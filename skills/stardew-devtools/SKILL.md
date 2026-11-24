@@ -1,6 +1,6 @@
 ---
 name: stardew-devtools
-description: 使用 sdv-dev CLI 进行《星露谷物语》(Stardew Valley 1.6) 模组开发、项目依赖管理、1.6 语义/Harmony 静态体检、Publicizer 免 SDK 编译、地图/精灵图离线渲染与实机自动化测试。需要检索原版/SMAPI 接口、反编译源码、生成 GMCM 配置菜单、校验/预览 .tmx 地图或 NPC/物品精灵图、打包发布、隔离启动进档、透视实机资产/Harmony 补丁链、排演 Event 剧情、跨日推进世界、分屏联调或执行主线程 eval 时使用。
+description: 使用 sdv-dev CLI 进行星露谷物语 (Stardew Valley 1.6) 模组开发、项目依赖管理、1.6 语义/Harmony 静态体检、Publicizer 免 SDK 编译、地图/精灵图离线渲染与实机自动化测试。需要检索原版/SMAPI 接口、反编译源码、生成 GMCM 配置菜单、校验/预览 .tmx 地图或 NPC/物品精灵图、打包发布、隔离启动进档、透视实机资产/Harmony 补丁链、排演 Event 剧情、跨日推进世界、分屏联调或执行主线程 eval 时使用。
 ---
 
 # SDV-DEV

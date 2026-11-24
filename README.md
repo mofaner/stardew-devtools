@@ -1,6 +1,6 @@
 # stardew-devtools (`sdv-dev`)
 
-面向 AI Agent 与开发者的 **《星露谷物语》（Stardew Valley 1.6）模组全闭环开发、离线地图/精灵图工作台、1.6 语义/Harmony 静态深检与无焦点实机自动化测试工具（CLI + AI Skill）**。
+面向 AI Agent 与开发者的 **星露谷物语（Stardew Valley 1.6）模组全闭环开发、离线地图/精灵图工作台、1.6 语义/Harmony 静态深检与无焦点实机自动化测试工具（CLI + AI Skill）**。
 
 无需安装 Visual Studio、无需安装 `.NET SDK` 或运行时，解压即用，完整支持 **Windows 10 / Windows 11 (x64)** 以及含**中文、空格、`[CP]` 方括号、括号等特殊字符**的系统用户名与目录路径。
 
@@ -23,7 +23,7 @@
 
 ### 前置要求
 - 操作系统：**Windows 10 (1809+) 或 Windows 11 (x64)**（无需管理员权限、无需安装 Visual Studio 或 `.NET`）
-- 游戏环境：已安装 PC 版 **《星露谷物语》1.6+** 及 **[SMAPI 4.0+](https://smapi.io/)**（实机测试与本机 DLL 编译引用需要）
+- 游戏环境：已安装 PC 版 **星露谷物语 1.6+** 及 **[SMAPI 4.0+](https://smapi.io/)**（实机测试与本机 DLL 编译引用需要）
 
 ---
 
@@ -60,7 +60,7 @@
 .\bin\sdv-dev.exe status
 .\bin\sdv-dev.exe api "Farmer stamina"
 ```
-程序优先自动直连同级目录的 `sdv-dev.db`，并通过注册表与 `libraryfolders.vdf` 自动识别 Steam（含自定义中文盘符库路径）与 GOG 版《星露谷物语》安装位置。
+程序优先自动直连同级目录的 `sdv-dev.db`，并通过注册表与 `libraryfolders.vdf` 自动识别 Steam（含自定义中文盘符库路径）与 GOG 版星露谷物语安装位置。
 
 ---
 
