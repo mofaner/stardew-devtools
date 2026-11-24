@@ -6,6 +6,7 @@ using System.Reflection.PortableExecutable;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Xml.Linq;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.Emit;
@@ -150,11 +151,20 @@ namespace System.Runtime.CompilerServices
                 return res;
             }
 
+            var csprojOpts = ParseOptionalCsprojSettings(fullModDir);
+
             var csFiles = Directory.GetFiles(fullModDir, "*.cs", SearchOption.AllDirectories)
                 .Where(f =>
                 {
-                    string rel = f.Substring(fullModDir.Length);
-                    return !rel.Contains("\\obj\\") && !rel.Contains("\\bin\\") && !rel.Contains("/obj/") && !rel.Contains("/bin/");
+                    string rel = f.Substring(fullModDir.Length).TrimStart('\\', '/').Replace('\\', '/');
+                    if (rel.StartsWith("obj/", StringComparison.OrdinalIgnoreCase) ||
+                        rel.StartsWith("bin/", StringComparison.OrdinalIgnoreCase) ||
+                        rel.Contains("/obj/", StringComparison.OrdinalIgnoreCase) ||
+                        rel.Contains("/bin/", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return false;
+                    }
+                    return !IsExcludedByCsprojRemove(rel, csprojOpts.RemovedCompilePatterns);
                 })
                 .ToList();
 
@@ -193,7 +203,8 @@ namespace System.Runtime.CompilerServices
                     includeLoadedMods: false,
                     extraReferences: extraRefPaths,
                     publicize: publicize,
-                    outXmlDocPath: null);
+                    outXmlDocPath: null,
+                    csprojSettings: csprojOpts);
 
                 if (!ok)
                 {
@@ -239,6 +250,110 @@ namespace System.Runtime.CompilerServices
             }
         }
 
+        private sealed class CsprojCompilerSettings
+        {
+            public HashSet<string> DefineConstants { get; } = new HashSet<string>(StringComparer.Ordinal);
+            public List<string> RemovedCompilePatterns { get; } = new List<string>();
+            public bool AllowUnsafe { get; set; } = true;
+            public bool ImplicitUsings { get; set; }
+            public List<string> ExtraGlobalUsingLines { get; } = new List<string>();
+        }
+
+        private static CsprojCompilerSettings ParseOptionalCsprojSettings(string modDir)
+        {
+            var settings = new CsprojCompilerSettings { AllowUnsafe = true };
+            settings.DefineConstants.Add("TRACE");
+
+            try
+            {
+                var csprojFile = Directory.GetFiles(modDir, "*.csproj", SearchOption.TopDirectoryOnly).FirstOrDefault();
+                if (csprojFile == null)
+                    return settings;
+
+                var xdoc = XDocument.Load(csprojFile);
+                foreach (var dc in xdoc.Descendants().Where(e => e.Name.LocalName.Equals("DefineConstants", StringComparison.OrdinalIgnoreCase)))
+                {
+                    foreach (var sym in (dc.Value ?? "").Split(new[] { ';', ',', ' ', '\r', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        if (!sym.StartsWith("$(", StringComparison.Ordinal))
+                            settings.DefineConstants.Add(sym.Trim());
+                    }
+                }
+
+                foreach (var au in xdoc.Descendants().Where(e => e.Name.LocalName.Equals("AllowUnsafeBlocks", StringComparison.OrdinalIgnoreCase)))
+                {
+                    if (bool.TryParse(au.Value?.Trim(), out bool allow))
+                        settings.AllowUnsafe = allow;
+                }
+
+                foreach (var iu in xdoc.Descendants().Where(e => e.Name.LocalName.Equals("ImplicitUsings", StringComparison.OrdinalIgnoreCase)))
+                {
+                    string v = (iu.Value ?? "").Trim();
+                    if (v.Equals("enable", StringComparison.OrdinalIgnoreCase) || v.Equals("true", StringComparison.OrdinalIgnoreCase))
+                        settings.ImplicitUsings = true;
+                    else if (v.Equals("disable", StringComparison.OrdinalIgnoreCase) || v.Equals("false", StringComparison.OrdinalIgnoreCase))
+                        settings.ImplicitUsings = false;
+                }
+
+                foreach (var u in xdoc.Descendants().Where(e => e.Name.LocalName.Equals("Using", StringComparison.OrdinalIgnoreCase)))
+                {
+                    string? inc = u.Attribute("Include")?.Value?.Trim();
+                    if (string.IsNullOrWhiteSpace(inc))
+                        continue;
+                    bool isStatic = string.Equals(u.Attribute("Static")?.Value?.Trim(), "true", StringComparison.OrdinalIgnoreCase);
+                    string? alias = u.Attribute("Alias")?.Value?.Trim();
+                    if (!string.IsNullOrWhiteSpace(alias))
+                        settings.ExtraGlobalUsingLines.Add($"global using {alias} = global::{inc};");
+                    else if (isStatic)
+                        settings.ExtraGlobalUsingLines.Add($"global using static global::{inc};");
+                    else
+                        settings.ExtraGlobalUsingLines.Add($"global using global::{inc};");
+                }
+
+                foreach (var comp in xdoc.Descendants().Where(e => e.Name.LocalName.Equals("Compile", StringComparison.OrdinalIgnoreCase)))
+                {
+                    string? rem = comp.Attribute("Remove")?.Value;
+                    if (!string.IsNullOrWhiteSpace(rem))
+                    {
+                        foreach (var pat in rem!.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
+                        {
+                            string clean = pat.Trim().Replace('\\', '/').TrimStart('/');
+                            if (!string.IsNullOrEmpty(clean))
+                                settings.RemovedCompilePatterns.Add(clean);
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            return settings;
+        }
+
+        private static bool IsExcludedByCsprojRemove(string relSlashPath, List<string> patterns)
+        {
+            foreach (var pat in patterns)
+            {
+                if (pat.EndsWith("/**", StringComparison.Ordinal) || pat.EndsWith("/*", StringComparison.Ordinal))
+                {
+                    string prefix = pat.Substring(0, pat.IndexOf("/*", StringComparison.Ordinal) + 1);
+                    if (relSlashPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+                else if (pat.Contains('*'))
+                {
+                    string regexPat = "^" + Regex.Escape(pat).Replace("\\*\\*", ".*").Replace("\\*", "[^/]*") + "$";
+                    if (Regex.IsMatch(relSlashPath, regexPat, RegexOptions.IgnoreCase))
+                        return true;
+                }
+                else if (relSlashPath.Equals(pat, StringComparison.OrdinalIgnoreCase) ||
+                         relSlashPath.StartsWith(pat.TrimEnd('/') + "/", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         public static (bool Success, string Output) CompileSourcesToFiles(
             string gamePath,
             IEnumerable<string> sourceFiles,
@@ -247,9 +362,15 @@ namespace System.Runtime.CompilerServices
             bool includeLoadedMods,
             IEnumerable<string>? extraReferences,
             bool publicize = true,
-            string? outXmlDocPath = null)
+            string? outXmlDocPath = null,
+            object? csprojSettings = null)
         {
+            var cfg = csprojSettings as CsprojCompilerSettings;
             var parseOpts = CSharpParseOptions.Default.WithLanguageVersion(LanguageVersion.Latest);
+            if (cfg != null && cfg.DefineConstants.Count > 0)
+            {
+                parseOpts = parseOpts.WithPreprocessorSymbols(cfg.DefineConstants);
+            }
             var syntaxTrees = new List<SyntaxTree>();
             bool hasTargetFrameworkAttr = false;
             bool hasIgnoresAccessChecks = false;
@@ -263,6 +384,25 @@ namespace System.Runtime.CompilerServices
                     hasIgnoresAccessChecks = true;
 
                 syntaxTrees.Add(CSharpSyntaxTree.ParseText(srcText, parseOpts, path: csFile, encoding: Encoding.UTF8));
+            }
+
+            if (cfg != null && (cfg.ImplicitUsings || cfg.ExtraGlobalUsingLines.Count > 0))
+            {
+                var guSb = new StringBuilder();
+                if (cfg.ImplicitUsings)
+                {
+                    guSb.AppendLine("global using global::System;");
+                    guSb.AppendLine("global using global::System.Collections.Generic;");
+                    guSb.AppendLine("global using global::System.IO;");
+                    guSb.AppendLine("global using global::System.Linq;");
+                    guSb.AppendLine("global using global::System.Net.Http;");
+                    guSb.AppendLine("global using global::System.Threading;");
+                    guSb.AppendLine("global using global::System.Threading.Tasks;");
+                }
+                foreach (var extraU in cfg.ExtraGlobalUsingLines)
+                    guSb.AppendLine(extraU);
+
+                syntaxTrees.Add(CSharpSyntaxTree.ParseText(guSb.ToString(), parseOpts, path: "_ImplicitGlobalUsings.g.cs", encoding: Encoding.UTF8));
             }
 
             if (!hasTargetFrameworkAttr)
@@ -284,7 +424,8 @@ namespace System.Runtime.CompilerServices
                 syntaxTrees,
                 references,
                 emitPdb: !string.IsNullOrEmpty(outPdbPath),
-                emitXmlDocs: !string.IsNullOrEmpty(outXmlDocPath));
+                emitXmlDocs: !string.IsNullOrEmpty(outXmlDocPath),
+                allowUnsafe: cfg?.AllowUnsafe ?? true);
 
             if (!ok || peBytes == null)
                 return (false, diagText);
@@ -316,12 +457,14 @@ namespace System.Runtime.CompilerServices
             };
 
             var extraModRefs = new List<string>();
-            if (!string.IsNullOrWhiteSpace(activeModsRootOverride) && Directory.Exists(activeModsRootOverride))
+            bool hasExplicitModsRoot = !string.IsNullOrWhiteSpace(activeModsRootOverride) && Directory.Exists(activeModsRootOverride);
+            if (hasExplicitModsRoot)
             {
                 CollectModEntryDllsFromRoot(activeModsRootOverride!, extraModRefs);
             }
 
-            var refs = CollectReferencesInMemory(gamePath, includeLoadedMods: true, extraModRefs, publicize: true);
+            // Only scan default `<GamePath>\Mods` when no explicit/isolated activeModsRootOverride was supplied!
+            var refs = CollectReferencesInMemory(gamePath, includeLoadedMods: !hasExplicitModsRoot, extraModRefs, publicize: true);
             string uniqueAsmName = "SdvEvalDynamic_" + Guid.NewGuid().ToString("N");
             var (ok, peBytes, _, _, diagText) = EmitCompilationInMemory(uniqueAsmName, trees, refs, emitPdb: false, emitXmlDocs: false);
 
@@ -336,13 +479,14 @@ namespace System.Runtime.CompilerServices
             IEnumerable<SyntaxTree> syntaxTrees,
             IEnumerable<MetadataReference> references,
             bool emitPdb,
-            bool emitXmlDocs)
+            bool emitXmlDocs,
+            bool allowUnsafe = true)
         {
             var compOpts = new CSharpCompilationOptions(
                 OutputKind.DynamicallyLinkedLibrary,
                 optimizationLevel: OptimizationLevel.Release,
                 nullableContextOptions: NullableContextOptions.Enable,
-                allowUnsafe: true,
+                allowUnsafe: allowUnsafe,
                 deterministic: true,
                 assemblyIdentityComparer: DesktopAssemblyIdentityComparer.Default,
                 specificDiagnosticOptions: new[]
@@ -760,9 +904,12 @@ namespace SdvEvalDynamic
             {
                 string fileName = Path.GetFileName(file);
                 string ext = Path.GetExtension(file).ToLowerInvariant();
-                if (ext == ".cs" || ext == ".csproj" || ext == ".sln" || ext == ".user")
+                if (ext == ".cs" || ext == ".csproj" || ext == ".sln" || ext == ".user" ||
+                    ext == ".suo" || ext == ".zip" || ext == ".nupkg" || ext == ".bak" || ext == ".tmp" || ext == ".log")
                     continue;
-                if (fileName.Equals("sdv-project.json", StringComparison.OrdinalIgnoreCase))
+                if (fileName.Equals("sdv-project.json", StringComparison.OrdinalIgnoreCase) ||
+                    fileName.Equals(".gitignore", StringComparison.OrdinalIgnoreCase) ||
+                    fileName.Equals(".gitattributes", StringComparison.OrdinalIgnoreCase))
                     continue;
                 if (skipBinaries && (ext == ".dll" || ext == ".pdb" || ext == ".exe"))
                     continue;
@@ -776,7 +923,13 @@ namespace SdvEvalDynamic
                 if (name.Equals("bin", StringComparison.OrdinalIgnoreCase) ||
                     name.Equals("obj", StringComparison.OrdinalIgnoreCase) ||
                     name.Equals(".git", StringComparison.OrdinalIgnoreCase) ||
-                    name.Equals(".vs", StringComparison.OrdinalIgnoreCase))
+                    name.Equals(".vs", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals(".idea", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals(".vscode", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals("releases", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals("dist", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals("node_modules", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals("__pycache__", StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
                 }

@@ -41,6 +41,8 @@ namespace SdvKb
                 return 0;
             }
 
+            ValidateNoUnknownGlobalFlags(cmd, rest);
+
             return cmd switch
             {
                 // Knowledge & Inspection
@@ -85,6 +87,8 @@ namespace SdvKb
                 "world" => RunWorld(rest),
                 "interact" => RunInteract(rest),
                 "profile" => RunProfile(rest),
+                "checkpoint" or "cp-save" => RunCheckpoint(rest),
+                "schedule-check" or "schedule" => RunScheduleCheck(rest),
                 "mp" or "multiplayer" => RunMultiplayer(rest),
                 "warp" => RunWarp(rest),
                 "screenshot" => RunScreenshot(rest),
@@ -761,13 +765,16 @@ namespace SdvKb
 
         private static int RunSprite(string[] args)
         {
+            string[] valOpts = { "--game-path", "-g", "--out", "-o", "--preset", "--mode", "-m", "--cell", "-c", "--grid", "--zoom", "-z" };
+            EnsureCommandOptions("sprite", args, valOpts, "--no-bbox");
+
             var cfg = KbConfig.Load(GetOption(args, "--game-path", "-g"));
             string? outPath = GetOption(args, "--out", "-o");
-            string? preset = GetOption(args, "--preset");
-            string? cellStr = GetOption(args, "--cell", "-c");
+            string? preset = GetOption(args, "--preset", "--mode", "-m");
+            string? cellStr = GetOption(args, "--cell", "-c", "--grid");
             string? zoomStr = GetOption(args, "--zoom", "-z");
             bool noBbox = HasFlag(args, "--no-bbox");
-            string target = GetPositionalQuery(args, "--game-path", "-g", "--out", "-o", "--preset", "--cell", "-c", "--zoom", "-z");
+            string target = GetPositionalQuery(args, valOpts);
 
             if (string.IsNullOrWhiteSpace(target))
             {
@@ -832,13 +839,22 @@ namespace SdvKb
 
         private static int RunMapRender(string[] args)
         {
+            string[] valOpts = { "--game-path", "-g", "--out", "-o", "--season", "-s", "--zoom", "-z", "--cp", "--target", "-t", "--crop" };
+            EnsureCommandOptions("map-render", args, valOpts, "--debug-overlay", "--debug", "--show-paths", "--auto-crop");
+
             var cfg = KbConfig.Load(GetOption(args, "--game-path", "-g"));
             string? outPath = GetOption(args, "--out", "-o");
             string? season = GetOption(args, "--season", "-s");
+            string? cpMod = GetOption(args, "--cp");
+            string? targetOpt = GetOption(args, "--target", "-t");
+            string? cropStr = GetOption(args, "--crop");
+            bool autoCrop = HasFlag(args, "--auto-crop") || string.Equals(cropStr, "auto", StringComparison.OrdinalIgnoreCase);
             bool debugOverlay = HasFlag(args, "--debug-overlay", "--debug");
             bool showPaths = HasFlag(args, "--show-paths");
-            int zoom = GetIntOption(args, "--zoom", "-z", defaultValue: debugOverlay ? 2 : 1);
-            string mapTarget = GetPositionalQuery(args, "--game-path", "-g", "--out", "-o", "--season", "-s", "--zoom", "-z");
+            int zoom = GetIntOption(args, "--zoom", "-z", defaultValue: (debugOverlay || autoCrop || cropStr != null) ? 2 : 1);
+            string mapTarget = !string.IsNullOrWhiteSpace(targetOpt)
+                ? targetOpt!
+                : GetPositionalQuery(args, valOpts);
 
             if (string.IsNullOrWhiteSpace(mapTarget) || string.IsNullOrWhiteSpace(outPath))
             {
@@ -846,7 +862,18 @@ namespace SdvKb
                 return 1;
             }
 
-            PrintJson(MapInspectorAndRenderer.RenderMapToPng(mapTarget, cfg.GamePath, outPath!, season, debugOverlay, zoom, showPaths));
+            var cropRect = (!string.IsNullOrWhiteSpace(cropStr) && !autoCrop) ? ParseRect4(cropStr) : null;
+            PrintJson(MapInspectorAndRenderer.RenderMapToPng(
+                mapTarget,
+                cfg.GamePath,
+                outPath!,
+                season,
+                debugOverlay,
+                zoom,
+                showPaths,
+                cpModOrJson: cpMod,
+                cropRect: cropRect,
+                autoCropPatched: autoCrop));
             return 0;
         }
 
@@ -1223,14 +1250,19 @@ namespace SdvKb
 
         private static int RunScreenshot(string[] args)
         {
+            string[] valOpts = { "--mode", "-m", "--out", "-o", "--scale", "-s", "--screen" };
+            EnsureCommandOptions("screenshot", args, valOpts, "--ui-overlay", "--ui");
+
             string mode = (GetOption(args, "--mode", "-m") ?? "screen").Trim().ToLowerInvariant();
             string? outPath = GetOption(args, "--out", "-o");
             string? scaleStr = GetOption(args, "--scale", "-s");
+            string? screen = GetOption(args, "--screen");
+            bool uiOverlay = HasFlag(args, "--ui-overlay", "--ui");
             float scale = float.TryParse(scaleStr, NumberStyles.Float, CultureInfo.InvariantCulture, out float sv) ? sv : 1.0f;
 
             if (string.IsNullOrWhiteSpace(outPath))
             {
-                outPath = GetPositionalQuery(args, "--mode", "-m", "--scale", "-s");
+                outPath = GetPositionalQuery(args, valOpts);
             }
 
             if (string.IsNullOrWhiteSpace(outPath))
@@ -1240,13 +1272,39 @@ namespace SdvKb
             }
 
             string fullOut = Path.GetFullPath(outPath!);
-            Console.WriteLine(BridgeClient.SendRequired(new
+            string resp = BridgeClient.SendRequired(new
             {
                 action = "screenshot",
                 mode,
                 outPath = fullOut,
-                scale
-            }, connectTimeoutMs: 5000));
+                scale,
+                screen,
+                uiOverlay
+            }, connectTimeoutMs: 5000);
+
+            if (uiOverlay && mode == "screen" && File.Exists(fullOut))
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(resp);
+                    if (doc.RootElement.TryGetProperty("uiLayout", out var uiEl))
+                    {
+                        var overlayStats = SpriteSheetInspector.DrawUiOverlayOnScreenshotPng(fullOut, uiEl);
+                        PrintJson(new
+                        {
+                            ok = true,
+                            mode = "screen",
+                            outputPng = fullOut,
+                            uiOverlay = overlayStats,
+                            uiLayout = JsonSerializer.Deserialize<object>(uiEl.GetRawText())
+                        });
+                        return 0;
+                    }
+                }
+                catch { }
+            }
+
+            Console.WriteLine(resp);
             return 0;
         }
 
@@ -1462,6 +1520,7 @@ namespace SdvKb
 
         private static int RunProfile(string[] args)
         {
+            EnsureCommandOptions("profile", args, new[] { "--seconds", "-s", "--top", "-n" });
             string? secStr = GetOption(args, "--seconds", "-s");
             double seconds = double.TryParse(secStr, NumberStyles.Float, CultureInfo.InvariantCulture, out double sv) && sv > 0 ? sv : 5.0;
             int top = GetIntOption(args, "--top", "-n", defaultValue: 12);
@@ -1471,6 +1530,89 @@ namespace SdvKb
                 action = "profile",
                 seconds,
                 top
+            }, connectTimeoutMs: 5000));
+            return 0;
+        }
+
+        private static int RunCheckpoint(string[] args)
+        {
+            EnsureCommandOptions("checkpoint", args, new[] { "--name", "-n" }, "--force");
+            bool force = HasFlag(args, "--force");
+            var pos = GetPositionalList(args, "--name", "-n");
+            string op = pos.Count > 0 ? pos[0].ToLowerInvariant() : "list";
+            string name = GetOption(args, "--name", "-n") ?? (pos.Count > 1 ? pos[1] : "quick");
+
+            string cpRoot = Path.Combine(KbConfig.DataDir, "checkpoints");
+            Directory.CreateDirectory(cpRoot);
+
+            if (op == "list" || op == "ls")
+            {
+                var items = new List<object>();
+                foreach (var dir in Directory.GetDirectories(cpRoot).OrderByDescending(Directory.GetLastWriteTimeUtc))
+                {
+                    string metaFile = Path.Combine(dir, "checkpoint-meta.json");
+                    if (File.Exists(metaFile))
+                    {
+                        try
+                        {
+                            items.Add(JsonSerializer.Deserialize<object>(File.ReadAllText(metaFile))!);
+                        }
+                        catch { }
+                    }
+                }
+                PrintJson(new { ok = true, count = items.Count, checkpoints = items });
+                return 0;
+            }
+            else if (op == "delete" || op == "rm" || op == "remove")
+            {
+                string targetDir = Path.Combine(cpRoot, SanitizeFileNameLocal(name));
+                bool existed = Directory.Exists(targetDir);
+                if (existed)
+                    Directory.Delete(targetDir, recursive: true);
+                PrintJson(new { ok = true, deleted = existed, name });
+                return 0;
+            }
+            else if (op == "save" || op == "load" || op == "restore")
+            {
+                string normOp = op == "restore" ? "load" : op;
+                Console.WriteLine(BridgeClient.SendRequired(new
+                {
+                    action = "checkpoint",
+                    op = normOp,
+                    name,
+                    force
+                }, connectTimeoutMs: 5000));
+                return 0;
+            }
+
+            PrintHelp("checkpoint");
+            return 1;
+        }
+
+        private static string SanitizeFileNameLocal(string raw)
+        {
+            string s = (raw ?? "quick").Trim();
+            foreach (char c in Path.GetInvalidFileNameChars())
+                s = s.Replace(c, '_');
+            return string.IsNullOrWhiteSpace(s) ? "quick" : s;
+        }
+
+        private static int RunScheduleCheck(string[] args)
+        {
+            EnsureCommandOptions("schedule-check", args, new[] { "--key", "-k" });
+            string? key = GetOption(args, "--key", "-k");
+            string npc = GetPositionalQuery(args, "--key", "-k");
+            if (string.IsNullOrWhiteSpace(npc))
+            {
+                PrintHelp("schedule-check");
+                return 1;
+            }
+
+            Console.WriteLine(BridgeClient.SendRequired(new
+            {
+                action = "schedule_check",
+                npc,
+                key
             }, connectTimeoutMs: 5000));
             return 0;
         }
@@ -2095,6 +2237,23 @@ OPTIONS:
    - `player`、`ui`、`ui-click`、`warp`、`eval`、`event-play`、`world` 均支持加 `--screen host|farmhand|0..3` 指定在主机或客机上下文执行！");
                     break;
 
+                case "checkpoint":
+                case "cp-save":
+                case "schedule-check":
+                case "schedule":
+                    Console.WriteLine(@"# sdv-dev checkpoint / schedule-check — 测试档秒级时光机快照与 NPC 日程寻路实机推演
+
+1. 测试档状态快照时光机 (`checkpoint`)：
+   sdv-dev checkpoint save <快照名>        将当前世界所有机器/作物进度、玩家背包、时间与精确站位秒存为命名快照
+   sdv-dev checkpoint load <快照名>        随时（即使改完 C# 代码冷重启后）1 秒回档到该快照的精确分钟与坐标反复测分支！
+   sdv-dev checkpoint list                 离线列出所有已保存的测试快照
+   sdv-dev checkpoint delete <快照名>      删除指定快照
+
+2. NPC 日程寻路实机推演 (`schedule-check`)：
+   sdv-dev schedule-check <NpcName> [--key spring]
+   直接调用原版 `NPC.parseMasterSchedule` 实机跑完该 NPC 所有日程段的跨图寻路，瞬间揪出不可达目标格或断链 Warp！");
+                    break;
+
                 default:
                     PrintHelp(null);
                     break;
@@ -2102,6 +2261,55 @@ OPTIONS:
         }
 
         #endregion
+
+        private static readonly HashSet<string> GlobalKnownOptions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "--action", "--add-item", "--advance-days", "--asm", "--asset", "--assets", "--at", "--author", "--auto-crop",
+            "--button", "--cat", "--cell", "--clear", "--close", "--code-b64", "--cold", "--config", "--cp", "--cp-trace", "--crop",
+            "--day", "--days", "--db", "--debug-overlay", "--debug", "--deploy", "--docs-only", "--docs-out", "--drop-in", "--dropin",
+            "--entry", "--export", "--facing-up", "--facing", "--file", "--force", "--friendship", "--full-mods", "--full",
+            "--game-path", "--github", "--give", "--grid", "--help", "--id", "--il", "--include-back", "--instructions", "--isolated",
+            "--json", "--keep-seen", "--key", "--kind", "--layer", "--level", "--limit", "--lines", "--list-assets", "--list",
+            "--mail", "--match", "--min-version", "--mod", "--mode", "--mods-path", "--money", "--name", "--near", "--new-test-save",
+            "--no-back", "--no-bbox", "--no-move", "--no-publicize", "--no-ref", "--no-reload-map", "--off", "--offline", "--optional",
+            "--out", "--place", "--power", "--prefab", "--preset", "--project", "--rect", "--refill", "--reload-map",
+            "--reset-test-world", "--response", "--right-click", "--save", "--scale", "--screen", "--script-b64", "--script",
+            "--season", "--seconds", "--show-paths", "--size", "--skip-check", "--skip", "--spec", "--status", "--stdin", "--step",
+            "--tail", "--target", "--test-world", "--theme", "--tile-size", "--time", "--timeout", "--tool", "--top", "--trace",
+            "--ui", "--ui-overlay", "--unpack", "--use-tool", "--weather", "--with-mods", "--xy", "--year", "--zoom",
+            "-a", "-c", "-d", "-e", "-f", "-g", "-h", "-k", "-l", "-m", "-n", "-o", "-p", "-r", "-s", "-t", "-w", "-y", "-z", "-"
+        };
+
+        private static void ValidateNoUnknownGlobalFlags(string cmd, string[] args)
+        {
+            foreach (var a in args)
+            {
+                if (!a.StartsWith("-", StringComparison.Ordinal) || a.Length == 1)
+                    continue;
+                // Allow negative numbers like `-100` or `-4`
+                if (double.TryParse(a, NumberStyles.Float, CultureInfo.InvariantCulture, out _))
+                    continue;
+                if (!GlobalKnownOptions.Contains(a))
+                    throw new ArgumentException($"Unknown option `{a}` for `sdv-dev {cmd}`. Run `sdv-dev {cmd} --help` to view valid options.");
+            }
+        }
+
+        private static void EnsureCommandOptions(string cmd, string[] args, string[] valueOptions, params string[] booleanFlags)
+        {
+            var allowed = new HashSet<string>(valueOptions, StringComparer.OrdinalIgnoreCase);
+            foreach (var bf in booleanFlags)
+                allowed.Add(bf);
+
+            foreach (var a in args)
+            {
+                if (!a.StartsWith("-", StringComparison.Ordinal) || a.Length == 1)
+                    continue;
+                if (double.TryParse(a, NumberStyles.Float, CultureInfo.InvariantCulture, out _))
+                    continue;
+                if (!allowed.Contains(a))
+                    throw new ArgumentException($"Option `{a}` is not supported by `sdv-dev {cmd}`. Run `sdv-dev {cmd} --help` to view valid options.");
+            }
+        }
 
         private static bool HasFlag(string[] args, params string[] names) =>
             args.Any(a => names.Any(n => a.Equals(n, StringComparison.OrdinalIgnoreCase)));

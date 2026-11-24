@@ -792,10 +792,52 @@ namespace SdvKb.Validation
             if (isTranspiler)
                 return;
 
-            // Verify Harmony injected parameters on Prefix / Postfix / Finalizer!
+            bool isPrefix = patchMethod.Name == "Prefix" ||
+                            patchMethod.GetAttributes().Any(a => a.AttributeType.Name.StartsWith("HarmonyPrefix", StringComparison.Ordinal));
+            bool isPostfix = patchMethod.Name == "Postfix" ||
+                             patchMethod.GetAttributes().Any(a => a.AttributeType.Name.StartsWith("HarmonyPostfix", StringComparison.Ordinal));
+            bool isFinalizer = patchMethod.Name == "Finalizer" ||
+                               patchMethod.GetAttributes().Any(a => a.AttributeType.Name.StartsWith("HarmonyFinalizer", StringComparison.Ordinal));
+
+            // 1. Validate patch method return type!
+            if (isPrefix && patchMethod.ReturnType.Kind != TypeKind.Void && patchMethod.ReturnType.FullName != "System.Boolean")
+            {
+                issues.Add(new ValidationIssue
+                {
+                    Severity = "ERROR",
+                    File = locLabel,
+                    Message = $"Harmony Prefix `{patchMethod.Name}` has invalid return type `{patchMethod.ReturnType.Name}` (must return `void` or `bool`)."
+                });
+            }
+            else if (isPostfix && patchMethod.ReturnType.Kind != TypeKind.Void)
+            {
+                // Pass-through Postfix must return the exact target return type!
+                if (matchedTarget.ReturnType.Kind == TypeKind.Void ||
+                    !AreHarmonyTypesCompatible(patchMethod.ReturnType, matchedTarget.ReturnType, requireExactForByRef: true))
+                {
+                    issues.Add(new ValidationIssue
+                    {
+                        Severity = "ERROR",
+                        File = locLabel,
+                        Message = $"Harmony pass-through Postfix `{patchMethod.Name}` returns `{patchMethod.ReturnType.Name}`, which does not match `{memberDesc}` return type `{matchedTarget.ReturnType.Name}`."
+                    });
+                }
+            }
+            else if (isFinalizer && patchMethod.ReturnType.Kind != TypeKind.Void && patchMethod.ReturnType.FullName != "System.Exception")
+            {
+                issues.Add(new ValidationIssue
+                {
+                    Severity = "ERROR",
+                    File = locLabel,
+                    Message = $"Harmony Finalizer `{patchMethod.Name}` has invalid return type `{patchMethod.ReturnType.Name}` (must return `void` or `Exception`)."
+                });
+            }
+
+            // 2. Verify Harmony injected parameters on Prefix / Postfix / Finalizer (existence, type compatibility & ref safety)!
             foreach (var p in patchMethod.Parameters)
             {
                 string pName = p.Name;
+                IType pPlainType = UnwrapByRef(p.Type, out bool pIsByRef);
 
                 // Check [HarmonyArgument("origName")] or [HarmonyArgument(index)]
                 var argAttr = p.GetAttributes().FirstOrDefault(a => a.AttributeType.Name.StartsWith("HarmonyArgument", StringComparison.Ordinal));
@@ -814,6 +856,19 @@ namespace SdvKb.Validation
                                 Message = $"Harmony `[HarmonyArgument({mappedIdx})]` on `{p.Name}` is out of range for `{memberDesc}` ({matchedTarget.Parameters.Count} parameter(s))."
                             });
                         }
+                        else
+                        {
+                            var idxTargetType = UnwrapByRef(matchedTarget.Parameters[mappedIdx].Type, out _);
+                            if (!AreHarmonyTypesCompatible(pPlainType, idxTargetType, pIsByRef))
+                            {
+                                issues.Add(new ValidationIssue
+                                {
+                                    Severity = "ERROR",
+                                    File = locLabel,
+                                    Message = $"Harmony `[HarmonyArgument({mappedIdx})]` parameter `{p.Type.Name} {p.Name}` is incompatible with target parameter `{matchedTarget.Parameters[mappedIdx].Type.Name}`."
+                                });
+                            }
+                        }
                         continue;
                     }
                 }
@@ -829,18 +884,60 @@ namespace SdvKb.Validation
                             Message = $"Harmony injection error: `{memberDesc}` is `static`, so `__instance` cannot be injected."
                         });
                     }
+                    else if (!AreHarmonyTypesCompatible(pPlainType, targetType, pIsByRef && !targetType.IsReferenceType.GetValueOrDefault(true)))
+                    {
+                        issues.Add(new ValidationIssue
+                        {
+                            Severity = "ERROR",
+                            File = locLabel,
+                            Message = $"Harmony `__instance` type `{pPlainType.FullName}` is incompatible with declaring type `{targetType.FullName}`."
+                        });
+                    }
+                    else if (pIsByRef && targetType.IsReferenceType == true)
+                    {
+                        issues.Add(new ValidationIssue
+                        {
+                            Severity = "ERROR",
+                            File = locLabel,
+                            Message = $"Harmony `__instance` on reference type `{targetType.Name}` cannot be passed by `ref`."
+                        });
+                    }
                     continue;
                 }
 
-                if (pName == "__result" || pName == "__resultRef")
+                if (pName == "__result")
                 {
+                    IType expectedRet = matchedTarget.IsConstructor ? targetType : UnwrapByRef(matchedTarget.ReturnType, out _);
                     if (matchedTarget.ReturnType.Kind == TypeKind.Void && !matchedTarget.IsConstructor)
                     {
                         issues.Add(new ValidationIssue
                         {
                             Severity = "ERROR",
                             File = locLabel,
-                            Message = $"Harmony injection error: `{memberDesc}` returns `void`, so `{pName}` cannot be injected."
+                            Message = $"Harmony injection error: `{memberDesc}` returns `void`, so `__result` cannot be injected."
+                        });
+                    }
+                    else if (!AreHarmonyTypesCompatible(pPlainType, expectedRet, requireExactForByRef: pIsByRef))
+                    {
+                        issues.Add(new ValidationIssue
+                        {
+                            Severity = "ERROR",
+                            File = locLabel,
+                            Message = $"Harmony `{(pIsByRef ? "ref " : "")}{pPlainType.Name} __result` is incompatible with `{memberDesc}` return type `{expectedRet.Name}`{(pIsByRef ? " (`ref __result` requires exact type match)" : "")}."
+                        });
+                    }
+                    continue;
+                }
+
+                if (pName == "__resultRef")
+                {
+                    if (matchedTarget.ReturnType.Kind != TypeKind.ByReference)
+                    {
+                        issues.Add(new ValidationIssue
+                        {
+                            Severity = "ERROR",
+                            File = locLabel,
+                            Message = $"Harmony `__resultRef` can only be injected when `{memberDesc}` returns by `ref`."
                         });
                     }
                     continue;
@@ -859,11 +956,41 @@ namespace SdvKb.Validation
                             Message = $"Harmony field injection `{pName}` failed: field `{fieldName}` does not exist on `{targetType.FullName}` (or its base classes)."
                         });
                     }
+                    else if (!AreHarmonyTypesCompatible(pPlainType, field.ReturnType, requireExactForByRef: pIsByRef))
+                    {
+                        issues.Add(new ValidationIssue
+                        {
+                            Severity = "ERROR",
+                            File = locLabel,
+                            Message = $"Harmony field injection `{(pIsByRef ? "ref " : "")}{pPlainType.Name} {pName}` is incompatible with field `{targetType.Name}.{fieldName}` of type `{field.ReturnType.Name}`."
+                        });
+                    }
                     continue;
                 }
 
                 if (pName.StartsWith("__", StringComparison.Ordinal))
                 {
+                    if (pName == "__runOriginal" && (pIsByRef || pPlainType.FullName != "System.Boolean"))
+                    {
+                        issues.Add(new ValidationIssue
+                        {
+                            Severity = "ERROR",
+                            File = locLabel,
+                            Message = $"Harmony `__runOriginal` must have type `bool` (not `ref` or `{pPlainType.Name}`)."
+                        });
+                        continue;
+                    }
+                    if (pName == "__args" && pPlainType.FullName != "System.Object[]")
+                    {
+                        issues.Add(new ValidationIssue
+                        {
+                            Severity = "ERROR",
+                            File = locLabel,
+                            Message = $"Harmony `__args` must have type `object[]` (got `{pPlainType.Name}`)."
+                        });
+                        continue;
+                    }
+
                     // Built-in Harmony injections (__state, __args, __originalMethod, __runOriginal, __exception, __0, __1...)
                     if (pName == "__state" || pName == "__args" || pName == "__originalMethod" ||
                         pName == "__runOriginal" || pName == "__exception" || Regex.IsMatch(pName, @"^__\d+$"))
@@ -878,6 +1005,19 @@ namespace SdvKb.Validation
                                     File = locLabel,
                                     Message = $"Harmony positional parameter `{pName}` is out of range for `{memberDesc}` ({matchedTarget.Parameters.Count} parameter(s))."
                                 });
+                            }
+                            else
+                            {
+                                var posTargetType = UnwrapByRef(matchedTarget.Parameters[posIdx].Type, out _);
+                                if (!AreHarmonyTypesCompatible(pPlainType, posTargetType, requireExactForByRef: pIsByRef))
+                                {
+                                    issues.Add(new ValidationIssue
+                                    {
+                                        Severity = "ERROR",
+                                        File = locLabel,
+                                        Message = $"Harmony positional parameter `{(pIsByRef ? "ref " : "")}{pPlainType.Name} {pName}` is incompatible with target parameter `{posTargetType.Name}`."
+                                    });
+                                }
                             }
                         }
                         continue;
@@ -898,7 +1038,65 @@ namespace SdvKb.Validation
                         Message = $"Harmony parameter `{pName}` not found on `{memberDesc}`! Target parameter names are: {validNames}."
                     });
                 }
+                else
+                {
+                    IType targetPlain = UnwrapByRef(targetParam.Type, out _);
+                    if (!AreHarmonyTypesCompatible(pPlainType, targetPlain, requireExactForByRef: pIsByRef))
+                    {
+                        issues.Add(new ValidationIssue
+                        {
+                            Severity = "ERROR",
+                            File = locLabel,
+                            Message = $"Harmony parameter `{(pIsByRef ? "ref " : "")}{pPlainType.Name} {p.Name}` is incompatible with `{memberDesc}` parameter `{targetParam.Type.Name} {targetParam.Name}`."
+                        });
+                    }
+                }
             }
+        }
+
+        private static IType UnwrapByRef(IType t, out bool isByRef)
+        {
+            if (t is ByReferenceType brt)
+            {
+                isByRef = true;
+                return brt.ElementType;
+            }
+            isByRef = false;
+            return t;
+        }
+
+        private static bool AreHarmonyTypesCompatible(IType injectedParamType, IType targetActualType, bool requireExactForByRef)
+        {
+            string injFull = StripRefType(injectedParamType.FullName);
+            string actFull = StripRefType(targetActualType.FullName);
+            if (injFull.Equals(actFull, StringComparison.Ordinal))
+                return true;
+
+            // Unknown / unresolved external assembly type in metadata: avoid false positives
+            if (injectedParamType.Kind == TypeKind.Unknown || targetActualType.Kind == TypeKind.Unknown)
+                return true;
+
+            if (requireExactForByRef)
+            {
+                // Harmony requires exact type match for `ref` value types; for reference types `object` is only allowed if non-ref or assignable in Harmony 2.2+
+                if (!targetActualType.IsReferenceType.GetValueOrDefault(true))
+                    return false;
+            }
+
+            if (injFull == "System.Object")
+                return targetActualType.IsReferenceType.GetValueOrDefault(true) || !requireExactForByRef;
+
+            // Walk inheritance & interfaces of targetActualType to see if targetActualType is assignable to injectedParamType
+            var cur = targetActualType.GetDefinition();
+            if (cur != null)
+            {
+                foreach (var baseType in cur.GetAllBaseTypes())
+                {
+                    if (StripRefType(baseType.FullName).Equals(injFull, StringComparison.Ordinal))
+                        return true;
+                }
+            }
+            return false;
         }
 
         private static ITypeDefinition? ResolveTypeInDecompiler(CSharpDecompiler? dec, string fullName)

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
@@ -147,12 +148,20 @@ namespace SdvKb.Validation
                         var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                         ValidateContentPatcherFile(
                             fullModDir,
+                            uniqueId ?? string.Empty,
                             contentJson,
                             isRoot: true,
                             visited,
                             engineRules,
                             referencedI18nKeys,
                             loadedLocalTextures,
+                            issues);
+
+                        NpcAndCrossAssetValidator.RunCrossAssetAndNpcChecks(
+                            fullModDir,
+                            uniqueId ?? string.Empty,
+                            explicitGamePath,
+                            engineRules,
                             issues);
                     }
                 }
@@ -175,6 +184,7 @@ namespace SdvKb.Validation
 
         private static void ValidateContentPatcherFile(
             string modRoot,
+            string modUniqueId,
             string jsonPath,
             bool isRoot,
             HashSet<string> visitedFiles,
@@ -246,11 +256,11 @@ namespace SdvKb.Validation
                     if (patch.ValueKind != JsonValueKind.Object)
                         continue;
                     string? act = GetPropIgnoreCase(patch, "Action");
-                    string? tgt = GetPropIgnoreCase(patch, "Target");
-                    string? ff = GetPropIgnoreCase(patch, "FromFile");
+                    string? tgt = NpcAndCrossAssetValidator.ExpandModId(GetPropIgnoreCase(patch, "Target") ?? "", modUniqueId);
+                    string? ff = NpcAndCrossAssetValidator.ExpandModId(GetPropIgnoreCase(patch, "FromFile") ?? "", modUniqueId);
                     if (string.Equals(act, "Load", StringComparison.OrdinalIgnoreCase) &&
-                        !string.IsNullOrWhiteSpace(tgt) && !tgt!.Contains("{{") &&
-                        !string.IsNullOrWhiteSpace(ff) && !ff!.Contains("{{") &&
+                        !string.IsNullOrWhiteSpace(tgt) && !tgt.Contains("{{") &&
+                        !string.IsNullOrWhiteSpace(ff) && !ff.Contains("{{") &&
                         ff.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
                     {
                         string firstFile = ff.Split(',')[0].Trim();
@@ -323,6 +333,7 @@ namespace SdvKb.Validation
                                     {
                                         ValidateContentPatcherFile(
                                             modRoot,
+                                            modUniqueId,
                                             candidate,
                                             isRoot: false,
                                             visitedFiles,
@@ -353,10 +364,13 @@ namespace SdvKb.Validation
                         ValidateEditImagePatch(patch, resolvedFirstStaticFile, patchLabel, issues);
                     }
 
-                    // Validate EditData against 1.6 GameData schemas, GSQs, TriggerActions, Event commands & SpriteIndex bounds!
-                    if (string.Equals(action, "EditData", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(target))
+                    // Validate EditData & JSON Load against 1.6 GameData schemas, GSQs, TriggerActions, Event commands & SpriteIndex bounds!
+                    if ((string.Equals(action, "EditData", StringComparison.OrdinalIgnoreCase) ||
+                         (string.Equals(action, "Load", StringComparison.OrdinalIgnoreCase) && resolvedFirstStaticFile != null && resolvedFirstStaticFile.EndsWith(".json", StringComparison.OrdinalIgnoreCase))) &&
+                        !string.IsNullOrWhiteSpace(target))
                     {
-                        ValidateEditDataPatch(patch, target!, resolvedFirstStaticFile, engineRules, loadedLocalTextures, patchLabel, issues);
+                        string expandedTarget = NpcAndCrossAssetValidator.ExpandModId(target!, modUniqueId);
+                        ValidateEditDataPatch(patch, expandedTarget, resolvedFirstStaticFile, modUniqueId, engineRules, loadedLocalTextures, patchLabel, issues);
                     }
 
                     // Check When conditions for `Query:` GSQ syntax
@@ -434,6 +448,7 @@ namespace SdvKb.Validation
             JsonElement patch,
             string rawTarget,
             string? externalJsonPath,
+            string modUniqueId,
             CachedEngineRules? engineRules,
             Dictionary<string, (int Width, int Height)> loadedLocalTextures,
             string patchLabel,
@@ -453,9 +468,33 @@ namespace SdvKb.Validation
                 engineRules.AssetRules.TryGetValue(normTarget, out schemaRule);
             }
 
-            if (TryGetElementIgnoreCase(patch, "Entries", out var entries) && entries.ValueKind == JsonValueKind.Object)
+            bool hasTargetField = TryGetElementIgnoreCase(patch, "TargetField", out var targetFieldEl) &&
+                                  targetFieldEl.ValueKind == JsonValueKind.Array &&
+                                  targetFieldEl.GetArrayLength() > 0;
+            EngineAssetRule? effectiveRule = hasTargetField ? null : schemaRule;
+
+            if (TryGetElementIgnoreCase(patch, "Entries", out var entries))
             {
-                ValidateDataEntriesObject(normTarget, entries, isEventData, schemaRule, engineRules, loadedLocalTextures, patchLabel, issues);
+                if (entries.ValueKind == JsonValueKind.Object)
+                {
+                    ValidateDataEntriesObject(normTarget, entries, isEventData && !hasTargetField, modUniqueId, effectiveRule, engineRules, loadedLocalTextures, patchLabel, issues);
+                }
+                else if (entries.ValueKind == JsonValueKind.Array)
+                {
+                    if (!hasTargetField && (isEventData || (effectiveRule != null && !effectiveRule.IsListRoot)))
+                    {
+                        issues.Add(new ValidationIssue
+                        {
+                            Severity = "ERROR",
+                            File = $"{patchLabel}#Entries",
+                            Message = $"`{normTarget}` is a dictionary asset, so `Entries` must be a JSON object `{{ ... }}`, not an array `[ ... ]`."
+                        });
+                    }
+                    else
+                    {
+                        ValidateDataEntriesArray(normTarget, entries, modUniqueId, effectiveRule, engineRules, loadedLocalTextures, patchLabel, issues);
+                    }
+                }
             }
             else if (!string.IsNullOrEmpty(externalJsonPath) && externalJsonPath!.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
             {
@@ -464,7 +503,35 @@ namespace SdvKb.Validation
                     using var extDoc = JsonDocument.Parse(File.ReadAllText(externalJsonPath), JsoncOptions);
                     if (extDoc.RootElement.ValueKind == JsonValueKind.Object)
                     {
-                        ValidateDataEntriesObject(normTarget, extDoc.RootElement, isEventData, schemaRule, engineRules, loadedLocalTextures, patchLabel, issues);
+                        if (effectiveRule != null && effectiveRule.IsListRoot)
+                        {
+                            issues.Add(new ValidationIssue
+                            {
+                                Severity = "ERROR",
+                                File = patchLabel,
+                                Message = $"Loaded external JSON `{Path.GetFileName(externalJsonPath)}` for list asset `{normTarget}` must have a JSON array `[ ... ]` root, not an object."
+                            });
+                        }
+                        else
+                        {
+                            ValidateDataEntriesObject(normTarget, extDoc.RootElement, isEventData, modUniqueId, effectiveRule, engineRules, loadedLocalTextures, patchLabel, issues);
+                        }
+                    }
+                    else if (extDoc.RootElement.ValueKind == JsonValueKind.Array)
+                    {
+                        if (isEventData || (effectiveRule != null && !effectiveRule.IsListRoot))
+                        {
+                            issues.Add(new ValidationIssue
+                            {
+                                Severity = "ERROR",
+                                File = patchLabel,
+                                Message = $"Loaded external JSON `{Path.GetFileName(externalJsonPath)}` for dictionary asset `{normTarget}` must have a JSON object `{{ ... }}` root, not an array."
+                            });
+                        }
+                        else
+                        {
+                            ValidateDataEntriesArray(normTarget, extDoc.RootElement, modUniqueId, effectiveRule, engineRules, loadedLocalTextures, patchLabel, issues);
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -478,7 +545,7 @@ namespace SdvKb.Validation
                 }
             }
 
-            if (schemaRule != null && !schemaRule.IsListRoot &&
+            if (effectiveRule != null &&
                 TryGetElementIgnoreCase(patch, "Fields", out var fieldsObj) && fieldsObj.ValueKind == JsonValueKind.Object)
             {
                 foreach (var entryProp in fieldsObj.EnumerateObject())
@@ -489,9 +556,36 @@ namespace SdvKb.Validation
                     {
                         if (fp.Name.Contains("{{") || fp.Name.Contains("/"))
                             continue;
-                        ValidateSingleModelField(schemaRule, fp.Name, fp.Value, engineRules, $"{patchLabel}#Fields[{entryProp.Name}]", issues);
+                        ValidateSingleModelField(effectiveRule, fp.Name, fp.Value, engineRules, $"{patchLabel}#Fields[{entryProp.Name}]", issues);
                     }
                 }
+            }
+        }
+
+        private static void ValidateDataEntriesArray(
+            string normTarget,
+            JsonElement entriesArray,
+            string modUniqueId,
+            EngineAssetRule? schemaRule,
+            CachedEngineRules? engineRules,
+            Dictionary<string, (int Width, int Height)> loadedLocalTextures,
+            string patchLabel,
+            List<ValidationIssue> issues)
+        {
+            if (schemaRule == null)
+                return;
+
+            int idx = 0;
+            foreach (var item in entriesArray.EnumerateArray())
+            {
+                string itemId = item.ValueKind == JsonValueKind.Object ? (GetPropIgnoreCase(item, "Id") ?? idx.ToString()) : idx.ToString();
+                string entryLabel = $"{patchLabel}[{itemId}]";
+                idx++;
+
+                if (item.ValueKind != JsonValueKind.Object)
+                    continue;
+
+                ValidateModelObjectElement(normTarget, item, modUniqueId, schemaRule, engineRules, loadedLocalTextures, entryLabel, issues);
             }
         }
 
@@ -499,6 +593,7 @@ namespace SdvKb.Validation
             string normTarget,
             JsonElement entries,
             bool isEventData,
+            string modUniqueId,
             EngineAssetRule? schemaRule,
             CachedEngineRules? engineRules,
             Dictionary<string, (int Width, int Height)> loadedLocalTextures,
@@ -522,37 +617,53 @@ namespace SdvKb.Validation
                 if (schemaRule == null || entry.Value.ValueKind != JsonValueKind.Object)
                     continue;
 
-                string? entryTexture = null;
-                int? spriteIndex = null;
+                ValidateModelObjectElement(normTarget, entry.Value, modUniqueId, schemaRule, engineRules, loadedLocalTextures, entryLabel, issues);
+            }
+        }
 
-                foreach (var fieldProp in entry.Value.EnumerateObject())
+        private static void ValidateModelObjectElement(
+            string normTarget,
+            JsonElement objElement,
+            string modUniqueId,
+            EngineAssetRule schemaRule,
+            CachedEngineRules? engineRules,
+            Dictionary<string, (int Width, int Height)> loadedLocalTextures,
+            string entryLabel,
+            List<ValidationIssue> issues)
+        {
+            string? entryTexture = null;
+            int? spriteIndex = null;
+
+            foreach (var fieldProp in objElement.EnumerateObject())
+            {
+                if (fieldProp.Name.Contains("{{"))
+                    continue;
+
+                ValidateSingleModelField(schemaRule, fieldProp.Name, fieldProp.Value, engineRules, entryLabel, issues);
+
+                if (fieldProp.Name.Equals("Texture", StringComparison.OrdinalIgnoreCase) && fieldProp.Value.ValueKind == JsonValueKind.String)
+                    entryTexture = fieldProp.Value.GetString();
+                else if (fieldProp.Name.Equals("SpriteIndex", StringComparison.OrdinalIgnoreCase) &&
+                         fieldProp.Value.ValueKind == JsonValueKind.Number && fieldProp.Value.TryGetInt32(out int si))
+                    spriteIndex = si;
+            }
+
+            // Check SpriteIndex against local custom Texture dimensions if both are present!
+            if (spriteIndex.HasValue)
+            {
+                if (spriteIndex.Value < 0)
                 {
-                    if (fieldProp.Name.Contains("{{"))
-                        continue;
-
-                    ValidateSingleModelField(schemaRule, fieldProp.Name, fieldProp.Value, engineRules, entryLabel, issues);
-
-                    if (fieldProp.Name.Equals("Texture", StringComparison.OrdinalIgnoreCase) && fieldProp.Value.ValueKind == JsonValueKind.String)
-                        entryTexture = fieldProp.Value.GetString();
-                    else if (fieldProp.Name.Equals("SpriteIndex", StringComparison.OrdinalIgnoreCase) &&
-                             fieldProp.Value.ValueKind == JsonValueKind.Number && fieldProp.Value.TryGetInt32(out int si))
-                        spriteIndex = si;
-                }
-
-                // Check SpriteIndex against local custom Texture dimensions if both are present!
-                if (spriteIndex.HasValue)
-                {
-                    if (spriteIndex.Value < 0)
+                    issues.Add(new ValidationIssue
                     {
-                        issues.Add(new ValidationIssue
-                        {
-                            Severity = "ERROR",
-                            File = entryLabel,
-                            Message = $"`SpriteIndex` ({spriteIndex.Value}) cannot be negative."
-                        });
-                    }
-                    else if (!string.IsNullOrWhiteSpace(entryTexture) && !entryTexture!.Contains("{{") &&
-                             loadedLocalTextures.TryGetValue(NormalizeAssetKey(entryTexture), out var texDim))
+                        Severity = "ERROR",
+                        File = entryLabel,
+                        Message = $"`SpriteIndex` ({spriteIndex.Value}) cannot be negative."
+                    });
+                }
+                else if (!string.IsNullOrWhiteSpace(entryTexture))
+                {
+                    string expTex = NpcAndCrossAssetValidator.ExpandModId(entryTexture!, modUniqueId);
+                    if (!expTex.Contains("{{") && loadedLocalTextures.TryGetValue(NormalizeAssetKey(expTex), out var texDim))
                     {
                         int cellW = 16;
                         int cellH = normTarget.Equals("Data/BigCraftables", StringComparison.OrdinalIgnoreCase) ? 32 : 16;
@@ -695,6 +806,12 @@ namespace SdvKb.Validation
             }
         }
 
+        internal static void ValidateGsqExpressionPublic(string expression, CachedEngineRules rules, string label, List<ValidationIssue> issues) =>
+            ValidateGsqExpression(expression, rules, label, issues);
+
+        internal static void ValidateTriggerActionCommandPublic(string? actionLine, CachedEngineRules rules, string label, List<ValidationIssue> issues) =>
+            ValidateTriggerActionCommand(actionLine, rules, label, issues);
+
         private static void ValidateGsqExpression(
             string expression,
             CachedEngineRules rules,
@@ -776,6 +893,48 @@ namespace SdvKb.Validation
             // Forked continuation scripts (key without `/` or starting after fork) can be shorter, standard scripts have >= 3 slash segments
             string[] segments = SplitEventSlashes(script);
             bool hasPreconditionKey = eventKey.Contains("/");
+
+            // 1. Validate Event Preconditions in `eventKey` (`<EventId>/<Precond1>/<Precond2>...`)
+            if (hasPreconditionKey && !eventKey.Contains("{{") && rules != null && rules.ValidEventPreconditions.Count > 0)
+            {
+                string[] keyParts = SplitEventSlashes(eventKey);
+                for (int p = 1; p < keyParts.Length; p++)
+                {
+                    string rawPre = keyParts[p].Trim();
+                    if (string.IsNullOrEmpty(rawPre))
+                        continue;
+
+                    string[] preArgs = SplitSpaceQuoteAware(rawPre);
+                    if (preArgs.Length == 0)
+                        continue;
+
+                    string preName = preArgs[0].TrimStart('!');
+                    if (string.IsNullOrEmpty(preName) || preName.Contains('.') || preName.Contains('_'))
+                        continue; // Allow mod-prefixed custom preconditions
+
+                    if (!rules.ValidEventPreconditions.Contains(preName))
+                    {
+                        issues.Add(new ValidationIssue
+                        {
+                            Severity = "ERROR",
+                            File = $"{label}#precondition[{p}]",
+                            Message = $"Unknown 1.6 Event precondition `{preName}` in `{rawPre}`."
+                        });
+                    }
+                    else if ((preName.Equals("G", StringComparison.OrdinalIgnoreCase) ||
+                              preName.Equals("GameStateQuery", StringComparison.OrdinalIgnoreCase)) &&
+                             preArgs.Length >= 2)
+                    {
+                        int firstSpace = rawPre.IndexOf(' ');
+                        if (firstSpace > 0 && firstSpace < rawPre.Length - 1)
+                        {
+                            string gsq = rawPre.Substring(firstSpace + 1).Trim().Trim('"');
+                            ValidateGsqExpression(gsq, rules, $"{label}#precondition[{p}](GSQ)", issues);
+                        }
+                    }
+                }
+            }
+
             if (hasPreconditionKey && segments.Length < 3)
             {
                 issues.Add(new ValidationIssue
@@ -787,12 +946,78 @@ namespace SdvKb.Validation
                 return;
             }
 
-            if (hasPreconditionKey && rules != null && rules.ValidAudioCues.Count > 0)
+            if (hasPreconditionKey)
             {
-                string bgm = segments[0].Trim();
-                if (!string.IsNullOrEmpty(bgm) && !bgm.Contains("{{"))
+                if (rules != null && rules.ValidAudioCues.Count > 0)
                 {
-                    ValidateAudioCueReference(bgm, rules, $"{label}#bgm", issues);
+                    string bgm = segments[0].Trim();
+                    if (!string.IsNullOrEmpty(bgm) && !bgm.Contains("{{"))
+                    {
+                        ValidateAudioCueReference(bgm, rules, $"{label}#bgm", issues);
+                    }
+                }
+
+                // 2. Validate segment[1]: initial viewport coordinates (`<int X> <int Y>` or `continue` / `none`)
+                string vpSeg = segments[1].Trim();
+                if (!string.IsNullOrEmpty(vpSeg) && !vpSeg.Contains("{{") &&
+                    !vpSeg.Equals("continue", StringComparison.OrdinalIgnoreCase) &&
+                    !vpSeg.Equals("none", StringComparison.OrdinalIgnoreCase))
+                {
+                    string[] vpTokens = vpSeg.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (vpTokens.Length < 2 || !int.TryParse(vpTokens[0], out _) || !int.TryParse(vpTokens[1], out _))
+                    {
+                        issues.Add(new ValidationIssue
+                        {
+                            Severity = "ERROR",
+                            File = $"{label}#viewport",
+                            Message = $"Invalid Event viewport segment `{vpSeg}`: expected `<int X> <int Y>` (e.g. `-1000 -1000` or `64 15`)."
+                        });
+                    }
+                }
+
+                // 3. Validate segment[2]: initial actor 4-tuples (`<ActorName> <int X> <int Y> <int Facing 0..3>`)
+                string actorSeg = segments[2].Trim();
+                if (!string.IsNullOrEmpty(actorSeg) && !actorSeg.Contains("{{") &&
+                    !actorSeg.Equals("none", StringComparison.OrdinalIgnoreCase))
+                {
+                    string[] actorTokens = SplitSpaceQuoteAware(actorSeg);
+                    if (actorTokens.Length % 4 != 0)
+                    {
+                        issues.Add(new ValidationIssue
+                        {
+                            Severity = "ERROR",
+                            File = $"{label}#actors",
+                            Message = $"Event actor setup `{Truncate(actorSeg, 70)}` has {actorTokens.Length} token(s), which is not a multiple of 4 (`<Actor> <X> <Y> <Facing 0..3>`). Did you omit a facing direction?"
+                        });
+                    }
+                    else
+                    {
+                        for (int a = 0; a < actorTokens.Length; a += 4)
+                        {
+                            string aName = actorTokens[a];
+                            bool okX = int.TryParse(actorTokens[a + 1], out _);
+                            bool okY = int.TryParse(actorTokens[a + 2], out _);
+                            bool okDir = int.TryParse(actorTokens[a + 3], out int dirVal);
+                            if (!okX || !okY || !okDir)
+                            {
+                                issues.Add(new ValidationIssue
+                                {
+                                    Severity = "ERROR",
+                                    File = $"{label}#actors",
+                                    Message = $"Malformed actor 4-tuple `{aName} {actorTokens[a + 1]} {actorTokens[a + 2]} {actorTokens[a + 3]}` in segment[2]: `<X>`, `<Y>`, and `<Facing>` must all be integers."
+                                });
+                            }
+                            else if (dirVal < 0 || dirVal > 3)
+                            {
+                                issues.Add(new ValidationIssue
+                                {
+                                    Severity = "WARN",
+                                    File = $"{label}#actors",
+                                    Message = $"Actor `{aName}` has out-of-range facing direction `{dirVal}` (expected `0`=Up, `1`=Right, `2`=Down, `3`=Left)."
+                                });
+                            }
+                        }
+                    }
                 }
             }
 
@@ -844,6 +1069,37 @@ namespace SdvKb.Validation
                     }
                 }
             }
+        }
+
+        private static string[] SplitSpaceQuoteAware(string input)
+        {
+            var list = new List<string>();
+            var cur = new StringBuilder();
+            bool inQuotes = false;
+
+            for (int i = 0; i < input.Length; i++)
+            {
+                char ch = input[i];
+                if (ch == '"' && (i == 0 || input[i - 1] != '\\'))
+                {
+                    inQuotes = !inQuotes;
+                }
+                else if (!inQuotes && char.IsWhiteSpace(ch))
+                {
+                    if (cur.Length > 0)
+                    {
+                        list.Add(cur.ToString());
+                        cur.Clear();
+                    }
+                }
+                else
+                {
+                    cur.Append(ch);
+                }
+            }
+            if (cur.Length > 0)
+                list.Add(cur.ToString());
+            return list.ToArray();
         }
 
         [ThreadStatic]

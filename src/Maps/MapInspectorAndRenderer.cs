@@ -262,10 +262,46 @@ namespace SdvKb.Maps
             string? seasonOverride,
             bool debugOverlay,
             int zoom = 1,
-            bool showPathsLayer = false)
+            bool showPathsLayer = false,
+            string? cpModOrJson = null,
+            (int X, int Y, int W, int H)? cropRect = null,
+            bool autoCropPatched = false)
         {
-            string tmxPath = TmxMap.ResolveMapFilePath(mapOrAsset, gamePath);
-            var map = TmxMap.Load(tmxPath);
+            TmxMap map;
+            string tmxPath;
+            List<string>? appliedCpPatches = null;
+            List<Rectangle>? patchedRects = null;
+            Dictionary<string, string>? cpCustomTextures = null;
+
+            if (!string.IsNullOrWhiteSpace(cpModOrJson))
+            {
+                var cpRes = CpEditMapApplier.BuildPatchedMapInMemory(cpModOrJson!, mapOrAsset, gamePath, seasonOverride);
+                map = cpRes.Map;
+                tmxPath = cpRes.BaseTmxPath;
+                appliedCpPatches = cpRes.AppliedPatches;
+                patchedRects = cpRes.PatchedTileRects;
+                cpCustomTextures = cpRes.CustomTextureAssets;
+
+                if (autoCropPatched && cropRect == null && patchedRects.Count > 0)
+                {
+                    int minX = patchedRects.Min(r => r.Left);
+                    int minY = patchedRects.Min(r => r.Top);
+                    int maxX = patchedRects.Max(r => r.Right);
+                    int maxY = patchedRects.Max(r => r.Bottom);
+                    int pad = 6;
+                    int cx = Math.Max(0, minX - pad);
+                    int cy = Math.Max(0, minY - pad);
+                    int cw = Math.Min(map.Width - cx, (maxX - minX) + pad * 2);
+                    int ch = Math.Min(map.Height - cy, (maxY - minY) + pad * 2);
+                    cropRect = (cx, cy, cw, ch);
+                }
+            }
+            else
+            {
+                tmxPath = TmxMap.ResolveMapFilePath(mapOrAsset, gamePath);
+                map = TmxMap.Load(tmxPath);
+            }
+
             string? tmxDir = Path.GetDirectoryName(tmxPath);
 
             string? effectiveSeason = seasonOverride;
@@ -274,6 +310,15 @@ namespace SdvKb.Maps
 
             if (zoom < 1) zoom = 1;
             if (zoom > 4) zoom = 4;
+
+            int startTileX = 0, startTileY = 0, viewTilesW = map.Width, viewTilesH = map.Height;
+            if (cropRect.HasValue)
+            {
+                startTileX = Math.Max(0, Math.Min(map.Width - 1, cropRect.Value.X));
+                startTileY = Math.Max(0, Math.Min(map.Height - 1, cropRect.Value.Y));
+                viewTilesW = Math.Max(1, Math.Min(map.Width - startTileX, cropRect.Value.W));
+                viewTilesH = Math.Max(1, Math.Min(map.Height - startTileY, cropRect.Value.H));
+            }
 
             int tw = map.TileWidth;
             int th = map.TileHeight;
@@ -284,8 +329,8 @@ namespace SdvKb.Maps
             int rulerTop = debugOverlay ? 22 : 0;
             int legendBottom = debugOverlay ? 26 : 0;
 
-            int mapPxW = map.Width * cellW;
-            int mapPxH = map.Height * cellH;
+            int mapPxW = viewTilesW * cellW;
+            int mapPxH = viewTilesH * cellH;
             int totalW = Math.Max(320, rulerLeft + mapPxW);
             int totalH = rulerTop + mapPxH + legendBottom;
 
@@ -297,7 +342,13 @@ namespace SdvKb.Maps
                 for (int i = 0; i < map.Tilesets.Count; i++)
                 {
                     var ts = map.Tilesets[i];
-                    string? png = TmxMap.ResolveTilesheetPngPath(ts.ImageSource, tmxDir, gamePath, effectiveSeason);
+                    string? png = null;
+                    if (cpCustomTextures != null)
+                    {
+                        string normSrc = ts.ImageSource.Replace('\\', '/').Trim('/');
+                        cpCustomTextures.TryGetValue(normSrc, out png);
+                    }
+                    png ??= TmxMap.ResolveTilesheetPngPath(ts.ImageSource, tmxDir, gamePath, effectiveSeason);
                     if (png != null && File.Exists(png))
                     {
                         var bmp = LoadBitmapZeroLock(png);
@@ -332,9 +383,12 @@ namespace SdvKb.Maps
                         if (!showPathsLayer && layer.Name.Equals("Paths", StringComparison.OrdinalIgnoreCase))
                             continue;
 
-                        for (int y = 0; y < Math.Min(map.Height, layer.Height); y++)
+                        int endY = Math.Min(startTileY + viewTilesH, Math.Min(map.Height, layer.Height));
+                        int endX = Math.Min(startTileX + viewTilesW, Math.Min(map.Width, layer.Width));
+
+                        for (int y = startTileY; y < endY; y++)
                         {
-                            for (int x = 0; x < Math.Min(map.Width, layer.Width); x++)
+                            for (int x = startTileX; x < endX; x++)
                             {
                                 uint rawGid = layer.GetRawGid(x, y);
                                 int cleanGid = (int)(rawGid & 0x1FFFFFFFu);
@@ -354,7 +408,7 @@ namespace SdvKb.Maps
                                 if (srcX + ts.TileWidth > sheetBmp.Width || srcY + ts.TileHeight > sheetBmp.Height)
                                     continue;
 
-                                var destRect = new Rectangle(rulerLeft + x * cellW, rulerTop + y * cellH, cellW, cellH);
+                                var destRect = new Rectangle(rulerLeft + (x - startTileX) * cellW, rulerTop + (y - startTileY) * cellH, cellW, cellH);
                                 var srcRect = new Rectangle(srcX, srcY, ts.TileWidth, ts.TileHeight);
 
                                 bool flipH = (rawGid & TmxMap.FlipHorizontalFlag) != 0;
@@ -377,7 +431,7 @@ namespace SdvKb.Maps
 
                     if (debugOverlay)
                     {
-                        DrawDebugOverlay(g, map, rulerLeft, rulerTop, cellW, cellH, totalW, totalH);
+                        DrawDebugOverlay(g, map, startTileX, startTileY, viewTilesW, viewTilesH, rulerLeft, rulerTop, cellW, cellH, totalW, totalH, patchedRects);
                     }
                 }
 
@@ -388,6 +442,8 @@ namespace SdvKb.Maps
                     mapFile = tmxPath,
                     outputPng = fullOut,
                     mapDimensions = $"{map.Width}x{map.Height}",
+                    renderedCrop = cropRect.HasValue ? $"{startTileX},{startTileY},{viewTilesW}x{viewTilesH}" : null,
+                    appliedCpEditMaps = appliedCpPatches,
                     imagePixels = $"{totalW}x{totalH}",
                     season = effectiveSeason ?? "default",
                     debugOverlay,
@@ -404,12 +460,17 @@ namespace SdvKb.Maps
         private static void DrawDebugOverlay(
             Graphics g,
             TmxMap map,
+            int startTileX,
+            int startTileY,
+            int viewW,
+            int viewH,
             int ox,
             int oy,
             int cw,
             int ch,
             int totalW,
-            int totalH)
+            int totalH,
+            List<Rectangle>? patchedRects)
         {
             g.SmoothingMode = SmoothingMode.None;
             g.TextRenderingHint = TextRenderingHint.SingleBitPerPixelGridFit;
@@ -425,6 +486,7 @@ namespace SdvKb.Maps
             using var actionPen = new Pen(Color.FromArgb(255, 255, 215, 0), 2f);
             using var actionFill = new SolidBrush(Color.FromArgb(110, 255, 200, 0));
             using var lightPen = new Pen(Color.FromArgb(255, 0, 245, 255), 2f);
+            using var patchBoxPen = new Pen(Color.FromArgb(255, 255, 70, 230), 2f) { DashStyle = DashStyle.Dash };
             using var rulerTextBrush = new SolidBrush(Color.FromArgb(255, 210, 225, 255));
             using var tagBg = new SolidBrush(Color.FromArgb(205, 10, 12, 16));
             using var whiteBrush = new SolidBrush(Color.White);
@@ -433,12 +495,12 @@ namespace SdvKb.Maps
             int waterCount = 0;
             int blockedCount = 0;
 
-            for (int y = 0; y < map.Height; y++)
+            for (int y = startTileY; y < startTileY + viewH; y++)
             {
-                for (int x = 0; x < map.Width; x++)
+                for (int x = startTileX; x < startTileX + viewW; x++)
                 {
-                    int px = ox + x * cw;
-                    int py = oy + y * ch;
+                    int px = ox + (x - startTileX) * cw;
+                    int py = oy + (y - startTileY) * ch;
                     var rect = new Rectangle(px, py, cw, ch);
 
                     bool isWater = map.IsWaterTile(x, y);
@@ -451,7 +513,6 @@ namespace SdvKb.Maps
                         g.DrawLine(waterPen, px + 2, py + ch / 2, px + cw - 3, py + ch / 2);
                     }
 
-                    // If blocked AND not plain water (or blocked even on bridge/buildings over water), show red collision mask!
                     if (!passable && !isWater)
                     {
                         blockedCount++;
@@ -459,7 +520,6 @@ namespace SdvKb.Maps
                         g.DrawLine(blockPen, px + 2, py + 2, px + cw - 3, py + ch - 3);
                     }
 
-                    // Highlight Action / TouchAction tiles
                     foreach (var l in map.Layers)
                     {
                         var props = map.GetEffectiveLayerCellProperties(l, x, y);
@@ -473,23 +533,46 @@ namespace SdvKb.Maps
                 }
             }
 
-            // Grid lines & coordinate rulers (every 5 tiles labeled)
-            for (int x = 0; x <= map.Width; x++)
+            // Grid lines & true map coordinate rulers (even when cropped!)
+            for (int dx = 0; dx <= viewW; dx++)
             {
-                int px = ox + x * cw;
-                g.DrawLine(x % 5 == 0 ? gridMajor : gridMinor, px, oy, px, oy + map.Height * ch);
-                if (x < map.Width && x % 5 == 0)
-                    g.DrawString(x.ToString(), smallFont, rulerTextBrush, px + 1, 4);
+                int mapX = startTileX + dx;
+                int px = ox + dx * cw;
+                g.DrawLine(mapX % 5 == 0 ? gridMajor : gridMinor, px, oy, px, oy + viewH * ch);
+                if (dx < viewW && mapX % 5 == 0)
+                    g.DrawString(mapX.ToString(), smallFont, rulerTextBrush, px + 1, 4);
             }
-            for (int y = 0; y <= map.Height; y++)
+            for (int dy = 0; dy <= viewH; dy++)
             {
-                int py = oy + y * ch;
-                g.DrawLine(y % 5 == 0 ? gridMajor : gridMinor, ox, py, ox + map.Width * cw, py);
-                if (y < map.Height && y % 5 == 0)
-                    g.DrawString(y.ToString(), smallFont, rulerTextBrush, 2, py + 1);
+                int mapY = startTileY + dy;
+                int py = oy + dy * ch;
+                g.DrawLine(mapY % 5 == 0 ? gridMajor : gridMinor, ox, py, ox + viewW * cw, py);
+                if (dy < viewH && mapY % 5 == 0)
+                    g.DrawString(mapY.ToString(), smallFont, rulerTextBrush, 2, py + 1);
             }
 
-            // Draw Warps (clamping off-map edge warps -1 / Width / Height onto edge tile with arrow, per Pathoschild's AccessibleLayer!)
+            // Highlight patched CP EditMap regions in magenta dashed outline!
+            if (patchedRects != null)
+            {
+                foreach (var pr in patchedRects)
+                {
+                    int ix = Math.Max(startTileX, pr.Left);
+                    int iy = Math.Max(startTileY, pr.Top);
+                    int ir = Math.Min(startTileX + viewW, pr.Right);
+                    int ib = Math.Min(startTileY + viewH, pr.Bottom);
+                    if (ir > ix && ib > iy)
+                    {
+                        g.DrawRectangle(
+                            patchBoxPen,
+                            ox + (ix - startTileX) * cw,
+                            oy + (iy - startTileY) * ch,
+                            (ir - ix) * cw - 1,
+                            (ib - iy) * ch - 1);
+                    }
+                }
+            }
+
+            // Draw Warps
             foreach (var w in map.ParseWarps())
             {
                 string arrow = "";
@@ -500,10 +583,10 @@ namespace SdvKb.Maps
                 if (cy < 0) { cy = 0; arrow = "^"; }
                 else if (cy >= map.Height) { cy = map.Height - 1; arrow = "v"; }
 
-                if (cx >= 0 && cx < map.Width && cy >= 0 && cy < map.Height)
+                if (cx >= startTileX && cx < startTileX + viewW && cy >= startTileY && cy < startTileY + viewH)
                 {
-                    int px = ox + cx * cw;
-                    int py = oy + cy * ch;
+                    int px = ox + (cx - startTileX) * cw;
+                    int py = oy + (cy - startTileY) * ch;
                     g.FillRectangle(warpFill, px, py, cw, ch);
                     g.DrawRectangle(warpPen, px + 1, py + 1, cw - 2, ch - 2);
                     if (!string.IsNullOrEmpty(arrow))
@@ -515,18 +598,17 @@ namespace SdvKb.Maps
             g.SmoothingMode = SmoothingMode.AntiAlias;
             foreach (var lt in map.ParseLights())
             {
-                if (lt.TileX >= 0 && lt.TileX < map.Width && lt.TileY >= 0 && lt.TileY < map.Height)
+                if (lt.TileX >= startTileX && lt.TileX < startTileX + viewW && lt.TileY >= startTileY && lt.TileY < startTileY + viewH)
                 {
-                    int px = ox + lt.TileX * cw;
-                    int py = oy + lt.TileY * ch;
+                    int px = ox + (lt.TileX - startTileX) * cw;
+                    int py = oy + (lt.TileY - startTileY) * ch;
                     g.DrawEllipse(lightPen, px + 2, py + 2, cw - 4, ch - 4);
                 }
             }
 
-            // Bottom legend bar
             int ly = totalH - 22;
             g.FillRectangle(tagBg, 0, ly - 2, totalW, 24);
-            string legend = $"Map {map.Width}x{map.Height} | RED=Blocked({blockedCount}) | BLUE=Water({waterCount}) | GREEN=Warp | YELLOW=Action/Touch | CYAN=Light";
+            string legend = $"View {viewW}x{viewH}@(x={startTileX},y={startTileY}) | RED=Blocked({blockedCount}) | BLUE=Water({waterCount}) | GREEN=Warp | YELLOW=Action | MAGENTA=EditMap";
             g.DrawString(legend, smallFont, whiteBrush, 6, ly + 3);
         }
 

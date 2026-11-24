@@ -22,6 +22,8 @@ namespace SdvKb.Build
         public string CSharpType { get; set; } = string.Empty;
         public string Kind { get; set; } = "text"; // bool, int, float, double, string, keybind, button, enum
         public string Summary { get; set; } = string.Empty;
+        public string? ExplicitTitle { get; set; }
+        public string? ExplicitDescription { get; set; }
         public double? Min { get; set; }
         public double? Max { get; set; }
         public double? Interval { get; set; }
@@ -188,10 +190,12 @@ namespace SdvKb.Build
                         continue;
 
                     double? min = null, max = null, step = null;
+                    string? expTitle = null, expDesc = null;
                     foreach (var attr in p.GetAttributes())
                     {
-                        if (attr.AttributeType.Name.Equals("RangeAttribute", StringComparison.OrdinalIgnoreCase) ||
-                            attr.AttributeType.Name.Equals("Range", StringComparison.OrdinalIgnoreCase))
+                        string attrName = attr.AttributeType.Name;
+                        if (attrName.Equals("RangeAttribute", StringComparison.OrdinalIgnoreCase) ||
+                            attrName.Equals("Range", StringComparison.OrdinalIgnoreCase))
                         {
                             if (attr.FixedArguments.Length >= 2)
                             {
@@ -200,6 +204,23 @@ namespace SdvKb.Build
                                 if (attr.FixedArguments.Length >= 3)
                                     step = Convert.ToDouble(attr.FixedArguments[2].Value, CultureInfo.InvariantCulture);
                             }
+                        }
+                        else if (attrName.Equals("DisplayAttribute", StringComparison.OrdinalIgnoreCase) ||
+                                 attrName.Equals("Display", StringComparison.OrdinalIgnoreCase))
+                        {
+                            foreach (var na in attr.NamedArguments)
+                            {
+                                if (na.Name == "Name" && na.Value is string dn && !string.IsNullOrWhiteSpace(dn))
+                                    expTitle = dn.Trim();
+                                else if (na.Name == "Description" && na.Value is string dd && !string.IsNullOrWhiteSpace(dd))
+                                    expDesc = dd.Trim();
+                            }
+                        }
+                        else if (attrName.Equals("DescriptionAttribute", StringComparison.OrdinalIgnoreCase) ||
+                                 attrName.Equals("Description", StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (attr.FixedArguments.Length >= 1 && attr.FixedArguments[0].Value is string d1 && !string.IsNullOrWhiteSpace(d1))
+                                expDesc = d1.Trim();
                         }
                     }
 
@@ -210,6 +231,8 @@ namespace SdvKb.Build
                         CSharpType = retType.FullName,
                         Kind = kind,
                         Summary = summary,
+                        ExplicitTitle = expTitle,
+                        ExplicitDescription = expDesc,
                         Min = min,
                         Max = max,
                         Interval = step
@@ -227,9 +250,8 @@ namespace SdvKb.Build
 
         private static string? ClassifyTypeSystemKind(IType t)
         {
-            if (t.Kind == TypeKind.Enum)
-                return "enum";
-            return t.FullName switch
+            // Check exact SMAPI types BEFORE `TypeKind.Enum` because `SButton` is itself an enum!
+            string? known = t.FullName switch
             {
                 "System.Boolean" => "bool",
                 "System.Int32" => "int",
@@ -240,6 +262,12 @@ namespace SdvKb.Build
                 "StardewModdingAPI.Utilities.KeybindList" => "keybind",
                 _ => null
             };
+            if (known != null)
+                return known;
+
+            if (t.Kind == TypeKind.Enum)
+                return "enum";
+            return null;
         }
 
         private static string? FindConfigSourceFile(string modDir)
@@ -397,19 +425,43 @@ namespace {ns}
                 string keyBase = $"gmcm.{CamelCase(p.Name)}";
                 string nameKey = $"{keyBase}.name";
                 string tipKey = $"{keyBase}.tooltip";
+                string englishFallback = HumanizeIdentifier(p.Name);
+
+                string fullDoc = !string.IsNullOrWhiteSpace(p.ExplicitDescription) ? p.ExplicitDescription! : p.Summary;
 
                 if (!dict.ContainsKey(nameKey))
                 {
-                    dict[nameKey] = preferChinese && ContainsChinese(p.Summary)
-                        ? p.Summary.Split(new[] { '。', '；', ',', '，', '\n' })[0].Trim()
-                        : HumanizeIdentifier(p.Name);
+                    if (preferChinese)
+                    {
+                        if (!string.IsNullOrWhiteSpace(p.ExplicitTitle))
+                            dict[nameKey] = p.ExplicitTitle!;
+                        else if (ContainsChinese(p.Summary))
+                            dict[nameKey] = ExtractShortChineseOptionTitle(p.Summary, englishFallback);
+                        else
+                            dict[nameKey] = englishFallback;
+                    }
+                    else
+                    {
+                        if (!string.IsNullOrWhiteSpace(p.ExplicitTitle) && !ContainsChinese(p.ExplicitTitle!))
+                            dict[nameKey] = p.ExplicitTitle!;
+                        else
+                            dict[nameKey] = englishFallback;
+                    }
                 }
 
                 if (!dict.ContainsKey(tipKey))
                 {
-                    dict[tipKey] = !string.IsNullOrWhiteSpace(p.Summary)
-                        ? p.Summary
-                        : HumanizeIdentifier(p.Name);
+                    if (preferChinese)
+                    {
+                        dict[tipKey] = !string.IsNullOrWhiteSpace(fullDoc) ? fullDoc : dict[nameKey];
+                    }
+                    else
+                    {
+                        // Never leak Chinese XML summaries into English default.json!
+                        dict[tipKey] = (!string.IsNullOrWhiteSpace(fullDoc) && !ContainsChinese(fullDoc))
+                            ? fullDoc
+                            : englishFallback;
+                    }
                 }
             }
 
@@ -419,6 +471,15 @@ namespace {ns}
                 Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
             });
             File.WriteAllText(jsonPath, jsonOut + "\n", new UTF8Encoding(false));
+        }
+
+        private static string ExtractShortChineseOptionTitle(string summary, string fallback)
+        {
+            string head = summary.Split(new[] { '：', ':', '—', '（', '(', '。', '；', ',', '，', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                                 .FirstOrDefault()?.Trim() ?? string.Empty;
+            if (string.IsNullOrEmpty(head))
+                return fallback;
+            return head.Length <= 14 ? head : head.Substring(0, 14) + "…";
         }
 
         private static bool ContainsChinese(string s) =>

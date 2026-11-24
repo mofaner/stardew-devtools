@@ -47,15 +47,34 @@ namespace SdvDevBridge
     internal sealed class PendingScreenCapture
     {
         public string OutputPath { get; }
+        public int TargetScreenId { get; }
+        public bool IncludeUiLayout { get; }
         public long QueuedTick { get; }
         public TaskCompletionSource<JObject> Tcs { get; }
 
-        public PendingScreenCapture(string outputPath, long queuedTick, TaskCompletionSource<JObject> tcs)
+        public PendingScreenCapture(string outputPath, int targetScreenId, bool includeUiLayout, long queuedTick, TaskCompletionSource<JObject> tcs)
         {
             OutputPath = outputPath;
+            TargetScreenId = targetScreenId;
+            IncludeUiLayout = includeUiLayout;
             QueuedTick = queuedTick;
             Tcs = tcs;
         }
+    }
+
+    internal sealed class PendingCheckpointRestore
+    {
+        public string Name { get; set; } = string.Empty;
+        public string Location { get; set; } = "Farm";
+        public int TileX { get; set; } = 64;
+        public int TileY { get; set; } = 15;
+        public int Facing { get; set; } = 2;
+        public int TimeOfDay { get; set; } = 600;
+        public float Stamina { get; set; } = 270f;
+        public int Health { get; set; } = 100;
+        public int WaitTicks { get; set; }
+        public bool WarpIssued { get; set; }
+        public TaskCompletionSource<JObject>? Tcs { get; set; }
     }
 
     internal sealed class PendingDayAdvanceJob
@@ -165,6 +184,7 @@ namespace SdvDevBridge
 
     internal sealed class PendingWarpJob
     {
+        public int TargetScreenId { get; }
         public string TargetLocation { get; }
         public int TargetX { get; }
         public int TargetY { get; }
@@ -172,8 +192,9 @@ namespace SdvDevBridge
         public int TicksElapsed { get; set; }
         public TaskCompletionSource<JObject> Tcs { get; }
 
-        public PendingWarpJob(string targetLocation, int x, int y, int facing, TaskCompletionSource<JObject> tcs)
+        public PendingWarpJob(int targetScreenId, string targetLocation, int x, int y, int facing, TaskCompletionSource<JObject> tcs)
         {
+            TargetScreenId = targetScreenId;
             TargetLocation = targetLocation;
             TargetX = x;
             TargetY = y;
@@ -192,6 +213,7 @@ namespace SdvDevBridge
         private PendingDayAdvanceJob? _activeDayAdvanceJob;
         private PendingProfileSession? _activeProfileSession;
         private PendingWarpJob? _activeWarpJob;
+        private PendingCheckpointRestore? _pendingCheckpointRestore;
         private CancellationTokenSource? _cts;
         private string? _pendingAutoLoadSave;
         private int _autoLoadWaitTicks;
@@ -285,21 +307,28 @@ namespace SdvDevBridge
             }
 
             // Fallback if Display.Rendered did not fire within ~50 ticks (e.g. minimized window)
-            if (_screenCaptureQueue.TryPeek(out var pendingShot) && (_tickCounter - pendingShot.QueuedTick) > 50)
+            if (_screenCaptureQueue.TryPeek(out var pendingShot) &&
+                Context.ScreenId == pendingShot.TargetScreenId &&
+                (_tickCounter - pendingShot.QueuedTick) > 50)
             {
                 if (_screenCaptureQueue.TryDequeue(out var expiredShot))
                 {
-                    expiredShot.Tcs.TrySetResult(CaptureScreenBufferImmediate(expiredShot.OutputPath));
+                    expiredShot.Tcs.TrySetResult(CaptureScreenBufferImmediate(expiredShot.OutputPath, expiredShot.IncludeUiLayout));
                 }
             }
 
+            if (_pendingCheckpointRestore != null && Context.ScreenId == 0)
+            {
+                TickCheckpointRestore();
+            }
+
             // Tick-driven authentic multi-day overnight progression (`sdv-dev world --advance-days N`)
-            if (_activeDayAdvanceJob != null)
+            if (_activeDayAdvanceJob != null && Context.ScreenId == 0)
             {
                 TickDayAdvanceJob();
             }
 
-            if (_activeWarpJob != null)
+            if (_activeWarpJob != null && Context.ScreenId == _activeWarpJob.TargetScreenId)
             {
                 _activeWarpJob.TicksElapsed++;
                 bool finished = (!Game1.isWarping && Game1.locationRequest == null) || _activeWarpJob.TicksElapsed > 60;
@@ -312,6 +341,7 @@ namespace SdvDevBridge
                     wj.Tcs.TrySetResult(new JObject
                     {
                         ["ok"] = true,
+                        ["screenIndex"] = Context.ScreenId,
                         ["location"] = Game1.currentLocation?.NameOrUniqueName ?? wj.TargetLocation,
                         ["targetX"] = Game1.player?.TilePoint.X ?? wj.TargetX,
                         ["targetY"] = Game1.player?.TilePoint.Y ?? wj.TargetY,
@@ -320,10 +350,13 @@ namespace SdvDevBridge
                 }
             }
 
-            if (_activeProfileSession != null && _activeProfileSession.WallClock.Elapsed.TotalSeconds >= _activeProfileSession.TargetSeconds)
+            if (_activeProfileSession != null && Context.ScreenId == 0 && _activeProfileSession.WallClock.Elapsed.TotalSeconds >= _activeProfileSession.TargetSeconds)
             {
                 CompleteProfileSession();
             }
+
+            if (Context.ScreenId != 0)
+                return;
 
             while (_mainThreadQueue.TryDequeue(out var item))
             {
@@ -339,7 +372,21 @@ namespace SdvDevBridge
                         }
                         else
                         {
-                            _screenCaptureQueue.Enqueue(new PendingScreenCapture(outPath!, _tickCounter, item.Tcs));
+                            int reqScreen = ParseScreenSelector(item.Request["screen"]) ?? 0;
+                            int activeScreens = GameRunner.instance?.gameInstances?.Count ?? 1;
+                            if (reqScreen < 0 || reqScreen >= activeScreens)
+                            {
+                                item.Tcs.TrySetResult(new JObject
+                                {
+                                    ["ok"] = false,
+                                    ["error"] = $"Requested `--screen {reqScreen}`, but only {activeScreens} screen instance(s) are active (0..{activeScreens - 1})."
+                                });
+                            }
+                            else
+                            {
+                                bool incUi = item.Request.Value<bool?>("uiOverlay") == true;
+                                _screenCaptureQueue.Enqueue(new PendingScreenCapture(outPath!, reqScreen, incUi, _tickCounter, item.Tcs));
+                            }
                         }
                         continue;
                     }
@@ -363,7 +410,7 @@ namespace SdvDevBridge
 
         private void OnDisplayRendered(object? sender, RenderedEventArgs e)
         {
-            if (_activeProfileSession != null)
+            if (_activeProfileSession != null && Context.ScreenId == 0)
             {
                 long now = Stopwatch.GetTimestamp();
                 long delta = now - _activeProfileSession.LastRenderedTimestamp;
@@ -372,13 +419,16 @@ namespace SdvDevBridge
                     _activeProfileSession.FrameIntervalTicks.Add(delta);
             }
 
-            while (_screenCaptureQueue.TryDequeue(out var cap))
+            while (_screenCaptureQueue.TryPeek(out var peekCap) && peekCap.TargetScreenId == Context.ScreenId)
             {
-                cap.Tcs.TrySetResult(CaptureScreenBufferImmediate(cap.OutputPath));
+                if (_screenCaptureQueue.TryDequeue(out var cap))
+                {
+                    cap.Tcs.TrySetResult(CaptureScreenBufferImmediate(cap.OutputPath, cap.IncludeUiLayout));
+                }
             }
         }
 
-        private JObject CaptureScreenBufferImmediate(string outPath)
+        private JObject CaptureScreenBufferImmediate(string outPath, bool includeUiLayout = false)
         {
             try
             {
@@ -387,20 +437,71 @@ namespace SdvDevBridge
                 if (!string.IsNullOrEmpty(parent))
                     Directory.CreateDirectory(parent);
 
-                RenderTarget2D? screenTarget = Game1.game1?.screen;
-                if (screenTarget != null && !screenTarget.IsDisposed)
+                RenderTarget2D? worldTarget = Game1.game1?.screen;
+                RenderTarget2D? uiTarget = Game1.game1?.uiScreen;
+
+                // Composite world RenderTarget2D + uiScreen RenderTarget2D so active menus, HUD & dialogues are ALWAYS visible in PNG!
+                if (worldTarget != null && !worldTarget.IsDisposed)
                 {
-                    using var fs = new FileStream(fullOut, FileMode.Create, FileAccess.Write, FileShare.Read);
-                    screenTarget.SaveAsPng(fs, screenTarget.Width, screenTarget.Height);
-                    return new JObject
+                    if (uiTarget != null && !uiTarget.IsDisposed)
+                    {
+                        GraphicsDevice gdComp = Game1.graphics.GraphicsDevice;
+                        int outW = uiTarget.Width;
+                        int outH = uiTarget.Height;
+                        using var compositeRt = new RenderTarget2D(gdComp, outW, outH, false, SurfaceFormat.Color, DepthFormat.None);
+                        RenderTargetBinding[] prevTargets = gdComp.GetRenderTargets();
+                        try
+                        {
+                            gdComp.SetRenderTarget(compositeRt);
+                            gdComp.Clear(Color.Black);
+                            using (var sb = new SpriteBatch(gdComp))
+                            {
+                                sb.Begin(SpriteSortMode.Immediate, BlendState.AlphaBlend, SamplerState.PointClamp);
+                                sb.Draw(worldTarget, new Rectangle(0, 0, outW, outH), Color.White);
+                                sb.Draw(uiTarget, new Rectangle(0, 0, outW, outH), Color.White);
+                                sb.End();
+                            }
+                        }
+                        finally
+                        {
+                            gdComp.SetRenderTargets(prevTargets);
+                        }
+
+                        using (var fs = new FileStream(fullOut, FileMode.Create, FileAccess.Write, FileShare.Read))
+                        {
+                            compositeRt.SaveAsPng(fs, outW, outH);
+                        }
+
+                        var compRes = new JObject
+                        {
+                            ["ok"] = true,
+                            ["mode"] = "screen",
+                            ["outputPng"] = fullOut,
+                            ["width"] = outW,
+                            ["height"] = outH,
+                            ["source"] = "Game1.screen+uiScreen"
+                        };
+                        if (includeUiLayout)
+                            compRes["uiLayout"] = BuildUiJson(maxComponents: 200);
+                        return compRes;
+                    }
+
+                    using (var fs = new FileStream(fullOut, FileMode.Create, FileAccess.Write, FileShare.Read))
+                    {
+                        worldTarget.SaveAsPng(fs, worldTarget.Width, worldTarget.Height);
+                    }
+                    var wRes = new JObject
                     {
                         ["ok"] = true,
                         ["mode"] = "screen",
                         ["outputPng"] = fullOut,
-                        ["width"] = screenTarget.Width,
-                        ["height"] = screenTarget.Height,
+                        ["width"] = worldTarget.Width,
+                        ["height"] = worldTarget.Height,
                         ["source"] = "Game1.screen"
                     };
+                    if (includeUiLayout)
+                        wRes["uiLayout"] = BuildUiJson(maxComponents: 200);
+                    return wRes;
                 }
 
                 // Fallback: capture GraphicsDevice backbuffer directly
@@ -597,6 +698,10 @@ namespace SdvDevBridge
                     return HandleInteract(req);
                 case "profile":
                     return StartProfileSession(req, tcs);
+                case "checkpoint":
+                    return HandleCheckpoint(req, tcs);
+                case "schedule_check":
+                    return HandleScheduleCheck(req);
                 case "load_save":
                     return HandleLoadSave(req);
                 case "new_test_save":
@@ -734,7 +839,7 @@ namespace SdvDevBridge
             };
         }
 
-        private JObject BuildUiJson()
+        private JObject BuildUiJson(int maxComponents = 80)
         {
             IClickableMenu? menu = Game1.activeClickableMenu;
             if (menu is TitleMenu && TitleMenu.subMenu != null)
@@ -747,13 +852,18 @@ namespace SdvDevBridge
             var comps = new JArray();
             if (menu.allClickableComponents != null)
             {
-                foreach (var c in menu.allClickableComponents.Where(c => c != null && c.visible).Take(80))
+                foreach (var c in menu.allClickableComponents.Where(c => c != null && c.visible).Take(maxComponents))
                 {
                     comps.Add(new JObject
                     {
                         ["myID"] = c.myID,
                         ["name"] = c.name,
                         ["label"] = c.label,
+                        ["region"] = c.region,
+                        ["upNeighborID"] = c.upNeighborID,
+                        ["downNeighborID"] = c.downNeighborID,
+                        ["leftNeighborID"] = c.leftNeighborID,
+                        ["rightNeighborID"] = c.rightNeighborID,
                         ["hoverText"] = (c as ClickableTextureComponent)?.hoverText,
                         ["bounds"] = new JObject
                         {
@@ -773,6 +883,11 @@ namespace SdvDevBridge
                 ["ok"] = true,
                 ["hasActiveMenu"] = true,
                 ["menuType"] = menu.GetType().FullName,
+                ["uiViewport"] = new JObject
+                {
+                    ["width"] = Game1.uiViewport.Width,
+                    ["height"] = Game1.uiViewport.Height
+                },
                 ["bounds"] = new JObject
                 {
                     ["x"] = menu.xPositionOnScreen,
@@ -841,9 +956,23 @@ namespace SdvDevBridge
 
             if (menu is DialogueBox db)
             {
+                // Fast-forward DialogueBox intro transition, typewriter text, & 750ms safetyTimer lock so CLI clicks NEVER no-op!
+                db.transitioning = false;
+                db.safetyTimer = 0;
+                db.questionFinishPauseTimer = 0;
+                string curDialogueText = db.getCurrentString() ?? string.Empty;
+                db.characterIndexInDialogue = Math.Max(0, curDialogueText.Length);
+
                 int? respIdx = req.Value<int?>("responseIndex");
-                if (respIdx.HasValue && db.isQuestion && db.responses != null && respIdx.Value >= 0 && respIdx.Value < db.responses.Length)
+                if (respIdx.HasValue)
                 {
+                    if (!db.isQuestion || db.responses == null || db.responses.Length == 0)
+                        return new JObject { ["ok"] = false, ["error"] = "Active `DialogueBox` is not a question dialogue with selectable responses." };
+                    if (respIdx.Value < 0 || respIdx.Value >= db.responses.Length)
+                        return new JObject { ["ok"] = false, ["error"] = $"Response index {respIdx.Value} is out of range (valid `0..{db.responses.Length - 1}`)." };
+
+                    string chosenResponseText = db.responses[respIdx.Value].responseText;
+                    string chosenResponseKey = db.responses[respIdx.Value].responseKey;
                     db.selectedResponse = respIdx.Value;
                     if (db.responseCC != null && respIdx.Value < db.responseCC.Count)
                     {
@@ -854,7 +983,13 @@ namespace SdvDevBridge
                     {
                         db.receiveLeftClick(db.xPositionOnScreen + 32, db.yPositionOnScreen + 32, playSound: true);
                     }
-                    return new JObject { ["ok"] = true, ["clickedResponse"] = db.responses[respIdx.Value].responseText };
+                    return new JObject
+                    {
+                        ["ok"] = true,
+                        ["clickedResponseIndex"] = respIdx.Value,
+                        ["clickedResponseKey"] = chosenResponseKey,
+                        ["clickedResponse"] = chosenResponseText
+                    };
                 }
             }
 
@@ -939,7 +1074,7 @@ namespace SdvDevBridge
                 Game1.nonWarpFade = false;
                 if (tcs != null && _activeWarpJob == null)
                 {
-                    _activeWarpJob = new PendingWarpJob(loc.NameOrUniqueName, tx, ty, facing, tcs);
+                    _activeWarpJob = new PendingWarpJob(Context.ScreenId, loc.NameOrUniqueName, tx, ty, facing, tcs);
                     return null;
                 }
             }
@@ -2262,13 +2397,24 @@ namespace SdvDevBridge
             Assembly bridgeAsm = typeof(ModEntry).Assembly;
             Assembly smapiAsm = typeof(Mod).Assembly;
 
-            // 1. Discover all active SMAPI mod event handlers via SCore.Instance.Events (EventManager)
+            // 1. Discover all active SMAPI mod event handlers via ModEventsBase.EventManager (or SCore.EventManager fallback)
             try
             {
-                Type? sCoreType = smapiAsm.GetType("StardewModdingAPI.Framework.SCore");
-                object? sCore = sCoreType?.GetProperty("Instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null);
-                object? evtMgr = sCoreType?.GetField("Events", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(sCore)
-                              ?? sCoreType?.GetProperty("Events", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(sCore);
+                object? evtMgr = null;
+                Type? glType = Helper.Events.GameLoop.GetType();
+                while (glType != null && evtMgr == null)
+                {
+                    evtMgr = glType.GetField("EventManager", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(Helper.Events.GameLoop);
+                    glType = glType.BaseType;
+                }
+
+                if (evtMgr == null)
+                {
+                    Type? sCoreType = smapiAsm.GetType("StardewModdingAPI.Framework.SCore");
+                    object? sCore = sCoreType?.GetProperty("Instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null);
+                    evtMgr = sCoreType?.GetField("EventManager", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(sCore)
+                          ?? sCoreType?.GetProperty("EventManager", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(sCore);
+                }
 
                 if (evtMgr != null)
                 {
@@ -2280,32 +2426,53 @@ namespace SdvDevBridge
                         string evtName = managedEvt.GetType().GetProperty("EventName", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(managedEvt) as string
                                          ?? field.Name;
 
-                        var handlersField = managedEvt.GetType().GetField("Handlers", BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
+                        FieldInfo? handlersField = null;
+                        Type? curEvtType = managedEvt.GetType();
+                        while (curEvtType != null && handlersField == null)
+                        {
+                            handlersField = curEvtType.GetField("Handlers", BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
+                            curEvtType = curEvtType.BaseType;
+                        }
+
                         if (handlersField?.GetValue(managedEvt) is IEnumerable handlersList)
                         {
-                            foreach (object? hItem in handlersList)
+                            List<object?> snapshot;
+                            lock (handlersList)
+                            {
+                                snapshot = handlersList.Cast<object?>().ToList();
+                            }
+
+                            foreach (object? hItem in snapshot)
                             {
                                 if (hItem == null) continue;
                                 Type ht = hItem.GetType();
-                                var del = ht.GetProperty("Handler", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(hItem) as Delegate;
-                                object? srcMod = ht.GetProperty("SourceMod", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(hItem);
+                                var del = (ht.GetProperty("Handler", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(hItem)
+                                        ?? ht.GetField("Handler", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(hItem)) as Delegate;
+                                object? srcMod = ht.GetProperty("SourceMod", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(hItem)
+                                              ?? ht.GetField("SourceMod", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(hItem);
                                 object? manifest = srcMod?.GetType().GetProperty("Manifest", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(srcMod);
                                 string modId = (manifest as IManifest)?.UniqueID ?? del?.Method.DeclaringType?.Assembly.GetName().Name ?? "Unknown";
 
-                                MethodInfo? mInfo = del?.Method;
-                                if (mInfo == null || mInfo.DeclaringType == null || mInfo.IsGenericMethod || mInfo.DeclaringType.IsGenericType)
-                                    continue;
-                                if (mInfo.DeclaringType.Assembly == bridgeAsm || mInfo.DeclaringType.Assembly == smapiAsm)
+                                if (del == null)
                                     continue;
 
-                                if (!entries.ContainsKey(mInfo))
+                                foreach (var singleDel in del.GetInvocationList())
                                 {
-                                    entries[mInfo] = new ProfileSampleEntry
+                                    MethodInfo? mInfo = singleDel.Method;
+                                    if (mInfo == null || mInfo.DeclaringType == null || mInfo.IsGenericMethod || mInfo.DeclaringType.IsGenericType)
+                                        continue;
+                                    if (mInfo.DeclaringType.Assembly == bridgeAsm || mInfo.DeclaringType.Assembly == smapiAsm)
+                                        continue;
+
+                                    if (!entries.ContainsKey(mInfo))
                                     {
-                                        Kind = "SMAPI.Event",
-                                        ModId = modId,
-                                        Label = $"[{evtName}] {mInfo.DeclaringType.Name}.{mInfo.Name}"
-                                    };
+                                        entries[mInfo] = new ProfileSampleEntry
+                                        {
+                                            Kind = "SMAPI.Event",
+                                            ModId = modId,
+                                            Label = $"[{evtName}] {mInfo.DeclaringType.Name}.{mInfo.Name}"
+                                        };
+                                    }
                                 }
                             }
                         }
@@ -2895,8 +3062,10 @@ namespace SdvDevBridge
             if (timeVal.HasValue)
             {
                 int clamped = Math.Max(600, Math.Min(2600, timeVal.Value));
-                Game1.timeOfDay = clamped;
+                Game1.timeOfDay = Utility.ModifyTime(clamped, -10);
                 Game1.performTenMinuteClockUpdate();
+                Game1.timeOfDay = clamped;
+                Game1.gameTimeInterval = 0;
                 applied.Add($"time={Game1.timeOfDay}");
             }
 
@@ -3129,6 +3298,320 @@ namespace SdvDevBridge
             }
             catch { }
             return false;
+        }
+
+        private static string GetCheckpointsRoot()
+        {
+            string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            string dir = Path.Combine(home, ".local", "share", "sdv-dev", "checkpoints");
+            Directory.CreateDirectory(dir);
+            return dir;
+        }
+
+        private static string SanitizeCheckpointName(string raw)
+        {
+            string trimmed = (raw ?? "quick").Trim();
+            foreach (char c in Path.GetInvalidFileNameChars())
+                trimmed = trimmed.Replace(c, '_');
+            return string.IsNullOrWhiteSpace(trimmed) ? "quick" : trimmed;
+        }
+
+        private JObject? HandleCheckpoint(JObject req, TaskCompletionSource<JObject>? tcs)
+        {
+            string op = req.Value<string>("op")?.ToLowerInvariant() ?? "list";
+            string rawName = req.Value<string>("name") ?? "quick";
+            string name = SanitizeCheckpointName(rawName);
+            bool force = req.Value<bool?>("force") == true;
+            string root = GetCheckpointsRoot();
+            string cpDir = Path.Combine(root, name);
+
+            if (op == "save")
+            {
+                if (!Context.IsWorldReady || Game1.player == null || string.IsNullOrEmpty(Constants.SaveFolderName) || string.IsNullOrEmpty(Constants.CurrentSavePath))
+                {
+                    return new JObject { ["ok"] = false, ["error"] = "Cannot save checkpoint when `inWorld=false`." };
+                }
+
+                string saveFolder = Constants.SaveFolderName!;
+                string savePath = Constants.CurrentSavePath!;
+
+                // Drain vanilla SaveGame.getSaveEnumerator() synchronously on main thread (~80-150ms) to flush all live world/machine/inventory state!
+                var prevCulture = System.Threading.Thread.CurrentThread.CurrentCulture;
+                try
+                {
+                    System.Threading.Thread.CurrentThread.CurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
+                    IEnumerator<int> saveEnum = SaveGame.getSaveEnumerator();
+                    while (saveEnum.MoveNext())
+                    {
+                    }
+                }
+                finally
+                {
+                    System.Threading.Thread.CurrentThread.CurrentCulture = prevCulture;
+                    SaveGame.IsProcessing = false;
+                }
+
+                if (Directory.Exists(cpDir))
+                    Directory.Delete(cpDir, recursive: true);
+                Directory.CreateDirectory(cpDir);
+
+                string filesDir = Path.Combine(cpDir, "savefiles");
+                Directory.CreateDirectory(filesDir);
+                foreach (var f in Directory.GetFiles(savePath))
+                {
+                    string fn = Path.GetFileName(f);
+                    if (fn.EndsWith("_old", StringComparison.OrdinalIgnoreCase) || fn.StartsWith("SaveGameInfo_old", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    File.Copy(f, Path.Combine(filesDir, fn), overwrite: true);
+                }
+
+                var meta = new JObject
+                {
+                    ["name"] = name,
+                    ["createdAt"] = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+                    ["saveFolderName"] = saveFolder,
+                    ["year"] = Game1.year,
+                    ["season"] = Game1.currentSeason,
+                    ["dayOfMonth"] = Game1.dayOfMonth,
+                    ["date"] = $"Year {Game1.year} {Game1.currentSeason} {Game1.dayOfMonth}",
+                    ["timeOfDay"] = Game1.timeOfDay,
+                    ["location"] = Game1.currentLocation?.NameOrUniqueName ?? "Farm",
+                    ["tileX"] = Game1.player.TilePoint.X,
+                    ["tileY"] = Game1.player.TilePoint.Y,
+                    ["facing"] = Game1.player.FacingDirection,
+                    ["money"] = Game1.player.Money,
+                    ["stamina"] = Game1.player.Stamina,
+                    ["health"] = Game1.player.health
+                };
+                File.WriteAllText(Path.Combine(cpDir, "checkpoint-meta.json"), meta.ToString(Formatting.Indented), Encoding.UTF8);
+
+                return new JObject
+                {
+                    ["ok"] = true,
+                    ["op"] = "save",
+                    ["checkpoint"] = meta
+                };
+            }
+            else if (op == "load")
+            {
+                string metaFile = Path.Combine(cpDir, "checkpoint-meta.json");
+                string filesDir = Path.Combine(cpDir, "savefiles");
+                if (!File.Exists(metaFile) || !Directory.Exists(filesDir))
+                {
+                    return new JObject { ["ok"] = false, ["error"] = $"Checkpoint `{name}` does not exist. Run `sdv-dev checkpoint list`." };
+                }
+
+                var meta = JObject.Parse(File.ReadAllText(metaFile, Encoding.UTF8));
+                string targetSaveFolder = meta.Value<string>("saveFolderName") ?? DedicatedTestSaveFolder;
+                if (!force && !targetSaveFolder.StartsWith("SdvDevTest_", StringComparison.OrdinalIgnoreCase))
+                {
+                    return new JObject
+                    {
+                        ["ok"] = false,
+                        ["error"] = $"Checkpoint `{name}` targets non-test save `{targetSaveFolder}`. Pass `--force` if authorized to overwrite that save slot."
+                    };
+                }
+
+                string savesRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "StardewValley", "Saves");
+                string dstSaveDir = Path.Combine(savesRoot, targetSaveFolder);
+                Directory.CreateDirectory(dstSaveDir);
+
+                foreach (var f in Directory.GetFiles(filesDir))
+                {
+                    File.Copy(f, Path.Combine(dstSaveDir, Path.GetFileName(f)), overwrite: true);
+                }
+
+                _pendingCheckpointRestore = new PendingCheckpointRestore
+                {
+                    Name = name,
+                    Location = meta.Value<string>("location") ?? "Farm",
+                    TileX = meta.Value<int?>("tileX") ?? 64,
+                    TileY = meta.Value<int?>("tileY") ?? 15,
+                    Facing = meta.Value<int?>("facing") ?? 2,
+                    TimeOfDay = meta.Value<int?>("timeOfDay") ?? 600,
+                    Stamina = meta.Value<float?>("stamina") ?? 270f,
+                    Health = meta.Value<int?>("health") ?? 100,
+                    Tcs = tcs
+                };
+
+                Game1.exitActiveMenu();
+                SaveGame.Load(targetSaveFolder);
+                return tcs != null ? null : new JObject { ["ok"] = true, ["op"] = "load", ["restoring"] = name };
+            }
+
+            return new JObject { ["ok"] = false, ["error"] = $"Unsupported checkpoint op `{op}`." };
+        }
+
+        private void TickCheckpointRestore()
+        {
+            var job = _pendingCheckpointRestore;
+            if (job == null)
+                return;
+
+            job.WaitTicks++;
+            if (!Context.IsWorldReady || Game1.player == null || Game1.currentLocation == null)
+            {
+                if (job.WaitTicks > 600)
+                {
+                    _pendingCheckpointRestore = null;
+                    job.Tcs?.TrySetResult(new JObject { ["ok"] = false, ["error"] = $"Timed out restoring checkpoint `{job.Name}`." });
+                }
+                return;
+            }
+
+            if (!job.WarpIssued)
+            {
+                job.WarpIssued = true;
+                Game1.timeOfDay = job.TimeOfDay;
+                Game1.player.Stamina = job.Stamina;
+                Game1.player.health = job.Health;
+
+                if (!string.Equals(Game1.currentLocation.NameOrUniqueName, job.Location, StringComparison.OrdinalIgnoreCase) ||
+                    Game1.player.TilePoint.X != job.TileX || Game1.player.TilePoint.Y != job.TileY)
+                {
+                    Game1.warpFarmer(job.Location, job.TileX, job.TileY, job.Facing);
+                    if (Game1.isWarping || Game1.locationRequest != null)
+                    {
+                        Game1.fadeToBlackAlpha = 1.1f;
+                        Game1.fadeToBlack = true;
+                        Game1.nonWarpFade = false;
+                        return;
+                    }
+                }
+                else
+                {
+                    Game1.player.faceDirection(job.Facing);
+                }
+            }
+
+            if ((Game1.isWarping || Game1.locationRequest != null) && job.WaitTicks < 660)
+                return;
+
+            _pendingCheckpointRestore = null;
+            Game1.fadeToBlack = false;
+            Game1.fadeToBlackAlpha = 0f;
+            Game1.timeOfDay = job.TimeOfDay;
+            Game1.gameTimeInterval = 0;
+            Game1.player.faceDirection(job.Facing);
+
+            job.Tcs?.TrySetResult(new JObject
+            {
+                ["ok"] = true,
+                ["op"] = "load",
+                ["checkpoint"] = job.Name,
+                ["date"] = $"Year {Game1.year} {Game1.currentSeason} {Game1.dayOfMonth}",
+                ["timeOfDay"] = Game1.timeOfDay,
+                ["location"] = Game1.currentLocation?.NameOrUniqueName,
+                ["tileX"] = Game1.player.TilePoint.X,
+                ["tileY"] = Game1.player.TilePoint.Y,
+                ["facing"] = Game1.player.FacingDirection,
+                ["money"] = Game1.player.Money
+            });
+        }
+
+        private JObject HandleScheduleCheck(JObject req)
+        {
+            if (!Context.IsWorldReady)
+                return new JObject { ["ok"] = false, ["error"] = "Live `schedule-check` requires `inWorld=true`." };
+
+            string? npcQuery = req.Value<string>("npc");
+            string? keyFilter = req.Value<string>("key");
+            if (string.IsNullOrWhiteSpace(npcQuery))
+                return new JObject { ["ok"] = false, ["error"] = "Specify NPC name (e.g. `sdv-dev schedule-check Abigail`)." };
+
+            NPC? npc = Utility.fuzzyCharacterSearch(npcQuery!, must_be_villager: false);
+            if (npc == null)
+            {
+                foreach (var loc in Game1.locations)
+                {
+                    npc = loc.characters.FirstOrDefault(c => c != null && c.Name.Equals(npcQuery, StringComparison.OrdinalIgnoreCase));
+                    if (npc != null) break;
+                }
+            }
+
+            if (npc == null)
+                return new JObject { ["ok"] = false, ["error"] = $"NPC `{npcQuery}` not found in loaded world." };
+
+            var rawSchedules = npc.getMasterScheduleRawData();
+            if (rawSchedules == null || rawSchedules.Count == 0)
+            {
+                return new JObject
+                {
+                    ["ok"] = true,
+                    ["npc"] = npc.Name,
+                    ["scheduleKeyCount"] = 0,
+                    ["note"] = $"NPC `{npc.Name}` has no master schedule entries in `Characters/schedules/{npc.Name}`."
+                };
+            }
+
+            var results = new JArray();
+            int brokenCount = 0;
+
+            foreach (var kv in rawSchedules)
+            {
+                if (!string.IsNullOrWhiteSpace(keyFilter) && !kv.Key.Equals(keyFilter, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                Dictionary<int, SchedulePathDescription>? parsed = null;
+                string? parseErr = null;
+                try
+                {
+                    parsed = npc.parseMasterSchedule(kv.Key, kv.Value);
+                }
+                catch (Exception ex)
+                {
+                    parseErr = ex.Message;
+                }
+
+                var legsArr = new JArray();
+                if (parsed != null)
+                {
+                    foreach (var leg in parsed.OrderBy(p => p.Key))
+                    {
+                        var desc = leg.Value;
+                        int stepCount = desc?.route?.Count ?? 0;
+                        Point? finalStep = stepCount > 0 ? desc!.route.Last() : (Point?)null;
+                        bool reachedExact = finalStep.HasValue && desc != null && finalStep.Value == desc.targetTile;
+                        if (stepCount == 0)
+                            brokenCount++;
+
+                        legsArr.Add(new JObject
+                        {
+                            ["time"] = leg.Key,
+                            ["targetLocation"] = desc?.targetLocationName,
+                            ["targetTile"] = desc != null ? $"{desc.targetTile.X},{desc.targetTile.Y}" : null,
+                            ["facing"] = desc?.facingDirection,
+                            ["animation"] = string.IsNullOrEmpty(desc?.endOfRouteBehavior) ? null : desc!.endOfRouteBehavior,
+                            ["routeSteps"] = stepCount,
+                            ["reachedTargetTile"] = reachedExact,
+                            ["status"] = stepCount == 0 ? "UNREACHABLE_OR_EMPTY_ROUTE" : (reachedExact ? "OK" : "PARTIAL_PATH")
+                        });
+                    }
+                }
+                else if (parseErr != null)
+                {
+                    brokenCount++;
+                }
+
+                results.Add(new JObject
+                {
+                    ["scheduleKey"] = kv.Key,
+                    ["rawScript"] = kv.Value,
+                    ["parseError"] = parseErr,
+                    ["legCount"] = legsArr.Count,
+                    ["legs"] = legsArr
+                });
+            }
+
+            return new JObject
+            {
+                ["ok"] = brokenCount == 0,
+                ["npc"] = npc.Name,
+                ["defaultMap"] = npc.DefaultMap,
+                ["defaultTile"] = $"{(int)(npc.DefaultPosition.X / 64f)},{(int)(npc.DefaultPosition.Y / 64f)}",
+                ["brokenLegCount"] = brokenCount,
+                ["schedules"] = results
+            };
         }
     }
 }

@@ -394,5 +394,147 @@ namespace SdvKb.Maps
             relBounds = new Rectangle(minX, minY, maxX - minX + 1, maxY - minY + 1);
             return true;
         }
+
+        /// <summary>
+        /// Draws a visual UI component &amp; controller neighbor navigation overlay onto a captured screen PNG
+        /// (`sdv-dev screenshot --mode screen --ui-overlay`).
+        /// </summary>
+        public static object DrawUiOverlayOnScreenshotPng(string pngPath, System.Text.Json.JsonElement uiLayout)
+        {
+            if (!File.Exists(pngPath) || uiLayout.ValueKind != System.Text.Json.JsonValueKind.Object)
+                return new { drawn = false };
+
+            if (!uiLayout.TryGetProperty("components", out var compsEl) || compsEl.ValueKind != System.Text.Json.JsonValueKind.Array)
+                return new { drawn = false, reason = "No active menu components." };
+
+            float scaleX = 1f, scaleY = 1f;
+            using var baseBmp = LoadBitmapUnlocked(pngPath);
+            if (uiLayout.TryGetProperty("uiViewport", out var vpEl) && vpEl.ValueKind == System.Text.Json.JsonValueKind.Object)
+            {
+                if (vpEl.TryGetProperty("width", out var vwEl) && vwEl.TryGetInt32(out int vw) && vw > 0 &&
+                    vpEl.TryGetProperty("height", out var vhEl) && vhEl.TryGetInt32(out int vh) && vh > 0)
+                {
+                    scaleX = (float)baseBmp.Width / vw;
+                    scaleY = (float)baseBmp.Height / vh;
+                }
+            }
+
+            var items = new List<(int Id, string? Name, Rectangle Rect, int Up, int Down, int Left, int Right)>();
+            var byId = new Dictionary<int, Rectangle>();
+
+            foreach (var c in compsEl.EnumerateArray())
+            {
+                int id = c.TryGetProperty("myID", out var idEl) && idEl.TryGetInt32(out int parsedId) ? parsedId : -1;
+                string? name = c.TryGetProperty("name", out var nEl) && nEl.ValueKind == System.Text.Json.JsonValueKind.String ? nEl.GetString() : null;
+                int up = c.TryGetProperty("upNeighborID", out var uEl) && uEl.TryGetInt32(out int pu) ? pu : -1;
+                int down = c.TryGetProperty("downNeighborID", out var dEl) && dEl.TryGetInt32(out int pd) ? pd : -1;
+                int left = c.TryGetProperty("leftNeighborID", out var lEl) && lEl.TryGetInt32(out int pl) ? pl : -1;
+                int right = c.TryGetProperty("rightNeighborID", out var rEl) && rEl.TryGetInt32(out int pr) ? pr : -1;
+
+                if (!c.TryGetProperty("bounds", out var bEl) || bEl.ValueKind != System.Text.Json.JsonValueKind.Object)
+                    continue;
+                int bx = bEl.TryGetProperty("x", out var xe) && xe.TryGetInt32(out int px) ? (int)Math.Round(px * scaleX) : 0;
+                int by = bEl.TryGetProperty("y", out var ye) && ye.TryGetInt32(out int py) ? (int)Math.Round(py * scaleY) : 0;
+                int bw = bEl.TryGetProperty("w", out var we) && we.TryGetInt32(out int pw) ? Math.Max(2, (int)Math.Round(pw * scaleX)) : 4;
+                int bh = bEl.TryGetProperty("h", out var he) && he.TryGetInt32(out int ph) ? Math.Max(2, (int)Math.Round(ph * scaleY)) : 4;
+
+                var rect = new Rectangle(bx, by, bw, bh);
+                items.Add((id, name, rect, up, down, left, right));
+                if (id >= 0 && !byId.ContainsKey(id))
+                    byId[id] = rect;
+            }
+
+            int brokenLinks = 0;
+            int validLinks = 0;
+
+            using var outBmp = new Bitmap(baseBmp.Width, baseBmp.Height, PixelFormat.Format32bppArgb);
+            using (var g = Graphics.FromImage(outBmp))
+            {
+                g.DrawImage(baseBmp, 0, 0, baseBmp.Width, baseBmp.Height);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+
+                using var boxFill = new SolidBrush(Color.FromArgb(36, 0, 225, 255));
+                using var boxPen = new Pen(Color.FromArgb(230, 0, 230, 255), 2f);
+                using var brokenBoxPen = new Pen(Color.FromArgb(245, 255, 65, 65), 2.5f);
+                using var navPen = new Pen(Color.FromArgb(185, 90, 255, 130), 1.6f)
+                {
+                    CustomEndCap = new AdjustableArrowCap(4f, 4f, true)
+                };
+                using var badgeBg = new SolidBrush(Color.FromArgb(215, 12, 16, 24));
+                using var brokenBadgeBg = new SolidBrush(Color.FromArgb(225, 175, 25, 25));
+                using var textWhite = new SolidBrush(Color.White);
+                using var textYellow = new SolidBrush(Color.FromArgb(255, 255, 225, 100));
+                using var font = new Font("Consolas", 8.5f, FontStyle.Bold, GraphicsUnit.Point);
+
+                // 1. Draw directional gamepad neighbor arrows first
+                foreach (var it in items)
+                {
+                    Point srcCenter = new Point(it.Rect.Left + it.Rect.Width / 2, it.Rect.Top + it.Rect.Height / 2);
+                    foreach (int nb in new[] { it.Up, it.Down, it.Left, it.Right })
+                    {
+                        if (nb < 0 || nb == -7777 || nb == -99998 || nb == -99999)
+                            continue; // -1=none, -7777=custom snap, -99998/-99999=automatic snap
+                        if (byId.TryGetValue(nb, out var dstRect))
+                        {
+                            Point dstCenter = new Point(dstRect.Left + dstRect.Width / 2, dstRect.Top + dstRect.Height / 2);
+                            if (srcCenter != dstCenter)
+                            {
+                                g.DrawLine(navPen, srcCenter, dstCenter);
+                                validLinks++;
+                            }
+                        }
+                        else
+                        {
+                            brokenLinks++;
+                        }
+                    }
+                }
+
+                // 2. Draw component bounding boxes & ID badges
+                foreach (var it in items)
+                {
+                    bool hasDangling = false;
+                    foreach (int nb in new[] { it.Up, it.Down, it.Left, it.Right })
+                    {
+                        if (nb >= 0 && !byId.ContainsKey(nb))
+                            hasDangling = true;
+                    }
+
+                    g.FillRectangle(boxFill, it.Rect);
+                    g.DrawRectangle(hasDangling ? brokenBoxPen : boxPen, it.Rect);
+
+                    string label = it.Id >= 0 ? $"#{it.Id}" : "(-)";
+                    if (!string.IsNullOrWhiteSpace(it.Name))
+                    {
+                        string shortName = it.Name!.Length > 14 ? it.Name.Substring(0, 14) : it.Name;
+                        label += $":{shortName}";
+                    }
+                    if (hasDangling)
+                        label += " [!NAV]";
+
+                    SizeF sz = g.MeasureString(label, font);
+                    float lx = Math.Max(0, Math.Min(outBmp.Width - sz.Width - 2, it.Rect.Left));
+                    float ly = it.Rect.Top >= sz.Height + 2 ? it.Rect.Top - sz.Height : it.Rect.Top + 1;
+                    g.FillRectangle(hasDangling ? brokenBadgeBg : badgeBg, lx, ly, sz.Width + 2, sz.Height);
+                    g.DrawString(label, font, it.Id >= 0 ? textYellow : textWhite, lx + 1, ly);
+                }
+
+                // 3. Top summary banner
+                string menuType = uiLayout.TryGetProperty("menuType", out var mt) ? (mt.GetString() ?? "Menu") : "Menu";
+                string summary = $"UI Overlay: {menuType} | Components={items.Count} | NavArrows={validLinks} | BrokenNeighborIDs={brokenLinks}";
+                g.FillRectangle(badgeBg, 0, 0, outBmp.Width, 22);
+                g.DrawString(summary, font, brokenLinks > 0 ? textYellow : textWhite, 6, 3);
+            }
+
+            outBmp.Save(pngPath, ImageFormat.Png);
+            return new
+            {
+                drawn = true,
+                componentCount = items.Count,
+                navArrowCount = validLinks,
+                brokenNeighborLinks = brokenLinks
+            };
+        }
     }
 }
