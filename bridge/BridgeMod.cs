@@ -240,8 +240,100 @@ namespace SdvDevBridge
             return $"sdv-dev-bridge-{ComputeUserToken()}";
         }
 
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetConsoleOutputCP(uint wCodePageID);
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetConsoleCP(uint wCodePageID);
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr GetStdHandle(int nStdHandle);
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern unsafe bool GetCurrentConsoleFontEx(IntPtr hConsoleOutput, int bMaximumWindow, ref CONSOLE_FONT_INFOEX lpConsoleCurrentFontEx);
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern unsafe bool SetCurrentConsoleFontEx(IntPtr hConsoleOutput, int bMaximumWindow, ref CONSOLE_FONT_INFOEX lpConsoleCurrentFontEx);
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private unsafe struct CONSOLE_FONT_INFOEX
+        {
+            public uint cbSize;
+            public uint nFont;
+            public short dwFontSizeX;
+            public short dwFontSizeY;
+            public uint FontFamily;
+            public uint FontWeight;
+            public fixed char FaceName[32];
+        }
+
+        private static unsafe void EnsureModernUtf8Console()
+        {
+            try
+            {
+                if (!System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+                    return;
+
+                SetConsoleOutputCP(65001);
+                SetConsoleCP(65001);
+                Console.OutputEncoding = new UTF8Encoding(false);
+
+                IntPtr hOut = GetStdHandle(-11);
+                if (hOut == IntPtr.Zero || hOut == new IntPtr(-1))
+                    return;
+
+                var cur = new CONSOLE_FONT_INFOEX { cbSize = (uint)sizeof(CONSOLE_FONT_INFOEX) };
+                if (!GetCurrentConsoleFontEx(hOut, 0, ref cur))
+                    return;
+
+                string face;
+                {
+                    int len = 0;
+                    while (len < 32 && cur.FaceName[len] != '\0') len++;
+                    face = new string(cur.FaceName, 0, len);
+                }
+
+                if (string.IsNullOrWhiteSpace(face)
+                    || face.Equals("Terminal", StringComparison.OrdinalIgnoreCase)
+                    || face.Equals("__DefaultTTFont__", StringComparison.OrdinalIgnoreCase)
+                    || face.IndexOf("宋体", StringComparison.OrdinalIgnoreCase) >= 0
+                    || face.IndexOf("SimSun", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    SetConsoleFontFace(hOut, "Cascadia Mono", 18);
+                    var verify = new CONSOLE_FONT_INFOEX { cbSize = (uint)sizeof(CONSOLE_FONT_INFOEX) };
+                    if (GetCurrentConsoleFontEx(hOut, 0, ref verify))
+                    {
+                        int vLen = 0;
+                        while (vLen < 32 && verify.FaceName[vLen] != '\0') vLen++;
+                        string vFace = new string(verify.FaceName, 0, vLen);
+                        if (!vFace.StartsWith("Cascadia", StringComparison.OrdinalIgnoreCase))
+                            SetConsoleFontFace(hOut, "Consolas", 18);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static unsafe void SetConsoleFontFace(IntPtr hOut, string faceName, short height)
+        {
+            var next = new CONSOLE_FONT_INFOEX
+            {
+                cbSize = (uint)sizeof(CONSOLE_FONT_INFOEX),
+                dwFontSizeY = height,
+                FontFamily = 54,
+                FontWeight = 400
+            };
+            int max = Math.Min(faceName.Length, 31);
+            for (int i = 0; i < max; i++)
+                next.FaceName[i] = faceName[i];
+            next.FaceName[max] = '\0';
+            SetCurrentConsoleFontEx(hOut, 0, ref next);
+        }
+
         public override void Entry(IModHelper helper)
         {
+            EnsureModernUtf8Console();
+
             _automationBackgroundMode = Environment.GetEnvironmentVariable("SDV_DEV_AUTOMATION") == "1";
             _pendingAutoLoadSave = Environment.GetEnvironmentVariable("SDV_DEV_AUTOLOAD_SAVE");
             if (!string.IsNullOrEmpty(_pendingAutoLoadSave))

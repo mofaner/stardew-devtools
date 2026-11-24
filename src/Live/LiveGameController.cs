@@ -608,14 +608,45 @@ namespace SdvKb.Live
             const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
             const uint CREATE_NEW_CONSOLE = 0x00000010;
             const uint CREATE_NEW_PROCESS_GROUP = 0x00000200;
-            const int STARTF_USESHOWWINDOW = 0x00000001;
-            const short SW_SHOWMINNOACTIVE = 7;
 
-            var cmdLine = new StringBuilder(QuoteCommandLineArg(smapiExe));
-            if (!string.IsNullOrWhiteSpace(customModsRoot))
+            // Prefer hosting SMAPI inside modern `pwsh.exe` (or direct UTF-8 console fallback) WITHOUT `SW_SHOWMINNOACTIVE`,
+            // so: (1) SDL2/MonoGame initializes the game window at full resolution instead of a clipped half-black rect,
+            // and (2) console runs in UTF-8 + modern PowerShell styling instead of legacy CP936 SimSun conhost!
+            string? pwshExe = FindExecutableInPath("pwsh.exe");
+            string appExe;
+            StringBuilder cmdLine;
+
+            if (!string.IsNullOrWhiteSpace(pwshExe) && File.Exists(pwshExe))
             {
-                string cleanModsRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(customModsRoot!));
-                cmdLine.Append(" --mods-path ").Append(QuoteCommandLineArg(cleanModsRoot));
+                appExe = pwshExe!;
+                string psSmapi = EscapeSingleQuotedPowerShell(smapiExe);
+                var psScript = new StringBuilder();
+                string? clientExe = ResolveCompanionClientExe();
+                if (!string.IsNullOrWhiteSpace(clientExe) && File.Exists(clientExe))
+                {
+                    psScript.Append($"& '{EscapeSingleQuotedPowerShell(clientExe!)}' --init-console; ");
+                }
+                psScript.Append($"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; & '{psSmapi}'");
+                if (!string.IsNullOrWhiteSpace(customModsRoot))
+                {
+                    string cleanMods = Path.TrimEndingDirectorySeparator(Path.GetFullPath(customModsRoot!));
+                    psScript.Append($" --mods-path '{EscapeSingleQuotedPowerShell(cleanMods)}'");
+                }
+
+                cmdLine = new StringBuilder();
+                cmdLine.Append(QuoteCommandLineArg(pwshExe!))
+                       .Append(" -NoLogo -NoProfile -ExecutionPolicy Bypass -Command ")
+                       .Append(QuoteCommandLineArg(psScript.ToString()));
+            }
+            else
+            {
+                appExe = smapiExe;
+                cmdLine = new StringBuilder(QuoteCommandLineArg(smapiExe));
+                if (!string.IsNullOrWhiteSpace(customModsRoot))
+                {
+                    string cleanModsRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(customModsRoot!));
+                    cmdLine.Append(" --mods-path ").Append(QuoteCommandLineArg(cleanModsRoot));
+                }
             }
 
             // Build Unicode environment block inheriting current env + SDV_DEV_* overrides
@@ -647,13 +678,12 @@ namespace SdvKb.Live
                 Marshal.Copy(envBytes, 0, envPtr, envBytes.Length);
                 var si = new STARTUPINFO
                 {
-                    cb = Marshal.SizeOf<STARTUPINFO>(),
-                    dwFlags = STARTF_USESHOWWINDOW,
-                    wShowWindow = SW_SHOWMINNOACTIVE // Launch SMAPI console minimized without stealing foreground focus!
+                    cb = Marshal.SizeOf<STARTUPINFO>()
+                    // Intentionally NO `STARTF_USESHOWWINDOW` / `SW_SHOWMINNOACTIVE`!
                 };
 
                 bool ok = CreateProcessW(
-                    smapiExe,
+                    appExe,
                     cmdLine,
                     IntPtr.Zero,
                     IntPtr.Zero,
@@ -667,7 +697,7 @@ namespace SdvKb.Live
                 if (!ok)
                 {
                     int winErr = Marshal.GetLastWin32Error();
-                    throw new InvalidOperationException($"Failed to launch StardewModdingAPI.exe via CreateProcessW (Win32 error={winErr}).");
+                    throw new InvalidOperationException($"Failed to launch SMAPI process via CreateProcessW (Win32 error={winErr}).");
                 }
 
                 if (pi.hProcess != IntPtr.Zero) CloseHandle(pi.hProcess);
@@ -677,6 +707,53 @@ namespace SdvKb.Live
             {
                 Marshal.FreeHGlobal(envPtr);
             }
+        }
+
+        private static string EscapeSingleQuotedPowerShell(string s) => s.Replace("'", "''");
+
+        private static string? ResolveCompanionClientExe()
+        {
+            try
+            {
+                string? procPath = Environment.ProcessPath;
+                if (!string.IsNullOrWhiteSpace(procPath))
+                {
+                    string? dir = Path.GetDirectoryName(procPath);
+                    if (!string.IsNullOrWhiteSpace(dir))
+                    {
+                        string cand = Path.Combine(dir, "sdv-dev.exe");
+                        if (File.Exists(cand))
+                            return cand;
+                    }
+                }
+            }
+            catch { }
+
+            string fallback = Path.Combine(AppContext.BaseDirectory, "sdv-dev.exe");
+            if (File.Exists(fallback))
+                return fallback;
+
+            return FindExecutableInPath("sdv-dev.exe");
+        }
+
+        private static string? FindExecutableInPath(string exeName)
+        {
+            string? pathEnv = Environment.GetEnvironmentVariable("PATH");
+            if (string.IsNullOrWhiteSpace(pathEnv))
+                return null;
+            foreach (var dir in pathEnv.Split(';'))
+            {
+                if (string.IsNullOrWhiteSpace(dir))
+                    continue;
+                try
+                {
+                    string cand = Path.Combine(dir.Trim(), exeName);
+                    if (File.Exists(cand))
+                        return cand;
+                }
+                catch { }
+            }
+            return null;
         }
 
         private static string QuoteCommandLineArg(string arg)

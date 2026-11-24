@@ -6,6 +6,7 @@
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <NoWarn>$(NoWarn);CA1416</NoWarn>
     <EnableHarmony>true</EnableHarmony>
     <EnableModDeploy>false</EnableModDeploy>

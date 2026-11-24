@@ -11,5 +11,6 @@
     <DebugSymbols>false</DebugSymbols>
     <InvariantGlobalization>true</InvariantGlobalization>
     <OptimizationPreference>Speed</OptimizationPreference>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 </Project>

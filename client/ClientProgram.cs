@@ -24,12 +24,45 @@ namespace SdvDevClient
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool SetConsoleCP(uint wCodePageID);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr GetStdHandle(int nStdHandle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern unsafe bool GetCurrentConsoleFontEx(IntPtr hConsoleOutput, int bMaximumWindow, ref CONSOLE_FONT_INFOEX lpConsoleCurrentFontEx);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern unsafe bool SetCurrentConsoleFontEx(IntPtr hConsoleOutput, int bMaximumWindow, ref CONSOLE_FONT_INFOEX lpConsoleCurrentFontEx);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private unsafe struct CONSOLE_FONT_INFOEX
+        {
+            public uint cbSize;
+            public uint nFont;
+            public short dwFontSizeX;
+            public short dwFontSizeY;
+            public uint FontFamily;
+            public uint FontWeight;
+            public fixed char FaceName[32];
+        }
+
         public static int Main(string[] args)
         {
             TryEnableWin10Utf8Console();
             EnsureSafeBundleExtractDir();
 
             string first = args.Length > 0 ? args[0].ToLowerInvariant() : string.Empty;
+
+            if (first == "--init-console")
+            {
+                TryUpgradeModernConsoleStyle();
+                return 0;
+            }
 
             if (first == "daemon-stop")
             {
@@ -198,6 +231,80 @@ namespace SdvDevClient
                 Console.InputEncoding = Encoding.UTF8;
             }
             catch { }
+        }
+
+        private static unsafe void TryUpgradeModernConsoleStyle()
+        {
+            const int STD_OUTPUT_HANDLE = -11;
+            const int STD_ERROR_HANDLE = -12;
+            const uint ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004;
+
+            try
+            {
+                IntPtr hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+                if (hOut != IntPtr.Zero && hOut != new IntPtr(-1))
+                {
+                    if (GetConsoleMode(hOut, out uint outMode))
+                        SetConsoleMode(hOut, outMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+
+                    var cur = new CONSOLE_FONT_INFOEX { cbSize = (uint)sizeof(CONSOLE_FONT_INFOEX) };
+                    if (GetCurrentConsoleFontEx(hOut, 0, ref cur))
+                    {
+                        string face = ReadFixedFaceName(ref cur);
+                        bool isLegacyOrCjk = string.IsNullOrWhiteSpace(face)
+                            || face.Equals("Terminal", StringComparison.OrdinalIgnoreCase)
+                            || face.Equals("__DefaultTTFont__", StringComparison.OrdinalIgnoreCase)
+                            || face.IndexOf("宋体", StringComparison.OrdinalIgnoreCase) >= 0
+                            || face.IndexOf("SimSun", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                        if (isLegacyOrCjk)
+                        {
+                            TrySetConsoleFontFace(hOut, "Cascadia Mono", 18);
+                            var verify = new CONSOLE_FONT_INFOEX { cbSize = (uint)sizeof(CONSOLE_FONT_INFOEX) };
+                            if (!GetCurrentConsoleFontEx(hOut, 0, ref verify)
+                                || !ReadFixedFaceName(ref verify).StartsWith("Cascadia", StringComparison.OrdinalIgnoreCase))
+                            {
+                                TrySetConsoleFontFace(hOut, "Consolas", 18);
+                            }
+                        }
+                    }
+                }
+
+                IntPtr hErr = GetStdHandle(STD_ERROR_HANDLE);
+                if (hErr != IntPtr.Zero && hErr != new IntPtr(-1) && GetConsoleMode(hErr, out uint errMode))
+                {
+                    SetConsoleMode(hErr, errMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+                }
+            }
+            catch { }
+        }
+
+        private static unsafe string ReadFixedFaceName(ref CONSOLE_FONT_INFOEX info)
+        {
+            fixed (char* p = info.FaceName)
+            {
+                int len = 0;
+                while (len < 32 && p[len] != '\0') len++;
+                return new string(p, 0, len);
+            }
+        }
+
+        private static unsafe void TrySetConsoleFontFace(IntPtr hOut, string faceName, short height)
+        {
+            var next = new CONSOLE_FONT_INFOEX
+            {
+                cbSize = (uint)sizeof(CONSOLE_FONT_INFOEX),
+                nFont = 0,
+                dwFontSizeX = 0,
+                dwFontSizeY = height,
+                FontFamily = 54,
+                FontWeight = 400
+            };
+            int max = Math.Min(faceName.Length, 31);
+            for (int i = 0; i < max; i++)
+                next.FaceName[i] = faceName[i];
+            next.FaceName[max] = '\0';
+            SetCurrentConsoleFontEx(hOut, 0, ref next);
         }
 
         private static void EnsureSafeBundleExtractDir()
