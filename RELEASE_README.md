@@ -1,6 +1,6 @@
 # stardew-devtools 使用说明
 
-这是一个给星露谷物语 1.6 做模组用的辅助工具包，包含命令行工具 `sdv-dev` 和配套的 AI 技能。装好之后，Claude Code、Cursor、Codex、Gemini、Antigravity 等 AI 助手就能直接查原版代码、帮你写模组、画地图，还能自己开测试档进游戏跑验收。
+星露谷物语 1.6 模组开发资料库与实机自动化测试工具包（包含命令行工具 `sdv-dev` 和配套 AI 技能）。装好之后，Claude Code、Cursor、Codex、Gemini、Antigravity 等 AI 助手就能直接离线检索原版源码与 Wiki 资料、编译检查模组、预览地图贴图，并自动开测试档进游戏完成实机验收。
 
 ---
 
