@@ -1,0 +1,63 @@
+> **文档来源**: Stardew Valley Official Wiki (https://stardewvalleywiki.com/Modding:Tailoring)
+
+# Modding:Tailoring (`Tailoring`)
+
+← Index
+
+This page explains how the game stores and uses tailoring recipe data. This is an advanced guide for mod developers. 
+
+## Overview
+Tailoring recipes are recipes that can be made in the tailoring menu, which can be opened by interacting with the Sewing Machine either at Emily's house or once the player obtains it.
+
+Tailoring recipe data is stored in the `Data/TailoringRecipes` asset.
+
+## Data format
+The `Data/TailoringRecipes` asset consists of a string → model lookup, where...
+- The key is a unique string ID for the tailoring recipe.
+- The value is a model with the fields listed below.
+
+| field | effect |
+| --- | --- |
+| `FirstItemTags` | A list of context tags for items that can be accepted by the feed slot on the left-hand side of the tailoring menu for this recipe. Typically contains the `item_cloth` context tag. |
+| `SecondItemTags` | A list of context tags for items that can be accepted by the spool slot on the right-hand side of the tailoring menu for this recipe. If a specific item is needed, the item's automatically generated context tag should be used, for example `item_magic_rock_candy`. |
+| `SpendRightItem` | *(Optional)* Whether to consume the item in the spool slot on the right-hand side of the tailoring menu when crafting the item. Default `true`. |
+| `CraftedItemId` | The qualified item ID of the crafted item. |
+| `CraftedItemIds` | *(Optional)* A list of qualified item IDs of possible crafted item outputs. For example, placing a Prismatic Shard in the feed slot of the tailoring menu has multiple possible clothing item outputs. Default `null`. |
+| `CraftedItemIdFeminine` | *(Optional)* The qualified item ID of the alternate crafted item output based on the player's gender. Assumes the CraftedItemId field contains the masculine version of the crafted item. Default `null`. |
+
+### Examples
+You can add or replace tailoring recipes. For example, this content pack adds a recipe to tailor a rain coat using cloth and a pufferchick:
+
+    "Changes": [
+        {
+            "Action": "EditData",
+            "Target": "Data/TailoringRecipes",
+            "Entries": {
+                "ExampleAuthor.ModId_RainCoatFromPufferchick": {
+                    "Id": "ExampleAuthor.ModId_RainCoatFromPufferchick"
+                    "FirstItemTags": [ "item_cloth" ],
+                    "SecondItemTags": [ "item_pufferchick" ],
+                    "SpendRightItem": true,
+                    "CraftedItemId": "(S)1260",
+                    "CraftedItemIds": null,
+                    "CraftedItemIdFeminine": null,
+                }
+            },
+        }
+    ]
+
+## Open the Tailoring Menu
+You can place an `Action Tailoring` tile property on the map, which will open the tailoring menu when the player clicks it. The player must have seen event 992559 (the event where Emily visits the farmhouse after you have gotten your first piece of cloth) for it to open.
+
+## See also
+Modding:Recipe data for data about cooking and crafting recipes.
+
+Modding:Hats for data about hat items.
+
+Modding:Shirts for data about shirt items.
+
+Modding:Pants for data about pant items.
+
+Modding:Boots for data about boot items .
+
+ru:Модификации:Шитьё

@@ -1,0 +1,863 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
+using SdvKb.Indexers;
+
+namespace SdvKb.Project
+{
+    public sealed class InstalledModInfo
+    {
+        public string UniqueId { get; set; } = string.Empty;
+        public string Name { get; set; } = string.Empty;
+        public string Version { get; set; } = string.Empty;
+        public string DirectoryPath { get; set; } = string.Empty;
+        public string? EntryDll { get; set; }
+        public string? EntryDllFullPath => !string.IsNullOrWhiteSpace(EntryDll) ? Path.Combine(DirectoryPath, EntryDll!) : null;
+        public string? ContentPackForId { get; set; }
+        public string Source { get; set; } = "local-mods"; // local-mods | deps-cache
+        public List<(string UniqueId, bool IsRequired)> Dependencies { get; set; } = new List<(string UniqueId, bool IsRequired)>();
+    }
+
+    public sealed class ProjectDepSpec
+    {
+        public string UniqueId { get; set; } = string.Empty;
+        public string? MinVersion { get; set; }
+        public bool IsRequired { get; set; } = true;
+        public bool ReferenceDll { get; set; } = true;
+        public string? GitHubRepo { get; set; }
+        public string? AssetKeyword { get; set; }
+    }
+
+    public sealed class SdvProjectConfig
+    {
+        public bool Isolated { get; set; }
+        public List<string> ExtraMods { get; set; } = new List<string>();
+        public List<ProjectDepSpec> Dependencies { get; set; } = new List<ProjectDepSpec>();
+    }
+
+    public sealed class DependencyResolutionResult
+    {
+        public string ProjectDir { get; set; } = string.Empty;
+        public string ModUniqueId { get; set; } = string.Empty;
+        public bool IsolatedDefault { get; set; }
+        public List<InstalledModInfo> ResolvedMods { get; set; } = new List<InstalledModInfo>();
+        public List<string> CompileReferenceDlls { get; set; } = new List<string>();
+        public List<string> MissingRequired { get; set; } = new List<string>();
+        public List<string> MissingOptional { get; set; } = new List<string>();
+        public List<string> Notes { get; set; } = new List<string>();
+    }
+
+    /// <summary>
+    /// Lightweight project &amp; prerequisite mod resolver:
+    /// 1. Reads prerequisites from `manifest.json` (`ContentPackFor` + `Dependencies`) and optional `sdv-project.json`.
+    /// 2. Scans local `&lt;GamePath&gt;\Mods` (recursively handling nested folders) and `~/.local/share/sdv-dev/deps-cache`.
+    /// 3. Resolves full transitive prerequisite graph for `--isolated` (`--mods-path`) loading and C# compile-time DLL references.
+    /// 4. Falls back to GitHub Releases `.zip` download (never NexusMods!) when an open-source prerequisite is missing locally.
+    /// </summary>
+    public static class ModDependencyResolver
+    {
+        public static string DepsCacheRoot => Path.Combine(KbConfig.DataDir, "deps-cache");
+        public static string DefaultIsolatedModsRoot => Path.Combine(KbConfig.DataDir, "isolated-mods");
+
+        private static readonly JsonDocumentOptions JsoncReadOpts = new JsonDocumentOptions
+        {
+            CommentHandling = JsonCommentHandling.Skip,
+            AllowTrailingCommas = true
+        };
+
+        // Common Stardew 1.6 framework aliases & open-source GitHub Release repositories (fallback when missing in local Mods)
+        private static readonly (string Alias, string UniqueId, string? GitHubRepo, string? AssetHint)[] KnownFrameworks =
+        {
+            ("cp", "Pathoschild.ContentPatcher", "Pathoschild/StardewMods", "ContentPatcher"),
+            ("contentpatcher", "Pathoschild.ContentPatcher", "Pathoschild/StardewMods", "ContentPatcher"),
+            ("gmcm", "spacechase0.GenericModConfigMenu", "spacechase0/StardewValleyMods", "GenericModConfigMenu"),
+            ("genericmodconfigmenu", "spacechase0.GenericModConfigMenu", "spacechase0/StardewValleyMods", "GenericModConfigMenu"),
+            ("spacecore", "spacechase0.SpaceCore", "spacechase0/StardewValleyMods", "SpaceCore"),
+            ("ftm", "Esca.FarmTypeManager", "Esca-MMC/FarmTypeManager", "FarmTypeManager"),
+            ("farmtypemanager", "Esca.FarmTypeManager", "Esca-MMC/FarmTypeManager", "FarmTypeManager"),
+            ("automate", "Pathoschild.Automate", "Pathoschild/StardewMods", "Automate"),
+            ("lookupanything", "Pathoschild.LookupAnything", "Pathoschild/StardewMods", "LookupAnything"),
+            ("chestsanywhere", "Pathoschild.ChestsAnywhere", "Pathoschild/StardewMods", "ChestsAnywhere"),
+            ("tractormod", "Pathoschild.TractorMod", "Pathoschild/StardewMods", "TractorMod"),
+            ("centralstation", "Pathoschild.CentralStation", "Pathoschild/StardewMods", "CentralStation"),
+            ("uiinfosuite2", "Annosz.UiInfoSuite2", "Annosz/UIInfoSuite2", "UIInfoSuite2"),
+            ("alternativetextures", "PeacefulEnd.AlternativeTextures", "PeacefulEnd/AlternativeTextures", "AlternativeTextures"),
+            ("fashionSense", "PeacefulEnd.FashionSense", "PeacefulEnd/FashionSense", "FashionSense"),
+            ("customcompanions", "PeacefulEnd.CustomCompanions", "PeacefulEnd/CustomCompanions", "CustomCompanions"),
+            ("stardewhack", "bcmpinc.StardewHack", "bcmpinc/StardewHack", "StardewHack"),
+            ("kokoro", "Shockah.Kokoro", "Shockah/Stardew-Valley-Mods", "Kokoro"),
+            ("trinkettinker", "mushymato.TrinketTinker", "Mushymato/TrinketTinker", "TrinketTinker"),
+            ("sve", "FlashShifter.StardewValleyExpandedCP", null, null)
+        };
+
+        public static Dictionary<string, InstalledModInfo> ScanAvailableMods(string gamePath)
+        {
+            var index = new Dictionary<string, InstalledModInfo>(StringComparer.OrdinalIgnoreCase);
+
+            // 1. Scan deps-cache first, then local GamePath\Mods (so player's local Mods version takes priority!)
+            ScanRootIntoIndex(DepsCacheRoot, "deps-cache", index);
+            if (!string.IsNullOrWhiteSpace(gamePath))
+            {
+                ScanRootIntoIndex(Path.Combine(gamePath, "Mods"), "local-mods", index);
+            }
+
+            return index;
+        }
+
+        private static void ScanRootIntoIndex(string rootDir, string sourceTag, Dictionary<string, InstalledModInfo> index)
+        {
+            if (!Directory.Exists(rootDir))
+                return;
+
+            string[] manifests;
+            try
+            {
+                manifests = Directory.GetFiles(rootDir, "manifest.json", SearchOption.AllDirectories);
+            }
+            catch
+            {
+                return;
+            }
+
+            foreach (var mf in manifests)
+            {
+                try
+                {
+                    string modFolder = Path.GetDirectoryName(mf)!;
+                    string folderName = Path.GetFileName(modFolder);
+                    // Skip SMAPI disabled folders starting with '.'
+                    if (folderName.StartsWith(".", StringComparison.Ordinal))
+                        continue;
+
+                    var parsed = ParseManifestFile(mf, sourceTag);
+                    if (parsed == null || string.IsNullOrWhiteSpace(parsed.UniqueId))
+                        continue;
+                    if (parsed.UniqueId.Equals("SdvDev.Bridge", StringComparison.OrdinalIgnoreCase) ||
+                        folderName.Equals("_SdvDevBridge", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    index[parsed.UniqueId] = parsed;
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        public static InstalledModInfo? ParseManifestFile(string manifestPath, string sourceTag = "project")
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(manifestPath), JsoncReadOpts);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+                return null;
+
+            string? uid = GetString(root, "UniqueID");
+            if (string.IsNullOrWhiteSpace(uid))
+                return null;
+
+            var info = new InstalledModInfo
+            {
+                UniqueId = uid!.Trim(),
+                Name = GetString(root, "Name") ?? uid!.Trim(),
+                Version = GetString(root, "Version") ?? "1.0.0",
+                DirectoryPath = Path.GetDirectoryName(Path.GetFullPath(manifestPath))!,
+                EntryDll = GetString(root, "EntryDll"),
+                Source = sourceTag
+            };
+
+            if (TryGetProp(root, "ContentPackFor", out var cpf) && cpf.ValueKind == JsonValueKind.Object)
+            {
+                string? cpfId = GetString(cpf, "UniqueID");
+                if (!string.IsNullOrWhiteSpace(cpfId))
+                {
+                    info.ContentPackForId = cpfId!.Trim();
+                    info.Dependencies.Add((cpfId!.Trim(), true));
+                }
+            }
+
+            if (TryGetProp(root, "Dependencies", out var depsEl) && depsEl.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var d in depsEl.EnumerateArray())
+                {
+                    if (d.ValueKind != JsonValueKind.Object)
+                        continue;
+                    string? depId = GetString(d, "UniqueID");
+                    if (string.IsNullOrWhiteSpace(depId))
+                        continue;
+
+                    bool isReq = true;
+                    if (TryGetProp(d, "IsRequired", out var reqEl))
+                    {
+                        if (reqEl.ValueKind == JsonValueKind.False)
+                            isReq = false;
+                        else if (reqEl.ValueKind == JsonValueKind.String && reqEl.GetString()!.Equals("false", StringComparison.OrdinalIgnoreCase))
+                            isReq = false;
+                    }
+
+                    if (!info.Dependencies.Any(x => x.UniqueId.Equals(depId, StringComparison.OrdinalIgnoreCase)))
+                        info.Dependencies.Add((depId!.Trim(), isReq));
+                }
+            }
+
+            return info;
+        }
+
+        public static SdvProjectConfig LoadProjectConfig(string modDir)
+        {
+            string cfgPath = Path.Combine(modDir, "sdv-project.json");
+            if (!File.Exists(cfgPath))
+                return new SdvProjectConfig();
+
+            try
+            {
+                return JsonSerializer.Deserialize<SdvProjectConfig>(
+                    File.ReadAllText(cfgPath),
+                    new JsonSerializerOptions
+                    {
+                        PropertyNameCaseInsensitive = true,
+                        ReadCommentHandling = JsonCommentHandling.Skip,
+                        AllowTrailingCommas = true
+                    }) ?? new SdvProjectConfig();
+            }
+            catch
+            {
+                return new SdvProjectConfig();
+            }
+        }
+
+        public static void SaveProjectConfig(string modDir, SdvProjectConfig cfg)
+        {
+            string cfgPath = Path.Combine(modDir, "sdv-project.json");
+            string json = JsonSerializer.Serialize(cfg, new JsonSerializerOptions
+            {
+                WriteIndented = true,
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+            });
+            File.WriteAllText(cfgPath, json, new UTF8Encoding(false));
+        }
+
+        /// <summary>
+        /// Resolves all direct and transitive prerequisites of `modDir` (plus any CLI `extraModQueries`),
+        /// looking in local `GamePath\Mods` -> `deps-cache` -> GitHub Releases fallback (if `allowGitHubDownload` is true).
+        /// </summary>
+        public static DependencyResolutionResult ResolveProjectDependencies(
+            string? modDir,
+            string gamePath,
+            IEnumerable<string>? extraModQueries = null,
+            bool allowGitHubDownload = true)
+        {
+            var res = new DependencyResolutionResult();
+            var available = ScanAvailableMods(gamePath);
+            var queue = new Queue<(string QueryOrId, bool IsRequired, bool RefDll, string? ExplicitGitHub, string? AssetHint)>();
+
+            if (!string.IsNullOrWhiteSpace(modDir) && Directory.Exists(modDir))
+            {
+                string fullModDir = Path.GetFullPath(modDir!);
+                res.ProjectDir = fullModDir;
+
+                var projCfg = LoadProjectConfig(fullModDir);
+                res.IsolatedDefault = projCfg.Isolated;
+
+                string manifestPath = Path.Combine(fullModDir, "manifest.json");
+                if (File.Exists(manifestPath))
+                {
+                    var selfInfo = ParseManifestFile(manifestPath, "project");
+                    if (selfInfo != null)
+                    {
+                        res.ModUniqueId = selfInfo.UniqueId;
+                        foreach (var dep in selfInfo.Dependencies)
+                        {
+                            var cfgMatch = projCfg.Dependencies.FirstOrDefault(d => d.UniqueId.Equals(dep.UniqueId, StringComparison.OrdinalIgnoreCase));
+                            queue.Enqueue((
+                                dep.UniqueId,
+                                dep.IsRequired,
+                                cfgMatch?.ReferenceDll ?? true,
+                                cfgMatch?.GitHubRepo,
+                                cfgMatch?.AssetKeyword));
+                        }
+                    }
+                }
+
+                foreach (var pd in projCfg.Dependencies)
+                {
+                    if (!string.IsNullOrWhiteSpace(pd.UniqueId))
+                        queue.Enqueue((pd.UniqueId, pd.IsRequired, pd.ReferenceDll, pd.GitHubRepo, pd.AssetKeyword));
+                }
+
+                foreach (var extra in projCfg.ExtraMods)
+                {
+                    if (!string.IsNullOrWhiteSpace(extra))
+                        queue.Enqueue((extra.Trim(), true, false, null, null));
+                }
+            }
+
+            if (extraModQueries != null)
+            {
+                foreach (var q in extraModQueries)
+                {
+                    if (!string.IsNullOrWhiteSpace(q))
+                        queue.Enqueue((q.Trim(), true, false, null, null));
+                }
+            }
+
+            var visitedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (!string.IsNullOrEmpty(res.ModUniqueId))
+                visitedIds.Add(res.ModUniqueId);
+
+            while (queue.Count > 0)
+            {
+                var item = queue.Dequeue();
+                string canonicalId = ResolveAliasOrMatchLocal(item.QueryOrId, available);
+                if (!visitedIds.Add(canonicalId))
+                    continue;
+
+                if (!available.TryGetValue(canonicalId, out var modInfo) && allowGitHubDownload)
+                {
+                    var (fetched, note) = TryFetchFromGitHubReleases(canonicalId, item.ExplicitGitHub, item.AssetHint);
+                    if (!string.IsNullOrEmpty(note))
+                        res.Notes.Add(note!);
+
+                    if (fetched != null)
+                    {
+                        // Re-scan deps-cache in case the zip contained multiple folders (e.g., sub-packs)
+                        ScanRootIntoIndex(DepsCacheRoot, "deps-cache", available);
+                        available.TryGetValue(canonicalId, out modInfo);
+                        modInfo ??= fetched;
+                    }
+                }
+
+                if (modInfo == null)
+                {
+                    if (item.IsRequired)
+                        res.MissingRequired.Add(canonicalId);
+                    else
+                        res.MissingOptional.Add(canonicalId);
+                    continue;
+                }
+
+                res.ResolvedMods.Add(modInfo);
+
+                if (item.RefDll && modInfo.EntryDllFullPath != null && File.Exists(modInfo.EntryDllFullPath))
+                {
+                    if (!res.CompileReferenceDlls.Contains(modInfo.EntryDllFullPath, StringComparer.OrdinalIgnoreCase))
+                        res.CompileReferenceDlls.Add(modInfo.EntryDllFullPath);
+                }
+
+                // Enqueue transitive required dependencies (e.g., ContentPack -> Framework -> SubFramework)
+                foreach (var trans in modInfo.Dependencies)
+                {
+                    if (trans.IsRequired && !visitedIds.Contains(trans.UniqueId))
+                    {
+                        queue.Enqueue((trans.UniqueId, true, false, null, null));
+                    }
+                }
+            }
+
+            return res;
+        }
+
+        /// <summary>
+        /// Adds or updates a prerequisite dependency in the mod's `manifest.json` (`Dependencies`) and `sdv-project.json`,
+        /// resolving it from local `GamePath\Mods` first, or GitHub Releases if missing locally.
+        /// </summary>
+        public static object AddDependencyToProject(
+            string modDir,
+            string queryOrId,
+            string gamePath,
+            bool isRequired,
+            bool referenceDll,
+            string? explicitGitHubRepo,
+            string? minVersionOverride)
+        {
+            string fullModDir = Path.GetFullPath(modDir);
+            string manifestPath = Path.Combine(fullModDir, "manifest.json");
+            if (!File.Exists(manifestPath))
+                throw new FileNotFoundException($"manifest.json not found in `{fullModDir}`.");
+
+            var available = ScanAvailableMods(gamePath);
+            string targetId = ResolveAliasOrMatchLocal(queryOrId, available);
+            string? note = null;
+
+            if (!available.TryGetValue(targetId, out var resolvedMod))
+            {
+                var (fetched, dlNote) = TryFetchFromGitHubReleases(targetId, explicitGitHubRepo, assetHint: null);
+                note = dlNote;
+                if (fetched != null)
+                {
+                    resolvedMod = fetched;
+                    targetId = fetched.UniqueId;
+                }
+            }
+
+            string? minVer = minVersionOverride ?? resolvedMod?.Version;
+
+            // 1. Update manifest.json Dependencies array cleanly using System.Text.Json.Nodes
+            var rootNode = JsonNode.Parse(File.ReadAllText(manifestPath), documentOptions: JsoncReadOpts) as JsonObject
+                ?? throw new InvalidDataException("manifest.json root must be a JSON object.");
+
+            // Do not duplicate if already ContentPackFor
+            string? cpfId = (rootNode["ContentPackFor"] as JsonObject)?["UniqueID"]?.GetValue<string>();
+            if (!string.Equals(cpfId, targetId, StringComparison.OrdinalIgnoreCase))
+            {
+                JsonArray depsArr;
+                if (rootNode["Dependencies"] is JsonArray existingArr)
+                {
+                    depsArr = existingArr;
+                }
+                else
+                {
+                    depsArr = new JsonArray();
+                    rootNode["Dependencies"] = depsArr;
+                }
+
+                JsonObject? existingEntry = depsArr
+                    .OfType<JsonObject>()
+                    .FirstOrDefault(o => string.Equals(o["UniqueID"]?.GetValue<string>(), targetId, StringComparison.OrdinalIgnoreCase));
+
+                if (existingEntry == null)
+                {
+                    existingEntry = new JsonObject { ["UniqueID"] = targetId };
+                    depsArr.Add(existingEntry);
+                }
+
+                if (!string.IsNullOrWhiteSpace(minVer))
+                    existingEntry["MinimumVersion"] = minVer;
+                existingEntry["IsRequired"] = isRequired;
+
+                File.WriteAllText(manifestPath, rootNode.ToJsonString(new JsonSerializerOptions
+                {
+                    WriteIndented = true,
+                    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+                }), new UTF8Encoding(false));
+            }
+
+            // 2. Update sdv-project.json
+            var projCfg = LoadProjectConfig(fullModDir);
+            var existingSpec = projCfg.Dependencies.FirstOrDefault(d => d.UniqueId.Equals(targetId, StringComparison.OrdinalIgnoreCase));
+            if (existingSpec == null)
+            {
+                existingSpec = new ProjectDepSpec { UniqueId = targetId };
+                projCfg.Dependencies.Add(existingSpec);
+            }
+            existingSpec.IsRequired = isRequired;
+            existingSpec.ReferenceDll = referenceDll;
+            existingSpec.MinVersion = minVer;
+            if (!string.IsNullOrWhiteSpace(explicitGitHubRepo))
+                existingSpec.GitHubRepo = explicitGitHubRepo;
+            SaveProjectConfig(fullModDir, projCfg);
+
+            return new
+            {
+                ok = resolvedMod != null || !isRequired,
+                uniqueId = targetId,
+                name = resolvedMod?.Name ?? targetId,
+                version = resolvedMod?.Version ?? minVer,
+                resolvedFrom = resolvedMod?.Source ?? "unresolved",
+                resolvedDirectory = resolvedMod?.DirectoryPath,
+                entryDll = resolvedMod?.EntryDllFullPath,
+                isRequired,
+                referenceDll,
+                note
+            };
+        }
+
+        public static object RemoveDependencyFromProject(string modDir, string queryOrId, string gamePath)
+        {
+            string fullModDir = Path.GetFullPath(modDir);
+            var available = ScanAvailableMods(gamePath);
+            string targetId = ResolveAliasOrMatchLocal(queryOrId, available);
+
+            string manifestPath = Path.Combine(fullModDir, "manifest.json");
+            bool removedFromManifest = false;
+            if (File.Exists(manifestPath))
+            {
+                var rootNode = JsonNode.Parse(File.ReadAllText(manifestPath), documentOptions: JsoncReadOpts) as JsonObject;
+                if (rootNode?["Dependencies"] is JsonArray depsArr)
+                {
+                    for (int i = depsArr.Count - 1; i >= 0; i--)
+                    {
+                        if (depsArr[i] is JsonObject o &&
+                            string.Equals(o["UniqueID"]?.GetValue<string>(), targetId, StringComparison.OrdinalIgnoreCase))
+                        {
+                            depsArr.RemoveAt(i);
+                            removedFromManifest = true;
+                        }
+                    }
+                    if (removedFromManifest)
+                    {
+                        File.WriteAllText(manifestPath, rootNode!.ToJsonString(new JsonSerializerOptions
+                        {
+                            WriteIndented = true,
+                            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+                        }), new UTF8Encoding(false));
+                    }
+                }
+            }
+
+            var projCfg = LoadProjectConfig(fullModDir);
+            int removedCfg = projCfg.Dependencies.RemoveAll(d => d.UniqueId.Equals(targetId, StringComparison.OrdinalIgnoreCase));
+            if (removedCfg > 0 || File.Exists(Path.Combine(fullModDir, "sdv-project.json")))
+                SaveProjectConfig(fullModDir, projCfg);
+
+            return new
+            {
+                ok = true,
+                uniqueId = targetId,
+                removedFromManifest,
+                removedFromProjectJson = removedCfg > 0
+            };
+        }
+
+        /// <summary>
+        /// Inspects &amp; decompiles the public Mod-Provided API (`GetApi()` + `I*Api` interface) of a prerequisite mod DLL!
+        /// Essential for SMAPI `Helper.ModRegistry.GetApi&lt;IMyModApi&gt;("UniqueID")` integration without guessing signatures.
+        /// </summary>
+        public static string InspectModProvidedApi(string queryOrId, string gamePath, string? typeFilter = null, int maxLines = 320)
+        {
+            var available = ScanAvailableMods(gamePath);
+            string targetId = ResolveAliasOrMatchLocal(queryOrId, available);
+            if (!available.TryGetValue(targetId, out var mod))
+                throw new InvalidOperationException($"Mod `{queryOrId}` (`{targetId}`) is not installed in local Mods or deps-cache.");
+
+            if (string.IsNullOrWhiteSpace(mod.EntryDllFullPath) || !File.Exists(mod.EntryDllFullPath))
+                return $"// Mod `{mod.Name}` ({mod.UniqueId} v{mod.Version}) is a Content Pack without an EntryDll.";
+
+            return DecompileService.DecompileExternalModApi(mod.EntryDllFullPath!, gamePath, mod.UniqueId, mod.Version, typeFilter, maxLines);
+        }
+
+        public static string ExpandQueryAlias(string query, Dictionary<string, InstalledModInfo> available) =>
+            ResolveAliasOrMatchLocal(query, available);
+
+        /// <summary>
+        /// Stages an isolated SMAPI `--mods-path` folder containing ONLY:
+        /// - `_SdvDevBridge`
+        /// - Target mod (`projectDir`, if any)
+        /// - All resolved direct &amp; transitive prerequisite mods!
+        /// </summary>
+        public static (string IsolatedModsDir, List<string> StagedModIds, List<string> MissingModIds) StageIsolatedModsDirectory(
+            string gamePath,
+            string? customIsolatedDir,
+            string? projectDir,
+            IEnumerable<string>? extraWithMods)
+        {
+            string isoRoot = string.IsNullOrWhiteSpace(customIsolatedDir)
+                ? DefaultIsolatedModsRoot
+                : Path.GetFullPath(customIsolatedDir!);
+
+            // Preserve any generated `config.json` files per mod folder before refreshing isolated directory
+            var savedConfigs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (Directory.Exists(isoRoot))
+            {
+                foreach (var sub in Directory.GetDirectories(isoRoot))
+                {
+                    string cfgFile = Path.Combine(sub, "config.json");
+                    if (File.Exists(cfgFile))
+                    {
+                        try { savedConfigs[Path.GetFileName(sub)] = File.ReadAllText(cfgFile); } catch { }
+                    }
+                }
+                Directory.Delete(isoRoot, recursive: true);
+            }
+            Directory.CreateDirectory(isoRoot);
+
+            var depRes = ResolveProjectDependencies(projectDir, gamePath, extraWithMods, allowGitHubDownload: true);
+            var stagedIds = new List<string>();
+
+            foreach (var depMod in depRes.ResolvedMods)
+            {
+                string safeFolder = SanitizeFolderName(depMod.UniqueId);
+                string dst = Path.Combine(isoRoot, safeFolder);
+                CopyDirectoryAll(depMod.DirectoryPath, dst);
+                if (savedConfigs.TryGetValue(safeFolder, out var oldCfg) && !File.Exists(Path.Combine(dst, "config.json")))
+                {
+                    File.WriteAllText(Path.Combine(dst, "config.json"), oldCfg, new UTF8Encoding(false));
+                }
+                stagedIds.Add($"{depMod.UniqueId} ({depMod.Version}, {depMod.Source})");
+            }
+
+            if (!string.IsNullOrWhiteSpace(projectDir) && Directory.Exists(projectDir))
+            {
+                string fullProj = Path.GetFullPath(projectDir!);
+                string folderName = Path.GetFileName(fullProj.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+                if (string.IsNullOrWhiteSpace(folderName) || folderName.Equals("src", StringComparison.OrdinalIgnoreCase))
+                    folderName = SanitizeFolderName(depRes.ModUniqueId);
+
+                string dst = Build.DotNet6ModCompiler.DeployModFolderToModsRoot(fullProj, isoRoot, folderName);
+                if (savedConfigs.TryGetValue(Path.GetFileName(dst), out var oldProjCfg) && !File.Exists(Path.Combine(dst, "config.json")))
+                {
+                    File.WriteAllText(Path.Combine(dst, "config.json"), oldProjCfg, new UTF8Encoding(false));
+                }
+                stagedIds.Add($"{depRes.ModUniqueId} (target-project)");
+            }
+
+            return (isoRoot, stagedIds, depRes.MissingRequired);
+        }
+
+        private static string ResolveAliasOrMatchLocal(string query, Dictionary<string, InstalledModInfo> available)
+        {
+            string q = query.Trim();
+            if (available.ContainsKey(q))
+                return available[q].UniqueId;
+
+            var known = KnownFrameworks.FirstOrDefault(k =>
+                k.Alias.Equals(q, StringComparison.OrdinalIgnoreCase) ||
+                k.UniqueId.Equals(q, StringComparison.OrdinalIgnoreCase));
+            if (!string.IsNullOrEmpty(known.UniqueId))
+                return known.UniqueId;
+
+            // Substring match against local installed Mods (e.g. "Portraiture", "WearMoreRings", "SkullCavern")
+            var byName = available.Values.FirstOrDefault(m =>
+                m.Name.Equals(q, StringComparison.OrdinalIgnoreCase) ||
+                m.UniqueId.EndsWith("." + q, StringComparison.OrdinalIgnoreCase) ||
+                m.Name.Replace(" ", "").Equals(q.Replace(" ", ""), StringComparison.OrdinalIgnoreCase));
+            if (byName != null)
+                return byName.UniqueId;
+
+            return q;
+        }
+
+        private static (InstalledModInfo? Mod, string? Note) TryFetchFromGitHubReleases(
+            string uniqueIdOrRepo,
+            string? explicitGitHubRepo,
+            string? assetHint)
+        {
+            string? repo = explicitGitHubRepo;
+            string? hint = assetHint;
+
+            if (string.IsNullOrWhiteSpace(repo))
+            {
+                if (Regex.IsMatch(uniqueIdOrRepo, @"^[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+$"))
+                {
+                    repo = uniqueIdOrRepo;
+                }
+                else
+                {
+                    var known = KnownFrameworks.FirstOrDefault(k => k.UniqueId.Equals(uniqueIdOrRepo, StringComparison.OrdinalIgnoreCase));
+                    if (!string.IsNullOrEmpty(known.GitHubRepo))
+                    {
+                        repo = known.GitHubRepo;
+                        hint ??= known.AssetHint;
+                    }
+                    else
+                    {
+                        repo = TryLookupGitHubRepoFromSmapiList(uniqueIdOrRepo);
+                    }
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(repo))
+                return (null, $"Prerequisite `{uniqueIdOrRepo}` not found in local Mods, and no known GitHub repository was mapped.");
+
+            hint ??= uniqueIdOrRepo.Contains('.') ? uniqueIdOrRepo.Split('.').Last() : uniqueIdOrRepo;
+
+            try
+            {
+                using var http = CreateGitHubHttpClient();
+                string apiUrl = $"https://api.github.com/repos/{repo}/releases?per_page=25";
+                var resp = http.GetAsync(apiUrl).GetAwaiter().GetResult();
+                if (!resp.IsSuccessStatusCode)
+                    return (null, $"GitHub Releases query for `{repo}` returned HTTP {(int)resp.StatusCode}.");
+
+                string json = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                using var doc = JsonDocument.Parse(json);
+                if (doc.RootElement.ValueKind != JsonValueKind.Array)
+                    return (null, $"Unexpected GitHub API response for `{repo}`.");
+
+                string? bestZipUrl = null;
+                string? bestAssetName = null;
+
+                foreach (var rel in doc.RootElement.EnumerateArray())
+                {
+                    if (rel.TryGetProperty("draft", out var dr) && dr.ValueKind == JsonValueKind.True)
+                        continue;
+                    if (!rel.TryGetProperty("assets", out var assets) || assets.ValueKind != JsonValueKind.Array)
+                        continue;
+
+                    var zipAssets = new List<(string Name, string Url)>();
+                    foreach (var a in assets.EnumerateArray())
+                    {
+                        string? aName = GetString(a, "name");
+                        string? aUrl = GetString(a, "browser_download_url");
+                        if (!string.IsNullOrEmpty(aName) && !string.IsNullOrEmpty(aUrl) &&
+                            aName!.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+                        {
+                            zipAssets.Add((aName!, aUrl!));
+                        }
+                    }
+
+                    if (zipAssets.Count == 0)
+                        continue;
+
+                    // Prefer asset matching hint (essential for monorepos like Pathoschild/StardewMods!)
+                    var matched = zipAssets.FirstOrDefault(z =>
+                        z.Name.Replace(" ", "").Replace("-", "").Replace("_", "")
+                            .IndexOf(hint!.Replace(" ", "").Replace("-", "").Replace("_", ""), StringComparison.OrdinalIgnoreCase) >= 0);
+
+                    if (!string.IsNullOrEmpty(matched.Url))
+                    {
+                        bestAssetName = matched.Name;
+                        bestZipUrl = matched.Url;
+                        break;
+                    }
+
+                    // Single-mod repo fallback if repo name itself matches hint
+                    string repoShort = repo!.Split('/').Last();
+                    if (zipAssets.Count == 1 &&
+                        repoShort.Replace("-", "").IndexOf(hint!.Replace("-", ""), StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        bestAssetName = zipAssets[0].Name;
+                        bestZipUrl = zipAssets[0].Url;
+                        break;
+                    }
+                }
+
+                if (string.IsNullOrEmpty(bestZipUrl))
+                {
+                    return (null, $"GitHub repo `{repo}` has no prebuilt Release `.zip` matching `{hint}` (source-only repo; install once into local `Mods` to use).");
+                }
+
+                Directory.CreateDirectory(DepsCacheRoot);
+                string tempZip = Path.Combine(Path.GetTempPath(), $"sdv-dep-{Guid.NewGuid():N}.zip");
+                string extractTemp = Path.Combine(Path.GetTempPath(), $"sdv-dep-ext-{Guid.NewGuid():N}");
+                try
+                {
+                    byte[] zipBytes = http.GetByteArrayAsync(bestZipUrl).GetAwaiter().GetResult();
+                    File.WriteAllBytes(tempZip, zipBytes);
+                    ZipFile.ExtractToDirectory(tempZip, extractTemp);
+
+                    var manifests = Directory.GetFiles(extractTemp, "manifest.json", SearchOption.AllDirectories);
+                    InstalledModInfo? primary = null;
+                    foreach (var mf in manifests)
+                    {
+                        var parsed = ParseManifestFile(mf, "deps-cache");
+                        if (parsed == null)
+                            continue;
+
+                        string dstDir = Path.Combine(DepsCacheRoot, SanitizeFolderName(parsed.UniqueId));
+                        if (Directory.Exists(dstDir))
+                            Directory.Delete(dstDir, recursive: true);
+                        CopyDirectoryAll(Path.GetDirectoryName(mf)!, dstDir);
+
+                        var cachedInfo = ParseManifestFile(Path.Combine(dstDir, "manifest.json"), "deps-cache");
+                        if (cachedInfo != null && (primary == null || cachedInfo.UniqueId.Equals(uniqueIdOrRepo, StringComparison.OrdinalIgnoreCase)))
+                            primary = cachedInfo;
+                    }
+
+                    if (primary != null)
+                        return (primary, $"Downloaded `{bestAssetName}` from GitHub `{repo}` -> `{primary.UniqueId}` v{primary.Version}.");
+
+                    return (null, $"Downloaded `{bestAssetName}` from `{repo}`, but no valid `manifest.json` was found inside.");
+                }
+                finally
+                {
+                    try { if (File.Exists(tempZip)) File.Delete(tempZip); } catch { }
+                    try { if (Directory.Exists(extractTemp)) Directory.Delete(extractTemp, recursive: true); } catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                return (null, $"GitHub download failed for `{repo}`: {ex.Message}");
+            }
+        }
+
+        private static string? TryLookupGitHubRepoFromSmapiList(string uniqueId)
+        {
+            try
+            {
+                string cacheFile = Path.Combine(KbConfig.DataDir, "smapi-github-map.json");
+                Dictionary<string, string>? map = null;
+                if (File.Exists(cacheFile) && (DateTime.UtcNow - File.GetLastWriteTimeUtc(cacheFile)).TotalDays < 14)
+                {
+                    map = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(cacheFile));
+                }
+
+                if (map == null)
+                {
+                    using var http = CreateGitHubHttpClient();
+                    string raw = http.GetStringAsync("https://raw.githubusercontent.com/Pathoschild/SmapiCompatibilityList/develop/data/mods.jsonc").GetAwaiter().GetResult();
+                    map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    using var doc = JsonDocument.Parse(raw, JsoncReadOpts);
+                    if (doc.RootElement.TryGetProperty("mods", out var modsArr) && modsArr.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var m in modsArr.EnumerateArray())
+                        {
+                            string? gh = GetString(m, "githubRepo");
+                            string? ids = GetString(m, "id");
+                            if (string.IsNullOrWhiteSpace(gh) || string.IsNullOrWhiteSpace(ids))
+                                continue;
+                            foreach (var singleId in ids!.Split(',').Select(s => s.Trim()).Where(s => s.Length > 0))
+                                map[singleId] = gh!.Trim();
+                        }
+                    }
+                    try { File.WriteAllText(cacheFile, JsonSerializer.Serialize(map), new UTF8Encoding(false)); } catch { }
+                }
+
+                if (map != null && map.TryGetValue(uniqueId, out var foundRepo))
+                    return foundRepo;
+            }
+            catch
+            {
+            }
+            return null;
+        }
+
+        private static HttpClient CreateGitHubHttpClient()
+        {
+            var client = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("stardew-devtools/1.6");
+            client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
+            return client;
+        }
+
+        private static void CopyDirectoryAll(string srcDir, string dstDir)
+        {
+            Directory.CreateDirectory(dstDir);
+            foreach (var f in Directory.GetFiles(srcDir))
+            {
+                File.Copy(f, Path.Combine(dstDir, Path.GetFileName(f)), overwrite: true);
+            }
+            foreach (var sub in Directory.GetDirectories(srcDir))
+            {
+                string name = Path.GetFileName(sub);
+                if (name.StartsWith(".", StringComparison.Ordinal))
+                    continue;
+                CopyDirectoryAll(sub, Path.Combine(dstDir, name));
+            }
+        }
+
+        private static string SanitizeFolderName(string raw) =>
+            string.IsNullOrWhiteSpace(raw) ? "Mod" : Regex.Replace(raw.Trim(), @"[^a-zA-Z0-9._\- ]+", "_");
+
+        private static string? GetString(JsonElement obj, string propName)
+        {
+            if (TryGetProp(obj, propName, out var el))
+                return el.ValueKind == JsonValueKind.String ? el.GetString() : el.ToString();
+            return null;
+        }
+
+        private static bool TryGetProp(JsonElement obj, string propName, out JsonElement val)
+        {
+            if (obj.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var p in obj.EnumerateObject())
+                {
+                    if (p.Name.Equals(propName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        val = p.Value;
+                        return true;
+                    }
+                }
+            }
+            val = default;
+            return false;
+        }
+    }
+}

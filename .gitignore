@@ -1,0 +1,9 @@
+dist/
+obj/
+releases/
+raw/
+docs/dll-extracted/
+docs/guides/
+*.user
+*.suo
+.vs/

@@ -1,0 +1,30 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SdvDevBridge", "bridge\SdvDevBridge.csproj", "{A51D8C22-4B77-4E91-9A01-8F34C102E511}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SdvDevWorker", "src\SdvDev.csproj", "{8B42951D-3E4F-4C61-9B22-7A18E2439C11}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SdvDevClient", "client\SdvDevClient.csproj", "{3F91C4A2-7B18-4D90-A65E-91C2B084D301}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{A51D8C22-4B77-4E91-9A01-8F34C102E511}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A51D8C22-4B77-4E91-9A01-8F34C102E511}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A51D8C22-4B77-4E91-9A01-8F34C102E511}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A51D8C22-4B77-4E91-9A01-8F34C102E511}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8B42951D-3E4F-4C61-9B22-7A18E2439C11}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8B42951D-3E4F-4C61-9B22-7A18E2439C11}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8B42951D-3E4F-4C61-9B22-7A18E2439C11}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8B42951D-3E4F-4C61-9B22-7A18E2439C11}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3F91C4A2-7B18-4D90-A65E-91C2B084D301}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3F91C4A2-7B18-4D90-A65E-91C2B084D301}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3F91C4A2-7B18-4D90-A65E-91C2B084D301}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3F91C4A2-7B18-4D90-A65E-91C2B084D301}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

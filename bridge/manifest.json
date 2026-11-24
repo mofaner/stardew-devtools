@@ -1,0 +1,9 @@
+{
+  "Name": "SdvDev Automated Test Bridge",
+  "Author": "stardew-devtools",
+  "Version": "1.0.0",
+  "Description": "Main-thread IPC bridge for sdv-dev automated mod testing, live C# eval, non-intrusive UI inspection, and asset hot-reloading.",
+  "UniqueID": "SdvDev.TestBridge",
+  "EntryDll": "SdvDevBridge.dll",
+  "MinimumApiVersion": "4.0.0"
+}
