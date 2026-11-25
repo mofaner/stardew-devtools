@@ -203,7 +203,7 @@ namespace SdvDevBridge
         }
     }
 
-    public sealed class ModEntry : Mod
+    public sealed partial class ModEntry : Mod
     {
         public const string DedicatedTestSaveFolder = "SdvDevTest_999999999";
         public const ulong DedicatedTestUniqueId = 999999999UL;
@@ -214,6 +214,7 @@ namespace SdvDevBridge
         private PendingProfileSession? _activeProfileSession;
         private PendingWarpJob? _activeWarpJob;
         private PendingCheckpointRestore? _pendingCheckpointRestore;
+        private PendingMultiFrameCapture? _activeMultiFrameCapture;
         private CancellationTokenSource? _cts;
         private string? _pendingAutoLoadSave;
         private int _autoLoadWaitTicks;
@@ -365,6 +366,8 @@ namespace SdvDevBridge
             // Only disable pauseWhenOutOfFocus when launched in AI automation mode (SDV_DEV_AUTOMATION=1)!
             if (_automationBackgroundMode && Game1.options != null)
                 Game1.options.pauseWhenOutOfFocus = false;
+
+            ApplyBackgroundWindowModeIfRequested();
         }
 
         private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
@@ -373,6 +376,13 @@ namespace SdvDevBridge
 
             if (_automationBackgroundMode && Game1.options != null && Game1.options.pauseWhenOutOfFocus)
                 Game1.options.pauseWhenOutOfFocus = false;
+
+            // TitleMenu 首帧可能会重新居中窗口（CenterOnDisplay），在 --background 模式下前 120 ticks（以及 SetWindowSize 缩放恢复后）持续保持离屏隐藏且不缩放分辨率
+            if (_hiddenBackgroundWindow && ((_tickCounter <= 120 && (_tickCounter % 15 == 1)) || _reapplyBackgroundAfterZoomRestore))
+            {
+                _reapplyBackgroundAfterZoomRestore = false;
+                ApplyBackgroundWindowModeIfRequested();
+            }
 
             // Handle startup auto-load once TitleMenu is ready
             if ((!string.IsNullOrEmpty(_pendingAutoLoadSave) || _useDedicatedTestWorld) && Game1.activeClickableMenu is TitleMenu)
@@ -412,6 +422,11 @@ namespace SdvDevBridge
             if (_pendingCheckpointRestore != null && Context.ScreenId == 0)
             {
                 TickCheckpointRestore();
+            }
+
+            if (_activeMultiFrameCapture != null && Context.ScreenId == 0)
+            {
+                TickMultiFrameCapture();
             }
 
             // Tick-driven authentic multi-day overnight progression (`sdv-dev world --advance-days N`)
@@ -517,6 +532,11 @@ namespace SdvDevBridge
                 {
                     cap.Tcs.TrySetResult(CaptureScreenBufferImmediate(cap.OutputPath, cap.IncludeUiLayout));
                 }
+            }
+
+            if (_activeMultiFrameCapture != null && Context.ScreenId == 0 && _activeMultiFrameCapture.ReadyForRenderCapture)
+            {
+                CaptureMultiFrameStepOnRendered();
             }
         }
 
@@ -794,6 +814,12 @@ namespace SdvDevBridge
                     return HandleCheckpoint(req, tcs);
                 case "schedule_check":
                     return HandleScheduleCheck(req);
+                case "mod_config":
+                    return HandleModConfig(req);
+                case "screenshot_advanced":
+                    return StartMultiFrameCapture(req, tcs);
+                case "self_restart":
+                    return HandleSelfRestart(req);
                 case "load_save":
                     return HandleLoadSave(req);
                 case "new_test_save":
@@ -852,6 +878,7 @@ namespace SdvDevBridge
                 ["smapiVersion"] = Constants.ApiVersion.ToString(),
                 ["modsPath"] = activeModsPath,
                 ["isolatedMods"] = isIsolated,
+                ["backgroundMode"] = _hiddenBackgroundWindow,
                 ["inWorld"] = Context.IsWorldReady,
                 ["isPlayerFree"] = Context.IsPlayerFree,
                 ["screenCount"] = GameRunner.instance?.gameInstances?.Count ?? 1,
@@ -1042,8 +1069,19 @@ namespace SdvDevBridge
 
             if (req.Value<bool?>("close") == true)
             {
+                string closedType = menu.GetType().Name;
                 menu.exitThisMenu();
-                return new JObject { ["ok"] = true, ["message"] = $"Closed `{menu.GetType().Name}`." };
+                // 确保 DialogueBox 等带渐隐收缩动画的菜单在同帧立即解绑，防止数帧后动画结束时误清空后续紧接着打开的新菜单
+                if (ReferenceEquals(Game1.activeClickableMenu, menu))
+                {
+                    Game1.activeClickableMenu = null;
+                    Game1.dialogueUp = false;
+                }
+                else if (Game1.activeClickableMenu is TitleMenu && ReferenceEquals(TitleMenu.subMenu, menu))
+                {
+                    TitleMenu.subMenu = null;
+                }
+                return new JObject { ["ok"] = true, ["message"] = $"Closed `{closedType}`." };
             }
 
             if (menu is DialogueBox db)
@@ -1245,14 +1283,20 @@ namespace SdvDevBridge
             string? uniqueId = req.Value<string>("uniqueId");
             bool reloadMap = req.Value<bool?>("reloadMap") ?? false;
             var invalidated = new List<string>();
+            var reloadedShaders = new List<string>();
+            string? shaderHookCalled = null;
 
-            // If target mod is a Content Patcher pack, also trigger `patch reload <uniqueId>`
+            // 同步热刷新 C# 模组已加载的 `.mgfxo` Effect 实例或触发 Content Patcher 的 `patch reload`
             if (!string.IsNullOrWhiteSpace(uniqueId))
             {
                 var modInfo = Helper.ModRegistry.Get(uniqueId!);
                 if (modInfo == null || modInfo.IsContentPack)
                 {
                     HandleConsoleCommand(new JObject { ["command"] = $"patch reload {uniqueId}" });
+                }
+                else
+                {
+                    HotReloadModShadersInMemory(modInfo, req["compiledShaders"] as JArray, reloadedShaders, out shaderHookCalled);
                 }
             }
 
@@ -1300,6 +1344,8 @@ namespace SdvDevBridge
                 ["ok"] = true,
                 ["uniqueId"] = uniqueId,
                 ["invalidatedAssets"] = new JArray(invalidated),
+                ["reloadedShaders"] = reloadedShaders.Count > 0 ? new JArray(reloadedShaders) : null,
+                ["shaderReloadHook"] = shaderHookCalled,
                 ["reloadedLocation"] = reloadedLocation
             };
         }
@@ -3120,6 +3166,7 @@ namespace SdvDevBridge
             var applied = new JArray();
 
             // 1. Season / Day / Year
+            bool dateMutated = false;
             string? seasonStr = req.Value<string>("season")?.Trim().ToLowerInvariant();
             if (!string.IsNullOrEmpty(seasonStr))
             {
@@ -3127,6 +3174,7 @@ namespace SdvDevBridge
                 {
                     Game1.season = parsedSeason;
                     Game1.setGraphicsForSeason();
+                    dateMutated = true;
                     applied.Add($"season={Game1.currentSeason}");
                 }
                 else
@@ -3139,6 +3187,7 @@ namespace SdvDevBridge
             if (dayVal.HasValue)
             {
                 Game1.dayOfMonth = Math.Max(1, Math.Min(28, dayVal.Value));
+                dateMutated = true;
                 applied.Add($"day={Game1.dayOfMonth}");
             }
 
@@ -3146,22 +3195,22 @@ namespace SdvDevBridge
             if (yearVal.HasValue && yearVal.Value >= 1)
             {
                 Game1.year = yearVal.Value;
+                dateMutated = true;
                 applied.Add($"year={Game1.year}");
             }
 
-            // 2. Time of day
-            int? timeVal = req.Value<int?>("time");
-            if (timeVal.HasValue)
+            // 【当初为什么要在这里同步刷新节日与天气图标状态】：
+            // 当存档原本停在节日当天（如春 13 复活节、秋 16 展览会）时，`Game1.weatherIcon` 会被设为 `1`（代表右上角时钟显示节日小旗）。
+            // 如果此时用 `world --day 9 --time ...` 直接跳到非节日日期却没调 `Game1.updateWeatherIcon()`，
+            // 下方 `performTenMinuteClockUpdate()` 看到残留的 `weatherIcon == 1` 就会去硬读不存在的 `Data\Festivals\spring9.xnb` 崩溃报错！
+            if (dateMutated)
             {
-                int clamped = Math.Max(600, Math.Min(2600, timeVal.Value));
-                Game1.timeOfDay = Utility.ModifyTime(clamped, -10);
-                Game1.performTenMinuteClockUpdate();
-                Game1.timeOfDay = clamped;
-                Game1.gameTimeInterval = 0;
-                applied.Add($"time={Game1.timeOfDay}");
+                Game1.whereIsTodaysFest = null;
+                try { Game1.UpdatePassiveFestivalStates(); } catch { }
+                Game1.updateWeatherIcon();
             }
 
-            // 3. Weather (1.6 LocationWeather + ApplyWeatherForNewDay)
+            // 2. Weather (1.6 LocationWeather + ApplyWeatherForNewDay) — 先于 `--time` 执行，确保时钟刷新时已处于目标天气与图标状态
             string? weatherRaw = req.Value<string>("weather")?.Trim();
             if (!string.IsNullOrEmpty(weatherRaw))
             {
@@ -3184,7 +3233,27 @@ namespace SdvDevBridge
                     lw.InitializeDayWeather();
                 }
                 Game1.ApplyWeatherForNewDay();
+                Game1.updateWeatherIcon();
                 applied.Add($"weather={wId}");
+            }
+
+            // 3. Time of day
+            int? timeVal = req.Value<int?>("time");
+            if (timeVal.HasValue)
+            {
+                // 二次兜底：若此前外部代码把 weatherIcon 留在了 1（节日）但当天并非节日，立即纠正图标避免加载假节日 XNB
+                if (Game1.weatherIcon == 1 && !Utility.isFestivalDay())
+                {
+                    Game1.whereIsTodaysFest = null;
+                    Game1.updateWeatherIcon();
+                }
+
+                int clamped = Math.Max(600, Math.Min(2600, timeVal.Value));
+                Game1.timeOfDay = Utility.ModifyTime(clamped, -10);
+                Game1.performTenMinuteClockUpdate();
+                Game1.timeOfDay = clamped;
+                Game1.gameTimeInterval = 0;
+                applied.Add($"time={Game1.timeOfDay}");
             }
 
             // 4. Money / Stamina / Health
@@ -3249,6 +3318,17 @@ namespace SdvDevBridge
                 applied.Add($"mailbox+={mailId}");
             }
 
+            // 7.5 Camera Zoom (`--zoom <0.35..3.0>`)
+            // 【当初为什么要原生封装 `--zoom`】：
+            // 以往手写 `eval` 只改 `Game1.options.desiredBaseZoomLevel = 0.8f` 却没调用 `SetWindowSize` 重建 `Game1.screen` 离屏缓冲，
+            // 会导致 `Game1.viewport` 与 `Game1.screen` 尺寸失配，在画面右侧 `uv.x > 0.8` 处撕裂出一条假竖线，误导着色器排查！
+            float? zoomReq = req.Value<float?>("zoom");
+            if (zoomReq.HasValue && zoomReq.Value > 0.05f)
+            {
+                ApplyCameraZoomAndRebuildScreen(zoomReq.Value);
+                applied.Add($"zoom={Game1.options.zoomLevel:0.##} (screen={Game1.game1.screen?.Width}x{Game1.game1.screen?.Height})");
+            }
+
             // 8. Multi-day overnight pipeline (`--advance-days N`)
             int advDays = req.Value<int?>("advanceDays") ?? 0;
             if (advDays > 0 && tcs != null)
@@ -3272,6 +3352,9 @@ namespace SdvDevBridge
                 ["date"] = $"Year {Game1.year} {Game1.currentSeason} {Game1.dayOfMonth}",
                 ["timeOfDay"] = Game1.timeOfDay,
                 ["weather"] = Game1.netWorldState?.Value?.GetWeatherForLocation("Default")?.Weather,
+                ["zoom"] = Math.Round(Game1.options.zoomLevel, 3),
+                ["viewport"] = $"{Game1.viewport.Width}x{Game1.viewport.Height}",
+                ["screenBuffer"] = Game1.game1?.screen != null ? $"{Game1.game1.screen.Width}x{Game1.game1.screen.Height}" : null,
                 ["money"] = Game1.player.Money,
                 ["applied"] = applied
             };

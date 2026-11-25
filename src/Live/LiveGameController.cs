@@ -206,7 +206,9 @@ namespace SdvKb.Live
             string? customModsPath = null,
             string? projectDir = null,
             IEnumerable<string>? extraWithMods = null,
-            bool resetTestWorld = false)
+            bool resetTestWorld = false,
+            bool background = false,
+            bool noFocus = false)
         {
             // Check if project has sdv-project.json requesting isolated mode by default
             if (!isolated && string.IsNullOrWhiteSpace(customModsPath) && !string.IsNullOrWhiteSpace(projectDir) && Directory.Exists(projectDir))
@@ -295,12 +297,31 @@ namespace SdvKb.Live
             else if (useDisposableTestWorld)
                 autoLoadEnv = "__NEW_TEST_SAVE__";
 
-            SpawnDetachedSmapiProcess(smapiExe, gamePath, targetModsRoot, autoLoadEnv);
+            SpawnDetachedSmapiProcess(smapiExe, gamePath, targetModsRoot, autoLoadEnv, background, noFocus);
 
+            return WaitUntilNewBridgeSessionReady(
+                saveFolder,
+                useDisposableTestWorld,
+                resetTestWorld,
+                timeoutSeconds,
+                previousPidToIgnore: null);
+        }
+
+        private static string WaitUntilNewBridgeSessionReady(
+            string? saveFolder,
+            bool useDisposableTestWorld,
+            bool resetTestWorld,
+            int timeoutSeconds,
+            int? previousPidToIgnore)
+        {
             var sw = Stopwatch.StartNew();
             while (sw.Elapsed.TotalSeconds < timeoutSeconds)
             {
-                Thread.Sleep(700);
+                Thread.Sleep(650);
+                var running = FindRunningSmapiProcess();
+                if (running != null && previousPidToIgnore.HasValue && running.Id == previousPidToIgnore.Value)
+                    continue;
+
                 var (conn, respJson, _) = BridgeClient.TrySendJson("{\"action\":\"status\"}", 1000);
                 if (!conn)
                     continue;
@@ -316,6 +337,15 @@ namespace SdvKb.Live
             throw new TimeoutException($"Timed out after {timeoutSeconds}s waiting for SMAPI / world load. Check `sdv-dev logs --level Error`.");
         }
 
+        /// <summary>
+        /// 编译、静态校验并热重载/重开目标模组工程。
+        ///
+        /// 【当初为什么要加同桌面 `self_restart` 与 `--background` 参数】：
+        /// 1. 当玩家在可见屏幕打开了游戏，而 AI 在沙盒终端里调 `restart` 时，由旧游戏进程在退出前自举重开 (`self_restart`)
+        ///    能让新游戏继承玩家的可见桌面原位刷新，而不是消失进 AI 不可见的后台沙盒桌面；
+        /// 2. 反过来，万一玩家正在专心写代码、明确不想在桌面上看到弹窗，传入 `--background` (`background: true`) 就会关闭该可见会话
+        ///    并切换为无打扰离屏隐藏模式（传 `--visible` 则可强制切回可见模式）。
+        /// </summary>
         public static string RestartOrReloadProject(
             string? modDir,
             string gamePath,
@@ -328,7 +358,10 @@ namespace SdvKb.Live
             bool forceFullMods = false,
             string? customModsPath = null,
             IEnumerable<string>? extraWithMods = null,
-            bool resetTestWorld = false)
+            bool resetTestWorld = false,
+            bool? backgroundOverride = null,
+            bool sameDesktopExplicit = false,
+            bool noFocus = true)
         {
             ModBuildResult? buildRes = null;
 
@@ -395,40 +428,107 @@ namespace SdvKb.Live
                 }
             }
 
-            // Step 3: Stop existing game cleanly (protecting unmanaged manual sessions unless --force)
+            // Step 3: Stage updated mod files into a lock-free `.staging` directory & decide whether to self-restart!
             string? previousSave = saveFolder;
+            string? liveCurrentSave = null;
+            bool effectiveBackground = backgroundOverride ?? false;
+
             if (running != null)
             {
+                int oldPid = running.Id;
                 var (conn, statusJson, _) = BridgeClient.TrySendJson("{\"action\":\"status\"}", 1200);
                 if (!conn && !forceKillUnmanaged)
                 {
                     throw new InvalidOperationException(
-                        $"Game process PID={running.Id} is running without SdvDevBridge. Refusing to kill potential manual player session without `--force`.");
+                        $"Game process PID={oldPid} is running without SdvDevBridge. Refusing to kill potential manual player session without `--force`.");
+                }
+
+                bool prevWasBackground = false;
+                if (conn)
+                {
+                    try
+                    {
+                        using var sDoc = JsonDocument.Parse(statusJson);
+                        if (sDoc.RootElement.TryGetProperty("backgroundMode", out var bgEl) && bgEl.ValueKind == JsonValueKind.True)
+                            prevWasBackground = true;
+
+                        if (sDoc.RootElement.TryGetProperty("saveFolderName", out var sf) && sf.ValueKind == JsonValueKind.String)
+                        {
+                            liveCurrentSave = sf.GetString();
+                            if (string.IsNullOrWhiteSpace(previousSave) && !useDisposableTestWorld && !resetTestWorld &&
+                                !string.IsNullOrWhiteSpace(liveCurrentSave) && Directory.Exists(Path.Combine(SavesRoot, liveCurrentSave!)))
+                            {
+                                previousSave = liveCurrentSave;
+                            }
+                        }
+                    }
+                    catch { }
+
+                    // 个人存档保护边界：若当前正在运行非 SdvDevTest_ 的玩家个人存档，未加 `--force` 严禁自动接管重启！
+                    if (!forceKillUnmanaged &&
+                        !string.IsNullOrWhiteSpace(liveCurrentSave) &&
+                        !liveCurrentSave!.StartsWith("SdvDevTest_", StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidOperationException(
+                            $"Game is currently loaded into personal save `{liveCurrentSave}`. Refusing to auto-restart without `--force` (or exit to title via `sdv-dev menu` first).");
+                    }
+                }
+
+                // 若调用方未显式传 --background / --visible，则默认继承上一轮会话的可见/后台属性
+                effectiveBackground = backgroundOverride ?? prevWasBackground;
+
+                // 允许走同桌面无锁 self_restart 的条件：
+                // 1) 未指定 `--background`；
+                // 2) 用户显式传了 `--same-desktop`/`--visible`，或上一轮本身就是可见的标题界面 / `SdvDevTest_` 专属测试档会话！
+                bool allowSameDesktopSelfRestart = conn && !effectiveBackground &&
+                    (sameDesktopExplicit || (!prevWasBackground &&
+                        (string.IsNullOrWhiteSpace(liveCurrentSave) || liveCurrentSave!.StartsWith("SdvDevTest_", StringComparison.OrdinalIgnoreCase))));
+
+                if (allowSameDesktopSelfRestart)
+                {
+                    // 注意：此时旧进程 `oldPid` 仍活着并锁着运行目录中的 `.dll`！
+                    // 严禁直接修改/删除运行目录，必须先写入旁路无锁 `.staging` 目录，交由 `self_restart` 跳板脚本等 `oldPid` 死透后再覆盖！
+                    var (finalModsRoot, stagingDir, swapTargetDir, swapMode) = PrepareLockFreeStagingForSelfRestart(
+                        gamePath,
+                        wantsIsolated,
+                        customModsPath,
+                        modDir,
+                        extraWithMods,
+                        buildRes);
+
+                    string smapiExe = Path.Combine(gamePath, "StardewModdingAPI.exe");
+                    string? autoLoadEnv = ResolveAutoLoadEnvValue(previousSave, useDisposableTestWorld, resetTestWorld);
+
+                    var (srConn, srJson, _) = BridgeClient.TrySendJson(JsonSerializer.Serialize(new
+                    {
+                        action = "self_restart",
+                        smapiExe,
+                        gamePath,
+                        modsPath = finalModsRoot,
+                        stagingDir,
+                        swapTargetDir,
+                        swapMode,
+                        autoLoadSave = autoLoadEnv,
+                        clientExe = ResolveCompanionClientExe(),
+                        pwshExe = FindExecutableInPath("pwsh.exe"),
+                        background = false,
+                        noFocus
+                    }), 2500);
+
+                    if (srConn && srJson.Contains("\"ok\":true", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!running.WaitForExit(10000))
+                        {
+                            try { running.Kill(); running.WaitForExit(4000); } catch { }
+                        }
+                        return WaitUntilNewBridgeSessionReady(previousSave, useDisposableTestWorld, resetTestWorld, timeoutSeconds, previousPidToIgnore: oldPid);
+                    }
                 }
 
                 if (conn)
-                {
-                    if (string.IsNullOrWhiteSpace(previousSave) && !useDisposableTestWorld && !resetTestWorld)
-                    {
-                        try
-                        {
-                            using var sDoc = JsonDocument.Parse(statusJson);
-                            if (sDoc.RootElement.TryGetProperty("saveFolderName", out var sf) && sf.ValueKind == JsonValueKind.String)
-                            {
-                                string? curSave = sf.GetString();
-                                if (!string.IsNullOrWhiteSpace(curSave) && Directory.Exists(Path.Combine(SavesRoot, curSave!)))
-                                    previousSave = curSave;
-                            }
-                        }
-                        catch { }
-                    }
-
                     BridgeClient.TrySendJson("{\"action\":\"quit\"}", 1500);
-                }
                 else
-                {
                     running.CloseMainWindow();
-                }
 
                 if (!running.WaitForExit(10000))
                 {
@@ -452,7 +552,76 @@ namespace SdvKb.Live
                 customModsPath: customModsPath,
                 projectDir: modDir,
                 extraWithMods: extraWithMods,
-                resetTestWorld: resetTestWorld);
+                resetTestWorld: resetTestWorld,
+                background: effectiveBackground,
+                noFocus: noFocus);
+        }
+
+        /// <summary>
+        /// 在旧游戏进程仍存活锁住运行目录 DLL 时，将下一轮所需的全部模组与桥接层写入独立的无锁旁路暂存目录（`.staging`），
+        /// 供 `self_restart` 派生脚本在 `Wait-Process -Id <oldPid>` 结束后安全替换。
+        /// </summary>
+        private static (string? FinalModsRoot, string? StagingDir, string? SwapTargetDir, string? SwapMode) PrepareLockFreeStagingForSelfRestart(
+            string gamePath,
+            bool wantsIsolated,
+            string? customModsPath,
+            string? modDir,
+            IEnumerable<string>? extraWithMods,
+            ModBuildResult? buildRes)
+        {
+            if (wantsIsolated)
+            {
+                string finalIso = string.IsNullOrWhiteSpace(customModsPath)
+                    ? ModDependencyResolver.DefaultIsolatedModsRoot
+                    : Path.GetFullPath(customModsPath!);
+                finalIso = Path.TrimEndingDirectorySeparator(finalIso);
+                string stagingIso = finalIso + ".staging";
+
+                if (string.IsNullOrWhiteSpace(modDir) && !string.IsNullOrWhiteSpace(customModsPath) && (extraWithMods == null || !extraWithMods.Any()))
+                {
+                    EnsureBridgeModInstalled(gamePath, finalIso);
+                    return (finalIso, null, null, null);
+                }
+
+                var (_, _, missingReq) = ModDependencyResolver.StageIsolatedModsDirectory(
+                    gamePath,
+                    stagingIso,
+                    modDir,
+                    extraWithMods,
+                    preserveConfigsFromExistingDir: finalIso);
+
+                if (missingReq.Count > 0)
+                    throw new InvalidOperationException($"Missing required prerequisite mod(s): {string.Join(", ", missingReq)}.");
+
+                EnsureBridgeModInstalled(gamePath, stagingIso);
+                return (finalIso, stagingIso, finalIso, "replace_dir");
+            }
+            else
+            {
+                string normalModsRoot = Path.Combine(gamePath, "Mods");
+                string stagingModsRoot = Path.Combine(KbConfig.DataDir, "fullmods-restart-staging");
+                if (Directory.Exists(stagingModsRoot))
+                    Directory.Delete(stagingModsRoot, recursive: true);
+                Directory.CreateDirectory(stagingModsRoot);
+
+                if (!string.IsNullOrWhiteSpace(modDir) && buildRes != null)
+                {
+                    DotNet6ModCompiler.DeployModFolderToModsRoot(Path.GetFullPath(modDir!), stagingModsRoot, buildRes.UniqueId);
+                }
+                EnsureBridgeModInstalled(gamePath, stagingModsRoot);
+                return (null, stagingModsRoot, normalModsRoot, "merge_subdirs");
+            }
+        }
+
+        private static string? ResolveAutoLoadEnvValue(string? saveFolder, bool useDisposableTestWorld, bool resetTestWorld)
+        {
+            if (!string.IsNullOrWhiteSpace(saveFolder))
+                return saveFolder!;
+            if (resetTestWorld)
+                return "__RESET_TEST_SAVE__";
+            if (useDisposableTestWorld)
+                return "__NEW_TEST_SAVE__";
+            return null;
         }
 
         public static string StopGame(bool force)
@@ -603,11 +772,16 @@ namespace SdvKb.Live
             string smapiExe,
             string gamePath,
             string? customModsRoot,
-            string? autoLoadSaveValue)
+            string? autoLoadSaveValue,
+            bool background = false,
+            bool noFocus = false)
         {
             const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
             const uint CREATE_NEW_CONSOLE = 0x00000010;
             const uint CREATE_NEW_PROCESS_GROUP = 0x00000200;
+            const int STARTF_USESHOWWINDOW = 0x00000001;
+            const short SW_HIDE = 0;
+            const short SW_SHOWNOACTIVATE = 4;
 
             // Prefer hosting SMAPI inside modern `pwsh.exe` (or direct UTF-8 console fallback) WITHOUT `SW_SHOWMINNOACTIVE`,
             // so: (1) SDL2/MonoGame initializes the game window at full resolution instead of a clipped half-black rect,
@@ -659,6 +833,16 @@ namespace SdvKb.Live
                     envDict[k!] = v;
             }
             envDict["SDV_DEV_AUTOMATION"] = "1";
+            envDict["SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS"] = "0";
+            if (noFocus || background)
+                envDict["SDL_WINDOW_NO_ACTIVATION_WHEN_SHOWN"] = "1";
+            else
+                envDict.Remove("SDL_WINDOW_NO_ACTIVATION_WHEN_SHOWN");
+
+            if (background)
+                envDict["SDV_DEV_BACKGROUND"] = "1";
+            else
+                envDict.Remove("SDV_DEV_BACKGROUND");
             if (!string.IsNullOrWhiteSpace(autoLoadSaveValue))
                 envDict["SDV_DEV_AUTOLOAD_SAVE"] = autoLoadSaveValue!;
             else
@@ -679,8 +863,19 @@ namespace SdvKb.Live
                 var si = new STARTUPINFO
                 {
                     cb = Marshal.SizeOf<STARTUPINFO>()
-                    // Intentionally NO `STARTF_USESHOWWINDOW` / `SW_SHOWMINNOACTIVE`!
+                    // 可见模式下严禁传 SW_SHOWMINNOACTIVE（否则会把 SDL2 无边框窗口初始化成 0 尺寸导致半屏黑块）；
+                    // 仅当用户显式传 `--background` 时隐藏外层 pwsh 控制台，并由 BridgeMod 在 MonoGame 完成初始化后将 SDL2 窗口无损移出屏幕可视区。
                 };
+                if (background)
+                {
+                    si.dwFlags = STARTF_USESHOWWINDOW;
+                    si.wShowWindow = SW_HIDE;
+                }
+                else if (noFocus)
+                {
+                    si.dwFlags = STARTF_USESHOWWINDOW;
+                    si.wShowWindow = SW_SHOWNOACTIVATE;
+                }
 
                 bool ok = CreateProcessW(
                     appExe,

@@ -131,15 +131,155 @@ namespace SdvKb.Maps
             };
         }
 
+        /// <summary>
+        /// 离线检视 `.tmx` 或原版地图结构。
+        ///
+        /// 【当初为什么要在传入 `rectFilter` 时裁剪无关输出】：
+        /// 像 `Maps/Town` 全镇有十余张 TileSheets（含数百个水波/动画 TileID 数组）与几十条跨图 Warp；
+        /// 当调用方传入 `--rect 44,94,14,12` 只想看局部桥头 14×12 格时，若仍把全图所有 TileSheets 数组和全镇无关 Warp 全量序列化，
+        /// 输出会膨胀到 1400+ 行触发终端截断。因此当指定 `--rect` 且未传 `includeFullMapMeta: true` 时，
+        /// 自动过滤仅保留该矩形内实际用到的 TileSheet（精简版）、落在该区域周边的 Warp/Light 以及非全空图层，50 行内一轮读完。
+        /// </summary>
         public static object InspectMap(
             string mapOrAsset,
             string gamePath,
             (int X, int Y, int W, int H)? rectFilter,
-            string? layerFilter)
+            string? layerFilter,
+            bool includeFullMapMeta = false)
         {
             string tmxPath = TmxMap.ResolveMapFilePath(mapOrAsset, gamePath);
             var map = TmxMap.Load(tmxPath);
             string? tmxDir = Path.GetDirectoryName(tmxPath);
+            var warps = map.ParseWarps();
+            var lights = map.ParseLights();
+
+            if (rectFilter.HasValue && !includeFullMapMeta)
+            {
+                var r = rectFilter.Value;
+                int rx = Math.Max(0, r.X);
+                int ry = Math.Max(0, r.Y);
+                int rw = Math.Max(1, Math.Min(r.W, map.Width - rx));
+                int rh = Math.Max(1, Math.Min(r.H, map.Height - ry));
+
+                var usedSheetIndices = new SortedSet<int>();
+                var layerMatrices = new Dictionary<string, List<string>>();
+                var emptyLayers = new List<string>();
+
+                foreach (var layer in map.Layers)
+                {
+                    if (!string.IsNullOrWhiteSpace(layerFilter) && !layer.Name.Equals(layerFilter, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    bool anyNonEmptyInRect = false;
+                    bool isSparseOverlay = !includeFullMapMeta
+                        && string.IsNullOrWhiteSpace(layerFilter)
+                        && !layer.Name.Equals("Back", StringComparison.OrdinalIgnoreCase);
+                    var rows = new List<string>(rh);
+                    for (int y = ry; y < ry + rh; y++)
+                    {
+                        bool rowHasTile = false;
+                        var cells = new List<string>(rw);
+                        for (int x = rx; x < rx + rw; x++)
+                        {
+                            int gid = layer.GetCleanGid(x, y);
+                            if (gid == 0)
+                            {
+                                cells.Add("  .  ");
+                            }
+                            else
+                            {
+                                anyNonEmptyInRect = true;
+                                rowHasTile = true;
+                                var ts = map.FindTilesetForGid(gid);
+                                int sIdx = ts != null ? map.Tilesets.IndexOf(ts) : -1;
+                                if (sIdx >= 0) usedSheetIndices.Add(sIdx);
+                                int localId = ts != null ? gid - ts.FirstGid : gid;
+                                cells.Add($"{sIdx}:{localId,-3}");
+                            }
+                        }
+                        if (!isSparseOverlay || rowHasTile)
+                            rows.Add($"y={y,3}: " + string.Join(" ", cells));
+                    }
+
+                    // 除非用户点名了 `--layer`，否则自动折叠在局部矩形内完全空白的图层以节省输出行数
+                    if (anyNonEmptyInRect || !string.IsNullOrWhiteSpace(layerFilter))
+                        layerMatrices[layer.Name] = rows;
+                    else
+                        emptyLayers.Add(layer.Name);
+                }
+
+                var passRows = new List<string>(rh);
+                var groupedSpecialProps = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+                for (int y = ry; y < ry + rh; y++)
+                {
+                    var pChars = new char[rw];
+                    for (int x = rx; x < rx + rw; x++)
+                    {
+                        bool water = map.IsWaterTile(x, y);
+                        bool pass = map.IsTilePassable(x, y, out _);
+                        pChars[x - rx] = water && !pass ? '~' : (pass ? '.' : '#');
+
+                        foreach (var l in map.Layers)
+                        {
+                            var props = map.GetEffectiveLayerCellProperties(l, x, y);
+                            if (props.Count > 0 && !props.All(kv => kv.Key == "Type" || kv.Key == "Diggable" || kv.Key == "Water"))
+                            {
+                                string kvStr = string.Join(", ", props.Where(kv => kv.Key != "Type").Select(kv => $"{kv.Key}={kv.Value}"));
+                                if (!string.IsNullOrEmpty(kvStr))
+                                {
+                                    string groupKey = $"[{l.Name}] {kvStr}";
+                                    if (!groupedSpecialProps.TryGetValue(groupKey, out var coords))
+                                    {
+                                        coords = new List<string>();
+                                        groupedSpecialProps[groupKey] = coords;
+                                    }
+                                    coords.Add($"({x},{y})");
+                                }
+                            }
+                        }
+                    }
+                    passRows.Add($"y={y,3}: " + new string(pChars));
+                }
+
+                var specialCells = groupedSpecialProps
+                    .Select(kv => $"{kv.Key}: {string.Join(", ", kv.Value)}")
+                    .ToList();
+
+                var referencedSheets = usedSheetIndices
+                    .Where(i => i >= 0 && i < map.Tilesets.Count)
+                    .Select(i =>
+                    {
+                        var ts = map.Tilesets[i];
+                        return $"[{i}] {ts.Name} (firstGid={ts.FirstGid}, src={ts.ImageSource})";
+                    })
+                    .ToList();
+
+                // 仅保留落在查询矩形（向外扩 1 格边界以包含边缘门洞/桥头传送触发点）内的 Warp 与光源，并压成单行字符串
+                var localWarps = warps
+                    .Where(w => w.FromX >= rx - 1 && w.FromX <= rx + rw && w.FromY >= ry - 1 && w.FromY <= ry + rh)
+                    .Select(w => $"({w.FromX},{w.FromY}) -> {w.TargetLocation}({w.ToX},{w.ToY}) [{w.SourceKind}]")
+                    .ToList();
+                var localLights = lights
+                    .Where(l => l.TileX >= rx - 2 && l.TileX <= rx + rw + 1 && l.TileY >= ry - 2 && l.TileY <= ry + rh + 1)
+                    .Select(l => $"({l.TileX},{l.TileY}) type={l.LightType}")
+                    .ToList();
+
+                return new
+                {
+                    ok = true,
+                    mapFile = tmxPath,
+                    mapSize = $"{map.Width}x{map.Height}",
+                    rect = new { x = rx, y = ry, width = rw, height = rh },
+                    legend = "SheetIndex:LocalTileId ('.'=empty); Passability: '.'=walkable, '#'=blocked, '~'=water",
+                    referencedTilesheets = referencedSheets,
+                    emptyLayersInRect = emptyLayers,
+                    warpsInRect = localWarps,
+                    lightsInRect = localLights,
+                    passabilityMask = passRows,
+                    layers = layerMatrices,
+                    specialTileProperties = specialCells
+                };
+            }
 
             var tilesetsInfo = map.Tilesets.Select((ts, idx) =>
             {
@@ -163,9 +303,7 @@ namespace SdvKb.Maps
                 };
             }).ToList();
 
-            var warps = map.ParseWarps();
-            var lights = map.ParseLights();
-
+            // Full-map inspection mode (or when `--full` is explicitly passed alongside `--rect`)
             object? rectDump = null;
             if (rectFilter.HasValue)
             {

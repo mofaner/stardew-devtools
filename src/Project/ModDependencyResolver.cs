@@ -546,24 +546,41 @@ namespace SdvKb.Project
             string gamePath,
             string? customIsolatedDir,
             string? projectDir,
-            IEnumerable<string>? extraWithMods)
+            IEnumerable<string>? extraWithMods,
+            string? preserveConfigsFromExistingDir = null)
         {
             string isoRoot = string.IsNullOrWhiteSpace(customIsolatedDir)
                 ? DefaultIsolatedModsRoot
                 : Path.GetFullPath(customIsolatedDir!);
 
-            // Preserve any generated `config.json` files per mod folder before refreshing isolated directory
+            // Preserve any generated `config.json` files per mod folder before refreshing isolated directory.
+            // 当处于 `self_restart` 预暂存阶段时，旧游戏正锁着 `preserveConfigsFromExistingDir` 中的 DLL，
+            // 此时仅以共享只读方式提取其中的 `config.json` 写入全新的 `.staging` 目录，绝不删除正被占用的运行目录！
             var savedConfigs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            if (Directory.Exists(isoRoot))
+            string configSourceRoot = !string.IsNullOrWhiteSpace(preserveConfigsFromExistingDir) && Directory.Exists(preserveConfigsFromExistingDir)
+                ? Path.GetFullPath(preserveConfigsFromExistingDir!)
+                : isoRoot;
+
+            if (Directory.Exists(configSourceRoot))
             {
-                foreach (var sub in Directory.GetDirectories(isoRoot))
+                foreach (var sub in Directory.GetDirectories(configSourceRoot))
                 {
                     string cfgFile = Path.Combine(sub, "config.json");
                     if (File.Exists(cfgFile))
                     {
-                        try { savedConfigs[Path.GetFileName(sub)] = File.ReadAllText(cfgFile); } catch { }
+                        try
+                        {
+                            using var fs = new FileStream(cfgFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                            using var sr = new StreamReader(fs, Encoding.UTF8);
+                            savedConfigs[Path.GetFileName(sub)] = sr.ReadToEnd();
+                        }
+                        catch { }
                     }
                 }
+            }
+
+            if (Directory.Exists(isoRoot))
+            {
                 Directory.Delete(isoRoot, recursive: true);
             }
             Directory.CreateDirectory(isoRoot);

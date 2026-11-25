@@ -170,11 +170,14 @@ namespace SdvKb.Validation
                 ValidateTranslationsDirectory(fullModDir, referencedI18nKeys, issues);
             }
 
-            // C# Harmony static verification & split-screen multiplayer analysis
+            // C# Harmony static verification, MonoGame/SMAPI rendering AST rules & split-screen multiplayer analysis
             if (!string.IsNullOrWhiteSpace(entryDll))
             {
                 CSharpModAnalyzer.AnalyzeCSharpMod(fullModDir, entryDll, explicitGamePath, issues);
             }
+
+            // 静态预编译校验工程中的 `.fx` 着色器源码（拦截 HLSL 语法错误、OpenGL MojoShader 不支持的语义及漏编 `.mgfxo`）
+            SdvKb.Build.ShaderCompiler.ValidateModShaders(fullModDir, issues);
 
             // Validate any *.tmx map files in the mod directory (PNG dimensions, GID bounds, Warps, BFS walkability)
             TmxMapChecker.ValidateModTmxFiles(fullModDir, gamePath: engineRules?.GamePath ?? explicitGamePath, issues);

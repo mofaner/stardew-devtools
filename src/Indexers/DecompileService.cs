@@ -26,11 +26,16 @@ namespace SdvKb.Indexers
             }
         }
 
+        // 覆盖星露谷本体、SMAPI 本体与内部 Toolkit、GameData、MonoGame 渲染底层、xTile 地图渲染与 0Harmony
         private static readonly string[] SearchAssemblies =
         {
             "Stardew Valley.dll",
             "StardewModdingAPI.dll",
-            "StardewValley.GameData.dll"
+            "StardewValley.GameData.dll",
+            "MonoGame.Framework.dll",
+            "xTile.dll",
+            Path.Combine("smapi-internal", "0Harmony.dll"),
+            Path.Combine("smapi-internal", "SMAPI.Toolkit.dll")
         };
 
         private static readonly object CacheLock = new object();
@@ -94,17 +99,29 @@ namespace SdvKb.Indexers
             }
         }
 
+        /// <summary>
+        /// 反编译指定类型或成员源码。
+        /// 【当初为什么要加 `grepPattern` / `grepContextLines`】：
+        /// 像 `Game1.DrawWorld`、`GameLocation.draw`、`SModHooks` 这类核心大方法/大类动辄几百上千行，默认 200 行会被截断，
+        /// 开 `--full` 又会一次性吐出几千行代码撑爆 AI 上下文。支持 `--grep <关键词> -C 15` 后，会在内部完整反编译后
+        /// 仅提取命中关键词前后的带行号代码片段，定位内部逻辑既准又省 Token。
+        /// </summary>
         public static string DecompileTarget(
             string gamePath,
             string targetQuery,
             int maxLines = 220,
             bool fullType = false,
-            KbDatabase? db = null)
+            KbDatabase? db = null,
+            string? grepPattern = null,
+            int grepContextLines = 15)
         {
             if (string.IsNullOrWhiteSpace(targetQuery))
                 throw new ArgumentException("Please specify a type or Type.Member to decompile (e.g. ShopMenu.tryToPurchaseItem).");
 
             string query = targetQuery.Trim();
+            bool hasGrep = !string.IsNullOrWhiteSpace(grepPattern);
+            bool effectiveFull = fullType || hasGrep;
+            int effectiveMaxLines = effectiveFull ? int.MaxValue : maxLines;
 
             // 1. O(1) Fast Path via SQLite MetadataToken index!
             if (db != null)
@@ -123,26 +140,28 @@ namespace SdvKb.Indexers
                         return ambSb.ToString();
                     }
 
-                    string? fastOutput = DecompileFromTokenRecords(gamePath, tokenMatches, maxLines, fullType);
+                    string? fastOutput = DecompileFromTokenRecords(gamePath, tokenMatches, effectiveMaxLines, effectiveFull);
                     if (fastOutput != null)
-                        return fastOutput;
+                        return hasGrep ? ApplyGrepFilter(fastOutput, grepPattern!, grepContextLines) : fastOutput;
                 }
             }
 
             // 2. Fallback: Direct Type / Type.Member scan using in-memory cached TypeSystem
-            foreach (var dllName in SearchAssemblies)
+            foreach (var relDll in SearchAssemblies)
             {
-                string dllPath = Path.Combine(gamePath, dllName);
+                string dllPath = Path.Combine(gamePath, relDll);
                 if (!File.Exists(dllPath))
                     continue;
 
+                string dllName = Path.GetFileName(relDll);
                 var handle = GetOrOpenCached(gamePath, dllPath);
                 var mainMod = handle.TypeSystem.MainModule;
 
                 var exactTypes = FindMatchingTypes(mainMod, query);
                 if (exactTypes.Count > 0)
                 {
-                    return DecompileTypeDefinition(dllName, handle, exactTypes[0], maxLines, fullType);
+                    string raw = DecompileTypeDefinition(dllName, handle, exactTypes[0], effectiveMaxLines, effectiveFull);
+                    return hasGrep ? ApplyGrepFilter(raw, grepPattern!, grepContextLines) : raw;
                 }
 
                 int lastDot = query.LastIndexOf('.');
@@ -160,26 +179,31 @@ namespace SdvKb.Indexers
                             .ToList();
 
                         if (methods.Count > 0)
-                            return FormatMethodsDecompilation(dllName, handle, t, methods, maxLines, fullType);
+                        {
+                            string raw = FormatMethodsDecompilation(dllName, handle, t, methods, effectiveMaxLines, effectiveFull);
+                            return hasGrep ? ApplyGrepFilter(raw, grepPattern!, grepContextLines) : raw;
+                        }
 
                         var prop = t.Properties.FirstOrDefault(p => p.Name.Equals(memberPart, StringComparison.OrdinalIgnoreCase));
                         if (prop != null)
                         {
                             string pCode = SafeDecompileEntity(handle, prop.MetadataToken);
-                            return $"// Assembly: {dllName}\n// Property: {t.FullName}.{prop.Name}\n\n{pCode}";
+                            string raw = $"// Assembly: {dllName}\n// Property: {t.FullName}.{prop.Name}\n\n{pCode}";
+                            return hasGrep ? ApplyGrepFilter(raw, grepPattern!, grepContextLines) : raw;
                         }
 
                         var field = t.Fields.FirstOrDefault(f => f.Name.Equals(memberPart, StringComparison.OrdinalIgnoreCase));
                         if (field != null)
                         {
                             string fCode = SafeDecompileEntity(handle, field.MetadataToken);
-                            return $"// Assembly: {dllName}\n// Field: {t.FullName}.{field.Name}\n\n{fCode}";
+                            string raw = $"// Assembly: {dllName}\n// Field: {t.FullName}.{field.Name}\n\n{fCode}";
+                            return hasGrep ? ApplyGrepFilter(raw, grepPattern!, grepContextLines) : raw;
                         }
                     }
                 }
             }
 
-            return $"No type or member matching `{targetQuery}` found in Stardew Valley assemblies. Try `sdv-dev api \"{targetQuery}\"` first.";
+            return $"No type or member matching `{targetQuery}` found in Stardew Valley / SMAPI / MonoGame / xTile / Harmony assemblies. Try `sdv-dev api \"{targetQuery}\"` first.";
         }
 
         public static string DecompileExternalModApi(string modDllPath, string gamePath, string uniqueId, string version, string? typeOrMemberFilter = null, int maxLines = 320)
@@ -288,6 +312,18 @@ namespace SdvKb.Indexers
             }
         }
 
+        private static string? ResolveAssemblyFilePath(string gamePath, string assemblyName)
+        {
+            string dllFile = assemblyName + ".dll";
+            string rootCand = Path.Combine(gamePath, dllFile);
+            if (File.Exists(rootCand))
+                return rootCand;
+            string internalCand = Path.Combine(gamePath, "smapi-internal", dllFile);
+            if (File.Exists(internalCand))
+                return internalCand;
+            return null;
+        }
+
         private static string? DecompileFromTokenRecords(
             string gamePath,
             List<ApiRecord> records,
@@ -295,10 +331,10 @@ namespace SdvKb.Indexers
             bool fullType)
         {
             var first = records[0];
-            string dllName = first.Assembly + ".dll";
-            string dllPath = Path.Combine(gamePath, dllName);
-            if (!File.Exists(dllPath))
+            string? dllPath = ResolveAssemblyFilePath(gamePath, first.Assembly);
+            if (dllPath == null)
                 return null;
+            string dllName = Path.GetFileName(dllPath);
 
             var handle = GetOrOpenCached(gamePath, dllPath);
             var mainMod = handle.TypeSystem.MainModule;
@@ -452,6 +488,82 @@ namespace SdvKb.Indexers
                 sb.AppendLine("    " + AssemblyApiIndexer.FormatMethodSignature(type, m) + ";");
             }
             sb.AppendLine("}");
+            return sb.ToString();
+        }
+
+        private static string ApplyGrepFilter(string fullCode, string pattern, int contextLines)
+        {
+            int ctx = Math.Clamp(contextLines, 0, 200);
+            var lines = fullCode.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+            var hitIndices = new List<int>();
+
+            System.Text.RegularExpressions.Regex? regex = null;
+            try
+            {
+                regex = new System.Text.RegularExpressions.Regex(pattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            }
+            catch
+            {
+                // Fallback to literal substring match if pattern is not valid regex
+            }
+
+            for (int i = 0; i < lines.Length; i++)
+            {
+                bool matched = regex != null
+                    ? regex.IsMatch(lines[i])
+                    : lines[i].IndexOf(pattern, StringComparison.OrdinalIgnoreCase) >= 0;
+                if (matched)
+                    hitIndices.Add(i);
+            }
+
+            var sb = new StringBuilder();
+            // Always keep top `// Assembly: ...` metadata header lines
+            int headerEnd = 0;
+            while (headerEnd < Math.Min(6, lines.Length) && lines[headerEnd].StartsWith("//", StringComparison.Ordinal))
+            {
+                sb.AppendLine(lines[headerEnd]);
+                headerEnd++;
+            }
+
+            if (hitIndices.Count == 0)
+            {
+                sb.AppendLine($"// [grep] 0 lines matched `{pattern}` across {lines.Length} decompiled lines.");
+                return sb.ToString();
+            }
+
+            sb.AppendLine($"// [grep] {hitIndices.Count} line(s) matched `{pattern}` across {lines.Length} total lines (context: ±{ctx} lines):");
+            sb.AppendLine();
+
+            var hitSet = new HashSet<int>(hitIndices);
+            var ranges = new List<(int Start, int End)>();
+            foreach (int h in hitIndices)
+            {
+                int s = Math.Max(0, h - ctx);
+                int e = Math.Min(lines.Length - 1, h + ctx);
+                if (ranges.Count > 0 && s <= ranges[ranges.Count - 1].End + 1)
+                {
+                    var prev = ranges[ranges.Count - 1];
+                    ranges[ranges.Count - 1] = (prev.Start, Math.Max(prev.End, e));
+                }
+                else
+                {
+                    ranges.Add((s, e));
+                }
+            }
+
+            for (int rIdx = 0; rIdx < ranges.Count; rIdx++)
+            {
+                if (rIdx > 0)
+                    sb.AppendLine("// ---");
+
+                var (s, e) = ranges[rIdx];
+                for (int i = s; i <= e; i++)
+                {
+                    char marker = hitSet.Contains(i) ? '>' : ' ';
+                    sb.AppendLine($"{marker} {i + 1,5}: {lines[i]}");
+                }
+            }
+
             return sb.ToString();
         }
 

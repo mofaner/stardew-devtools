@@ -16,7 +16,8 @@ namespace SdvDevClient
     /// </summary>
     internal static class ClientProgram
     {
-        private const string ProtocolMagic = "SDVD1";
+        private const string ProtocolMagic = "SDVD2";
+        private const int StaleDaemonExitCode = -32099;
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool SetConsoleOutputCP(uint wCodePageID);
@@ -73,7 +74,10 @@ namespace SdvDevClient
 
             if (first == "daemon-status")
             {
-                if (TrySendToDaemon("PING", Environment.CurrentDirectory, Array.Empty<string>(), connectTimeoutMs: 250, out int code, out string so, out string se))
+                string statusWorker = ResolveWorkerExePath();
+                long expectedStamp = GetWorkerBinaryStamp(statusWorker);
+                if (TrySendToDaemon("PING", Environment.CurrentDirectory, Array.Empty<string>(), expectedStamp, connectTimeoutMs: 250, out int code, out string so, out string se) &&
+                    code != StaleDaemonExitCode)
                 {
                     if (!string.IsNullOrEmpty(so)) Console.Out.Write(so);
                     if (!string.IsNullOrEmpty(se)) Console.Error.Write(se);
@@ -122,16 +126,26 @@ namespace SdvDevClient
                 return RunWorkerDirect(workerExe, args);
             }
 
-            // Route through active daemon when alive (including `start` / `restart` so when daemon runs under `IsDaemon: true`,
-            // StardewModdingAPI.exe is spawned inside the persistent daemon job and survives across AI turns!)
+            // Route through active daemon when alive; automatically evict & respawn if `sdv-dev-worker.exe` on disk was rebuilt!
             string cwd = Environment.CurrentDirectory;
+            long workerStamp = GetWorkerBinaryStamp(workerExe);
             if (IsDaemonAlive())
             {
-                if (TrySendToDaemon("EXEC", cwd, args, connectTimeoutMs: 1500, out int exitCode, out string stdout, out string stderr))
+                if (TrySendToDaemon("EXEC", cwd, args, workerStamp, connectTimeoutMs: 1500, out int exitCode, out string stdout, out string stderr))
                 {
-                    if (!string.IsNullOrEmpty(stdout)) Console.Out.Write(stdout);
-                    if (!string.IsNullOrEmpty(stderr)) Console.Error.Write(stderr);
-                    return exitCode;
+                    if (exitCode != StaleDaemonExitCode)
+                    {
+                        if (!string.IsNullOrEmpty(stdout)) Console.Out.Write(stdout);
+                        if (!string.IsNullOrEmpty(stderr)) Console.Error.Write(stderr);
+                        return exitCode;
+                    }
+                    // 旧版 worker 已收到自退指令，确保其彻底释放互斥锁后走下方新拉起逻辑
+                    StopDaemonAndWait();
+                }
+                else
+                {
+                    // 可能遇到了旧版 SDVD1 协议守护进程，主动清理后再拉新版
+                    StopDaemonAndWait();
                 }
             }
 
@@ -150,7 +164,8 @@ namespace SdvDevClient
                     Thread.Sleep(8);
                     if (!IsDaemonAlive())
                         continue;
-                    if (TrySendToDaemon("EXEC", cwd, args, connectTimeoutMs: 400, out int exitCode, out string stdout, out string stderr))
+                    if (TrySendToDaemon("EXEC", cwd, args, workerStamp, connectTimeoutMs: 400, out int exitCode, out string stdout, out string stderr) &&
+                        exitCode != StaleDaemonExitCode)
                     {
                         if (!string.IsNullOrEmpty(stdout)) Console.Out.Write(stdout);
                         if (!string.IsNullOrEmpty(stderr)) Console.Error.Write(stderr);
@@ -472,7 +487,7 @@ namespace SdvDevClient
 
         public static bool StopDaemonAndWait()
         {
-            bool signaled = TrySendToDaemon("SHUTDOWN", Environment.CurrentDirectory, Array.Empty<string>(), connectTimeoutMs: 250, out _, out _, out _);
+            bool signaled = TrySendToDaemon("SHUTDOWN", Environment.CurrentDirectory, Array.Empty<string>(), expectedWorkerStamp: 0L, connectTimeoutMs: 250, out _, out _, out _);
 
             var procs = Process.GetProcessesByName("sdv-dev-worker");
             if (procs.Length == 0)
@@ -511,10 +526,26 @@ namespace SdvDevClient
             return true;
         }
 
+        private static long GetWorkerBinaryStamp(string workerExePath)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(workerExePath) || !File.Exists(workerExePath))
+                    return 0L;
+                var fi = new FileInfo(workerExePath);
+                return fi.LastWriteTimeUtc.Ticks ^ (fi.Length * 397L);
+            }
+            catch
+            {
+                return 0L;
+            }
+        }
+
         private static bool TrySendToDaemon(
             string mode,
             string cwd,
             string[] args,
+            long expectedWorkerStamp,
             int connectTimeoutMs,
             out int exitCode,
             out string stdout,
@@ -533,6 +564,7 @@ namespace SdvDevClient
                 using var br = new BinaryReader(pipe, Encoding.UTF8, leaveOpen: true);
 
                 bw.Write(ProtocolMagic);
+                bw.Write(expectedWorkerStamp);
                 bw.Write(mode);
                 bw.Write(cwd ?? string.Empty);
                 bw.Write(args.Length);

@@ -39,7 +39,8 @@ namespace SdvKb.Build
 
         private static readonly HashSet<string> ExcludedExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
-            ".cs", ".csproj", ".sln", ".user", ".pdb", ".suo", ".rsp", ".tmp", ".bak", ".orig", ".log"
+            // `.fx` / `.fxh` / `.hlsl` 为着色器源码，打包发布时仅保留编译产物 `.mgfxo`
+            ".cs", ".csproj", ".sln", ".user", ".pdb", ".suo", ".rsp", ".tmp", ".bak", ".orig", ".log", ".fx", ".fxh", ".hlsl", ".hlsli"
         };
 
         private static readonly HashSet<string> ExcludedFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -201,8 +202,12 @@ namespace SdvKb.Build
 
                 string fileName = Path.GetFileName(file);
                 string ext = Path.GetExtension(file);
-                if (ExcludedFileNames.Contains(fileName) || ExcludedExtensions.Contains(ext))
+                if (fileName.IndexOf(".old_locked_", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    ExcludedFileNames.Contains(fileName) ||
+                    ExcludedExtensions.Contains(ext))
+                {
                     continue;
+                }
 
                 // Exclude README / markdown docs at root unless inside assets
                 if (currentDir.Equals(modRoot, StringComparison.OrdinalIgnoreCase) && ext.Equals(".md", StringComparison.OrdinalIgnoreCase))

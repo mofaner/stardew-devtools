@@ -1,6 +1,6 @@
 # stardew-devtools 使用说明
 
-星露谷物语 1.6 模组开发资料库与实机自动化测试工具包（包含命令行工具 `sdv-dev` 和配套 AI 技能）。装好之后，Claude Code、Cursor、Codex、Gemini、Antigravity 等 AI 助手就能直接离线检索原版源码与 Wiki 资料、编译检查模组、预览地图贴图，并自动开测试档进游戏完成实机验收。
+星露谷物语 1.6 模组开发资料库与实机自动化测试工具包（包含命令行工具 `sdv-dev` 和配套 AI 技能）。装好之后，Claude Code、Cursor、Codex、Gemini、Antigravity 等 AI 助手就能直接离线检索原版/SMAPI/MonoGame/xTile 源码与 Wiki 资料、免 SDK 编译 C# 与 `.fx` 着色器、做深度静态体检、预览地图贴图，并自动开测试档完成免重启调参、A/B 对比截图与实机验收。
 
 ---
 

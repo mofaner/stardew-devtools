@@ -37,11 +37,20 @@ namespace SdvKb.Indexers
 
     public static class AssemblyApiIndexer
     {
+        // 【当初为什么要扩展这些程序集】：
+        // 早期仅索引了 `Stardew Valley.dll`、`StardewModdingAPI.dll`（且排除了 internal 框架类）与 `GameData`，
+        // 导致开发渲染/地图/底层补丁模组时，无法通过 `sdv-dev api` 或 `decompile` 查询 `MonoGame.Framework.dll`
+        //（如 `SpriteBatch`、`RenderTarget2D`、`Effect`、`BlendState`）、`xTile.dll`（如 `XnaDisplayDevice`、`Layer`）、
+        // `0Harmony.dll`、`SMAPI.Toolkit.dll` 以及 SMAPI 内部钩子（如 `SModHooks`、`SCore`）。纳入后可一站式反编译全部底层实现。
         private static readonly string[] TargetAssemblies =
         {
             "Stardew Valley.dll",
             "StardewModdingAPI.dll",
-            "StardewValley.GameData.dll"
+            "StardewValley.GameData.dll",
+            "MonoGame.Framework.dll",
+            "xTile.dll",
+            Path.Combine("smapi-internal", "0Harmony.dll"),
+            Path.Combine("smapi-internal", "SMAPI.Toolkit.dll")
         };
 
         public static AssemblyIndexResult IndexGameAssemblies(string gamePath)
@@ -74,6 +83,10 @@ namespace SdvKb.Indexers
                 string asmLabel = Path.GetFileNameWithoutExtension(dllName);
                 bool isGameData = asmLabel.Equals("StardewValley.GameData", StringComparison.OrdinalIgnoreCase);
                 bool isSdvMain = asmLabel.Equals("Stardew Valley", StringComparison.OrdinalIgnoreCase);
+                bool isSmapiCore = asmLabel.Equals("StardewModdingAPI", StringComparison.OrdinalIgnoreCase);
+                bool isMonoGame = asmLabel.Equals("MonoGame.Framework", StringComparison.OrdinalIgnoreCase);
+                bool isXTile = asmLabel.Equals("xTile", StringComparison.OrdinalIgnoreCase);
+                bool isHarmony = asmLabel.Equals("0Harmony", StringComparison.OrdinalIgnoreCase);
 
                 using var decompilerContext = OpenDecompiler(gamePath, dllPath);
                 var decompiler = decompilerContext.Decompiler;
@@ -81,7 +94,7 @@ namespace SdvKb.Indexers
                 string asmVersion = decompiler.TypeSystem.MainModule.AssemblyVersion.ToString();
                 if (isSdvMain)
                     result.GameVersion = asmVersion;
-                else if (asmLabel.Equals("StardewModdingAPI", StringComparison.OrdinalIgnoreCase))
+                else if (isSmapiCore)
                     result.SmapiVersion = asmVersion;
 
                 foreach (var type in decompiler.TypeSystem.MainModule.TypeDefinitions)
@@ -89,14 +102,39 @@ namespace SdvKb.Indexers
                     if (IsCompilerGenerated(type.Name) || type.Name == "<Module>")
                         continue;
 
-                    // Skip internal implementation noise inside SMAPI.Framework, keep public SMAPI interfaces/classes
-                    if (asmLabel == "StardewModdingAPI" && type.Accessibility != Accessibility.Public && type.Accessibility != Accessibility.Protected)
-                        continue;
-
-                    // Skip XTile / internal non-Stardew types if any, keep StardewValley* and Netcode*
                     string ns = type.Namespace ?? string.Empty;
+
+                    // Stardew Valley.dll: 保留全部 StardewValley* 与 Netcode*（含 internal/private 供 Harmony 检索）
                     if (isSdvMain && !ns.StartsWith("StardewValley", StringComparison.Ordinal) && !ns.StartsWith("Netcode", StringComparison.Ordinal))
                         continue;
+
+                    // StardewModdingAPI.dll: 除公开接口外，保留 StardewModdingAPI.Framework* 关键内部类（如 SModHooks / SCore / EventManager）以便排查事件管线
+                    if (isSmapiCore && type.Accessibility != Accessibility.Public && type.Accessibility != Accessibility.Protected &&
+                        !ns.StartsWith("StardewModdingAPI.Framework", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    // MonoGame.Framework.dll: 仅索引公开/受保护的 Microsoft.Xna.Framework* API（跳过上千个底层 SDL/OpenGL 私有 P/Invoke 委托噪声）
+                    if (isMonoGame && ((type.Accessibility != Accessibility.Public && type.Accessibility != Accessibility.Protected) ||
+                                       !ns.StartsWith("Microsoft.Xna.Framework", StringComparison.Ordinal)))
+                    {
+                        continue;
+                    }
+
+                    // 0Harmony.dll: 仅索引 HarmonyLib* 公开/受保护类型（排除内嵌的 MonoMod/Cecil 副本防污染）
+                    if (isHarmony && ((type.Accessibility != Accessibility.Public && type.Accessibility != Accessibility.Protected) ||
+                                      !ns.StartsWith("HarmonyLib", StringComparison.Ordinal)))
+                    {
+                        continue;
+                    }
+
+                    // 其余辅助程序集默认索引公开/受保护类型（xTile 额外保留 Display 内部实现）
+                    if (!isSdvMain && !isSmapiCore && !isMonoGame && !isHarmony && !isXTile &&
+                        type.Accessibility != Accessibility.Public && type.Accessibility != Accessibility.Protected)
+                    {
+                        continue;
+                    }
 
                     string typeDocId = IdStringProvider.GetIdString(type);
                     string typeSummary = xmlDocs.GetSummary(typeDocId);
@@ -149,12 +187,12 @@ namespace SdvKb.Indexers
                         continue;
                     }
 
-                    // Methods (include private/protected on StardewValley main classes for Harmony patching!)
+                    // Methods (include private/protected on StardewValley & SMAPI.Framework & xTile so Harmony / hook targets are searchable!)
                     foreach (var m in type.Methods)
                     {
                         if (m.IsAccessor || IsCompilerGenerated(m.Name))
                             continue;
-                        if (!isSdvMain && m.Accessibility != Accessibility.Public && m.Accessibility != Accessibility.Protected)
+                        if (!isSdvMain && !isSmapiCore && !isXTile && m.Accessibility != Accessibility.Public && m.Accessibility != Accessibility.Protected)
                             continue;
 
                         string mKind = m.IsConstructor ? "constructor" : "method";

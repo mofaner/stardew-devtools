@@ -23,6 +23,7 @@ namespace SdvKb.Build
         public string ModName { get; set; } = string.Empty;
         public string OutputDllPath { get; set; } = string.Empty;
         public string DeployedPath { get; set; } = string.Empty;
+        public List<string> CompiledShaders { get; set; } = new List<string>();
         public string CompilerOutput { get; set; } = string.Empty;
     }
 
@@ -140,6 +141,16 @@ namespace System.Runtime.CompilerServices
             string effectiveModsRoot = string.IsNullOrWhiteSpace(targetModsRootOverride)
                 ? Path.Combine(gamePath, "Mods")
                 : Path.GetFullPath(targetModsRootOverride!);
+
+            // 自动编译工程内全部 HLSL `.fx` 像素/顶点着色器为 `.mgfxo`（当初为突破无 mgfxc 无法制作真实水波折射/泛光/模糊等自定义 Effect 的瓶颈而加）
+            var (shadersOk, compiledShaders, shaderErrors) = ShaderCompiler.CompileAllInProject(fullModDir);
+            res.CompiledShaders = compiledShaders;
+            if (!shadersOk)
+            {
+                res.Success = false;
+                res.CompilerOutput = string.Join("\n", shaderErrors);
+                return res;
+            }
 
             if (res.IsContentPack)
             {
@@ -819,36 +830,28 @@ namespace SdvEvalDynamic
             return DeployModFolderToModsRoot(sourceModDir, Path.Combine(gamePath, "Mods"), fallbackFolderName);
         }
 
+        /// <summary>
+        /// 将构建好的模组目录同步部署到目标 `Mods`（或 `isolated-mods`）根目录。
+        ///
+        /// 【当初为什么要改成差量覆盖 + `.old_locked` 改名腾空，而不是 `Directory.Delete`】：
+        /// 当玩家在前台开着游戏看实时效果时，`Mods/<Mod>/<Mod>.dll` 正被 `StardewModdingAPI.exe` 映射锁定，
+        /// 直接 `Directory.Delete` 或直接 `File.Copy(overwrite: true)` 会当场抛 `UnauthorizedAccessException: Access to the path '*.dll' is denied`。
+        /// 利用 Windows NTFS 允许对正在运行的已加载 `.dll`/`.pdb` 执行同卷重命名 (`File.Move`) 的特性：
+        /// 遇到文件锁时自动把旧 DLL 改名为 `*.old_locked_*` 腾出原文件名再写入新 DLL（并在下次解锁时顺手清理旧备份），
+        /// 从而让后台 `sdv-dev build --deploy` 在游戏开着时也永远不会报错。
+        /// </summary>
         public static string DeployModFolderToModsRoot(string sourceModDir, string modsRoot, string fallbackFolderName)
         {
             Directory.CreateDirectory(modsRoot);
 
-            string folderName = Path.GetFileName(sourceModDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-            if (string.IsNullOrWhiteSpace(folderName) || folderName.Equals("src", StringComparison.OrdinalIgnoreCase))
-                folderName = Regex.Replace(fallbackFolderName, @"[^a-zA-Z0-9._\- ]+", "_");
-
-            string targetDir = Path.Combine(modsRoot, folderName);
-
-            if (Path.GetFullPath(sourceModDir).TrimEnd('\\').Equals(Path.GetFullPath(targetDir).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
+            string targetDir = ResolveExistingOrDefaultTargetModDir(sourceModDir, modsRoot, fallbackFolderName);
+            if (Path.GetFullPath(sourceModDir).TrimEnd('\\', '/').Equals(Path.GetFullPath(targetDir).TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase))
                 return targetDir;
 
-            if (Directory.Exists(targetDir))
-            {
-                string existingConfig = Path.Combine(targetDir, "config.json");
-                string? savedConfig = File.Exists(existingConfig) ? File.ReadAllText(existingConfig) : null;
-
-                Directory.Delete(targetDir, recursive: true);
-                Directory.CreateDirectory(targetDir);
-
-                if (savedConfig != null && !File.Exists(Path.Combine(sourceModDir, "config.json")))
-                    File.WriteAllText(existingConfig, savedConfig, new UTF8Encoding(false));
-            }
-            else
-            {
-                Directory.CreateDirectory(targetDir);
-            }
-
-            CopyModTree(sourceModDir, targetDir, skipBinaries: false);
+            Directory.CreateDirectory(targetDir);
+            CleanupUnlockedOldBinaries(targetDir);
+            PruneDeletedFilesInTarget(sourceModDir, targetDir);
+            CopyModTreeLockTolerant(sourceModDir, targetDir, skipBinaries: false);
             return targetDir;
         }
 
@@ -856,12 +859,25 @@ namespace SdvEvalDynamic
         {
             Directory.CreateDirectory(modsRoot);
 
+            string targetDir = ResolveExistingOrDefaultTargetModDir(sourceModDir, modsRoot, fallbackFolderName);
+            if (!Path.GetFullPath(sourceModDir).TrimEnd('\\', '/').Equals(Path.GetFullPath(targetDir).TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase))
+            {
+                Directory.CreateDirectory(targetDir);
+                CleanupUnlockedOldBinaries(targetDir);
+                CopyModTreeLockTolerant(sourceModDir, targetDir, skipBinaries: true);
+            }
+            return targetDir;
+        }
+
+        private static string ResolveExistingOrDefaultTargetModDir(string sourceModDir, string modsRoot, string fallbackFolderName)
+        {
             string folderName = Path.GetFileName(sourceModDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
             if (string.IsNullOrWhiteSpace(folderName) || folderName.Equals("src", StringComparison.OrdinalIgnoreCase))
                 folderName = Regex.Replace(fallbackFolderName, @"[^a-zA-Z0-9._\- ]+", "_");
 
+            // 优先在目标 modsRoot（尤其是 `isolated-mods`，其目录名可能是 UniqueID 清洗后的名字而非源码文件夹名）中按 manifest.json UniqueID 精确对齐！
             string manifestSrc = Path.Combine(sourceModDir, "manifest.json");
-            if (File.Exists(manifestSrc))
+            if (File.Exists(manifestSrc) && Directory.Exists(modsRoot))
             {
                 try
                 {
@@ -871,32 +887,70 @@ namespace SdvEvalDynamic
                     {
                         foreach (var mf in Directory.GetFiles(modsRoot, "manifest.json", SearchOption.AllDirectories))
                         {
-                            using var d2 = JsonDocument.Parse(File.ReadAllText(mf), JsoncOpts);
-                            if (string.Equals(GetProp(d2.RootElement, "UniqueID"), uid, StringComparison.OrdinalIgnoreCase))
+                            try
                             {
-                                string existingDir = Path.GetDirectoryName(mf)!;
-                                if (!Path.GetFullPath(sourceModDir).TrimEnd('\\').Equals(Path.GetFullPath(existingDir).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
-                                    CopyModTree(sourceModDir, existingDir, skipBinaries: true);
-                                return existingDir;
+                                using var d2 = JsonDocument.Parse(File.ReadAllText(mf), JsoncOpts);
+                                if (string.Equals(GetProp(d2.RootElement, "UniqueID"), uid, StringComparison.OrdinalIgnoreCase))
+                                    return Path.GetDirectoryName(mf)!;
                             }
+                            catch { }
                         }
                     }
                 }
-                catch
+                catch { }
+            }
+
+            return Path.Combine(modsRoot, folderName);
+        }
+
+        private static void CleanupUnlockedOldBinaries(string targetDir)
+        {
+            if (!Directory.Exists(targetDir))
+                return;
+            foreach (var oldFile in Directory.GetFiles(targetDir, "*.old_locked_*", SearchOption.AllDirectories))
+            {
+                try { File.Delete(oldFile); } catch { /* 仍被当前运行中的进程占用，留待下次清理 */ }
+            }
+        }
+
+        private static void PruneDeletedFilesInTarget(string srcDir, string dstDir)
+        {
+            if (!Directory.Exists(dstDir))
+                return;
+
+            foreach (var dstFile in Directory.GetFiles(dstDir))
+            {
+                string fn = Path.GetFileName(dstFile);
+                // 保留运行期生成的 config.json 及正在被游戏进程占用的 .old_locked_* 替身文件
+                if (fn.Equals("config.json", StringComparison.OrdinalIgnoreCase) ||
+                    fn.IndexOf(".old_locked_", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
+                    continue;
+                }
+
+                string srcEquiv = Path.Combine(srcDir, fn);
+                if (!File.Exists(srcEquiv))
+                {
+                    try { File.Delete(dstFile); } catch { }
                 }
             }
 
-            string targetDir = Path.Combine(modsRoot, folderName);
-            if (!Path.GetFullPath(sourceModDir).TrimEnd('\\').Equals(Path.GetFullPath(targetDir).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
+            foreach (var dstSub in Directory.GetDirectories(dstDir))
             {
-                Directory.CreateDirectory(targetDir);
-                CopyModTree(sourceModDir, targetDir, skipBinaries: true);
+                string subName = Path.GetFileName(dstSub);
+                string srcSub = Path.Combine(srcDir, subName);
+                if (!Directory.Exists(srcSub))
+                {
+                    try { Directory.Delete(dstSub, recursive: true); } catch { }
+                }
+                else
+                {
+                    PruneDeletedFilesInTarget(srcSub, dstSub);
+                }
             }
-            return targetDir;
         }
 
-        private static void CopyModTree(string srcDir, string dstDir, bool skipBinaries)
+        private static void CopyModTreeLockTolerant(string srcDir, string dstDir, bool skipBinaries)
         {
             Directory.CreateDirectory(dstDir);
 
@@ -905,16 +959,23 @@ namespace SdvEvalDynamic
                 string fileName = Path.GetFileName(file);
                 string ext = Path.GetExtension(file).ToLowerInvariant();
                 if (ext == ".cs" || ext == ".csproj" || ext == ".sln" || ext == ".user" ||
-                    ext == ".suo" || ext == ".zip" || ext == ".nupkg" || ext == ".bak" || ext == ".tmp" || ext == ".log")
+                    ext == ".suo" || ext == ".zip" || ext == ".nupkg" || ext == ".bak" || ext == ".tmp" || ext == ".log" ||
+                    ext == ".fx" || ext == ".fxh" || ext == ".hlsl" || ext == ".hlsli")
+                {
                     continue;
-                if (fileName.Equals("sdv-project.json", StringComparison.OrdinalIgnoreCase) ||
+                }
+                if (fileName.IndexOf(".old_locked_", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    fileName.Equals("sdv-project.json", StringComparison.OrdinalIgnoreCase) ||
                     fileName.Equals(".gitignore", StringComparison.OrdinalIgnoreCase) ||
                     fileName.Equals(".gitattributes", StringComparison.OrdinalIgnoreCase))
+                {
                     continue;
+                }
                 if (skipBinaries && (ext == ".dll" || ext == ".pdb" || ext == ".exe"))
                     continue;
 
-                File.Copy(file, Path.Combine(dstDir, fileName), overwrite: true);
+                string dstPath = Path.Combine(dstDir, fileName);
+                CopySingleFileWithLockedRenameFallback(file, dstPath);
             }
 
             foreach (var sub in Directory.GetDirectories(srcDir))
@@ -933,7 +994,26 @@ namespace SdvEvalDynamic
                 {
                     continue;
                 }
-                CopyModTree(sub, Path.Combine(dstDir, name), skipBinaries);
+                CopyModTreeLockTolerant(sub, Path.Combine(dstDir, name), skipBinaries);
+            }
+        }
+
+        private static void CopySingleFileWithLockedRenameFallback(string srcFile, string dstFile)
+        {
+            try
+            {
+                File.Copy(srcFile, dstFile, overwrite: true);
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+            {
+                if (!File.Exists(dstFile))
+                    throw;
+
+                // 目标文件正被运行中的游戏进程映射占用：在同目录改名为 `.old_locked_<ticks>` 腾出路径后再写入新文件
+                string backupLocked = $"{dstFile}.old_locked_{Environment.TickCount64}";
+                try { if (File.Exists(backupLocked)) File.Delete(backupLocked); } catch { }
+                File.Move(dstFile, backupLocked);
+                File.Copy(srcFile, dstFile, overwrite: true);
             }
         }
 

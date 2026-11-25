@@ -14,7 +14,14 @@ namespace SdvKb.Daemon
 {
     public static class WorkerDaemonServer
     {
-        private const string ProtocolMagic = "SDVD1";
+        // 升级为 SDVD2 协议：每次请求携带磁盘上 `sdv-dev-worker.exe` 的修改时间+体积指纹 (`SelfWorkerStamp`)。
+        // 【当初为什么要加这个指纹校验】：
+        // 重新运行 `build.ps1` 或覆盖更新安装包后，若后台仍驻留着 10 分钟内未超时的旧版 `--daemon`，
+        // 客户端直接连上去会读到旧版帮助文本与旧逻辑。加入二进制指纹对账后，一旦发现磁盘上的 worker 已更新，
+        // 旧守护进程立即返回 `StaleDaemonExitCode` 并主动自退，客户端无感拉起新进程接管。
+        private const string ProtocolMagic = "SDVD2";
+        private const int StaleDaemonExitCode = -32099;
+        private static readonly long SelfWorkerStamp = ComputeSelfBinaryStamp();
         private static readonly TimeSpan IdleTimeout = TimeSpan.FromMinutes(10);
 
         private static readonly object ExecLock = new object();
@@ -176,14 +183,29 @@ namespace SdvKb.Daemon
 
                         string magic = br.ReadString();
                         if (magic != ProtocolMagic)
-                            continue;
+                        {
+                            // 若旧版/新版协议不一致，旧守护进程直接退出让位给磁盘上的新 worker
+                            cts.Cancel();
+                            break;
+                        }
 
+                        long clientExpectedStamp = br.ReadInt64();
                         string mode = br.ReadString();
                         string cwd = br.ReadString();
                         int argc = br.ReadInt32();
                         string[] args = new string[argc];
                         for (int i = 0; i < argc; i++)
                             args[i] = br.ReadString();
+
+                        if (mode != "SHUTDOWN" && clientExpectedStamp != 0L && SelfWorkerStamp != 0L && clientExpectedStamp != SelfWorkerStamp)
+                        {
+                            bw.Write(StaleDaemonExitCode);
+                            bw.Write(string.Empty);
+                            bw.Write(string.Empty);
+                            bw.Flush();
+                            cts.Cancel();
+                            break;
+                        }
 
                         if (mode == "SHUTDOWN")
                         {
@@ -306,6 +328,22 @@ namespace SdvKb.Daemon
             _warmDbPath = dbPath;
             _warmDbWriteUtc = writeUtc;
             return _warmDb;
+        }
+
+        private static long ComputeSelfBinaryStamp()
+        {
+            try
+            {
+                string? selfPath = Environment.ProcessPath;
+                if (string.IsNullOrWhiteSpace(selfPath) || !File.Exists(selfPath))
+                    return 0L;
+                var fi = new FileInfo(selfPath);
+                return fi.LastWriteTimeUtc.Ticks ^ (fi.Length * 397L);
+            }
+            catch
+            {
+                return 0L;
+            }
         }
 
         private static void CleanupResources()

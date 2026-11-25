@@ -369,6 +369,9 @@ namespace SdvKb.Validation
             // Source-level multiplayer check (lightweight & works even before first build)
             AnalyzeCSharpSourcesForMultiplayer(modDir, csFiles, issues);
 
+            // Roslyn AST 静态扫描 MonoGame / SMAPI 渲染常见大坑（重复 SpriteBatch.Begin、每帧 new Texture2D/RenderTarget2D 泄漏、SetRenderTarget 未还原、非预乘 Alpha 泛白）
+            RenderingAstAnalyzer.AnalyzeModRenderingPatterns(modDir, csFiles, issues);
+
             if (string.IsNullOrWhiteSpace(entryDllRelative) || string.IsNullOrWhiteSpace(gamePath))
                 return;
 

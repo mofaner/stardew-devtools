@@ -61,6 +61,17 @@ if (Test-Path -LiteralPath $wikiDir) {
     }
 }
 
+# 1.6 将对齐星露谷 1.6 (MonoGame 3.8.0.1641) 的 mgfxc + MojoShader 着色器编译器打包进 worker，实现免装工具链直编 .fx -> .mgfxo
+$mgfxcDir = Join-Path $PSScriptRoot 'tools\mgfxc-3.8.0'
+$mgfxcZip = Join-Path $objDir 'MgfxcBundle.zip'
+if (Test-Path -LiteralPath $mgfxcDir) {
+    $mgFiles = Get-ChildItem -LiteralPath $mgfxcDir -File
+    if ($mgFiles.Count -gt 0) {
+        $mgFiles | Compress-Archive -DestinationPath $mgfxcZip -CompressionLevel Optimal -Force
+        Write-Host "[预备] 已打包内置 .fx Shader 编译器资源包 ($([math]::Round((Get-Item -LiteralPath $mgfxcZip).Length / 1KB, 1)) KB)"
+    }
+}
+
 # 2. 使用官方 Pathoschild.Stardew.ModBuildConfig 编译 .NET 6.0 游戏桥接层 (SdvDevBridge.dll)
 Write-Host "[1/3] 编译 .NET 6.0 桥接模组 SdvDevBridge.dll (ModBuildConfig)..."
 $bridgeArgs = @('build', "$PSScriptRoot\bridge\SdvDevBridge.csproj", '-c', 'Release', '-o', $bridgeStaging, '--nologo', '-v', 'minimal')
@@ -165,10 +176,28 @@ if (-not $SkipInstall) {
     $binDir = Join-Path $HOME '.local\bin'
     New-Item -ItemType Directory -Path $binDir -Force | Out-Null
 
-    Copy-Item -LiteralPath "$distDir\sdv-dev.exe" -Destination (Join-Path $binDir 'sdv-dev.exe') -Force
-    Copy-Item -LiteralPath "$distDir\sdv-dev-worker.exe" -Destination (Join-Path $binDir 'sdv-dev-worker.exe') -Force
+    # 清理之前因进程短暂占用改名的旧二进制残留
+    Get-ChildItem -LiteralPath $binDir -Filter '*.old_locked_*' -ErrorAction SilentlyContinue | ForEach-Object {
+        try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch { }
+    }
+
+    function Copy-LockTolerant([string]$src, [string]$dst) {
+        try {
+            Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop
+        } catch {
+            # 若另一终端正瞬时执行 sdv-dev.exe / sdv-dev-worker.exe，利用 Windows MoveFile 腾空原文件名后再写入新版
+            if (Test-Path -LiteralPath $dst) {
+                $retired = "$dst.old_locked_$([DateTime]::UtcNow.Ticks)"
+                Move-Item -LiteralPath $dst -Destination $retired -Force -ErrorAction Stop
+            }
+            Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop
+        }
+    }
+
+    Copy-LockTolerant "$distDir\sdv-dev.exe" (Join-Path $binDir 'sdv-dev.exe')
+    Copy-LockTolerant "$distDir\sdv-dev-worker.exe" (Join-Path $binDir 'sdv-dev-worker.exe')
     if (Test-Path -LiteralPath "$distDir\sdv-dev.db") {
-        Copy-Item -LiteralPath "$distDir\sdv-dev.db" -Destination (Join-Path $binDir 'sdv-dev.db') -Force
+        Copy-LockTolerant "$distDir\sdv-dev.db" (Join-Path $binDir 'sdv-dev.db')
     }
     Remove-Item -LiteralPath (Join-Path $binDir 'sdv-dev.exe.config') -Force -ErrorAction SilentlyContinue
     $legacyLibDir = Join-Path $HOME '.local\lib\sdv-dev'
@@ -176,6 +205,9 @@ if (-not $SkipInstall) {
         Remove-Item -LiteralPath $legacyLibDir -Recurse -Force -ErrorAction SilentlyContinue
     }
     Write-Host "已安装三文件绿色便携套件到: $binDir"
+
+    # 构建安装完毕后再次停掉可能刚被外部调用拉起的旧守护进程，确保任何终端下一次调用直接连上新版 worker
+    try { & (Join-Path $binDir 'sdv-dev.exe') daemon-stop *> $null } catch { }
 
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $entries = @()

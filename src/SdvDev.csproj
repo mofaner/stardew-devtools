@@ -17,6 +17,7 @@
     <EmbeddedResource Include="..\obj\bridge-out\SdvDevBridge.dll" LogicalName="SdvDevBridge.dll" Condition="Exists('..\obj\bridge-out\SdvDevBridge.dll')" />
     <EmbeddedResource Include="..\bridge\manifest.json" LogicalName="SdvDevBridge.manifest.json" />
     <EmbeddedResource Include="..\obj\WikiDocsBundle.zip" LogicalName="WikiDocsBundle.zip" Condition="Exists('..\obj\WikiDocsBundle.zip')" />
+    <EmbeddedResource Include="..\obj\MgfxcBundle.zip" LogicalName="MgfxcBundle.zip" Condition="Exists('..\obj\MgfxcBundle.zip')" />
   </ItemGroup>
 
   <ItemGroup>

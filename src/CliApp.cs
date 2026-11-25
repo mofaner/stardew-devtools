@@ -60,6 +60,7 @@ namespace SdvKb
                 "gen-gmcm" or "gmcm" => RunGenGmcm(rest),
                 "check" or "validate" => RunCheck(rest),
                 "build" => RunBuild(rest),
+                "shader" or "shader-compile" or "fx" => RunShaderCompile(rest),
                 "pack" or "package" => RunPack(rest),
 
                 // Offline & Live Map / Tilesheet / Sprite Toolchain
@@ -92,6 +93,7 @@ namespace SdvKb
                 "mp" or "multiplayer" => RunMultiplayer(rest),
                 "warp" => RunWarp(rest),
                 "screenshot" => RunScreenshot(rest),
+                "config" or "mod-config" => RunModConfig(rest),
                 "stop" => RunStop(rest),
                 "menu" => RunMenu(),
                 "eval" => RunEval(rest),
@@ -288,6 +290,10 @@ namespace SdvKb
                     "sdv" or "game" => "Stardew Valley",
                     "smapi" => "StardewModdingAPI",
                     "gamedata" => "StardewValley.GameData",
+                    "monogame" or "mg" or "xna" => "MonoGame.Framework",
+                    "xtile" => "xTile",
+                    "harmony" => "0Harmony",
+                    "toolkit" => "SMAPI.Toolkit",
                     _ => asm
                 };
             }
@@ -327,7 +333,9 @@ namespace SdvKb
             int lines = GetIntOption(args, "--lines", "-n", defaultValue: 200);
             bool full = HasFlag(args, "--full");
             string? overrideGame = GetOption(args, "--game-path", "-g");
-            string target = GetPositionalQuery(args, "--lines", "-n", "--game-path", "-g");
+            string? grep = GetOption(args, "--grep", "--search");
+            int grepCtx = GetIntOption(args, "-C", "--context", defaultValue: 15);
+            string target = GetPositionalQuery(args, "--lines", "-n", "--game-path", "-g", "--grep", "--search", "-C", "--context");
 
             if (string.IsNullOrWhiteSpace(target))
             {
@@ -344,7 +352,7 @@ namespace SdvKb
 
             if (sharedDb != null)
             {
-                string code = DecompileService.DecompileTarget(cfg.GamePath, target, lines, full, sharedDb);
+                string code = DecompileService.DecompileTarget(cfg.GamePath, target, lines, full, sharedDb, grep, grepCtx);
                 Console.WriteLine(code);
                 return 0;
             }
@@ -352,7 +360,7 @@ namespace SdvKb
             KbDatabase? localDb = File.Exists(cfg.DbPath) ? new KbDatabase(cfg.DbPath) : null;
             using (localDb)
             {
-                string code = DecompileService.DecompileTarget(cfg.GamePath, target, lines, full, localDb);
+                string code = DecompileService.DecompileTarget(cfg.GamePath, target, lines, full, localDb, grep, grepCtx);
                 Console.WriteLine(code);
                 return 0;
             }
@@ -737,6 +745,40 @@ namespace SdvKb
             return res.Success ? 0 : 1;
         }
 
+        private static int RunShaderCompile(string[] args)
+        {
+            string? outPath = GetOption(args, "--out", "-o");
+            string profile = GetOption(args, "--profile") ?? "OpenGL";
+            string? defines = GetOption(args, "--defines");
+            bool debug = HasFlag(args, "--debug");
+            string target = GetOption(args, "--project", "-p")
+                ?? GetPositionalQuery(args, "--out", "-o", "--profile", "--defines", "--project", "-p");
+
+            if (string.IsNullOrWhiteSpace(target))
+            {
+                PrintHelp("shader");
+                return 1;
+            }
+
+            if (Directory.Exists(target))
+            {
+                var (allOk, compiled, errs) = ShaderCompiler.CompileAllInProject(target);
+                PrintJson(new
+                {
+                    ok = allOk,
+                    projectDir = Path.GetFullPath(target),
+                    compiledCount = compiled.Count,
+                    compiledShaders = compiled,
+                    errors = errs
+                });
+                return allOk ? 0 : 1;
+            }
+
+            var single = ShaderCompiler.CompileShaderFile(target, outPath, profile, defines, debug);
+            PrintJson(single);
+            return single.Success ? 0 : 1;
+        }
+
         private static int RunGenGmcm(string[] args)
         {
             string? configFile = GetOption(args, "--config", "-c");
@@ -824,6 +866,7 @@ namespace SdvKb
             var cfg = KbConfig.Load(GetOption(args, "--game-path", "-g"));
             string? rectStr = GetOption(args, "--rect", "-r");
             string? layer = GetOption(args, "--layer", "-l");
+            bool full = HasFlag(args, "--full");
             string mapName = GetPositionalQuery(args, "--game-path", "-g", "--rect", "-r", "--layer", "-l");
 
             if (string.IsNullOrWhiteSpace(mapName))
@@ -833,7 +876,7 @@ namespace SdvKb
             }
 
             (int X, int Y, int W, int H)? rect = ParseRect4(rectStr);
-            PrintJson(MapInspectorAndRenderer.InspectMap(mapName, cfg.GamePath, rect, layer));
+            PrintJson(MapInspectorAndRenderer.InspectMap(mapName, cfg.GamePath, rect, layer, includeFullMapMeta: full));
             return 0;
         }
 
@@ -1067,6 +1110,8 @@ namespace SdvKb
             bool isolated = HasFlag(args, "--isolated");
             bool testWorld = HasFlag(args, "--test-world", "--new-test-save");
             bool resetTestWorld = HasFlag(args, "--reset-test-world");
+            bool background = HasFlag(args, "--background", "--no-window", "--headless") && !HasFlag(args, "--visible");
+            bool noFocus = HasFlag(args, "--no-focus");
             int timeout = GetIntOption(args, "--timeout", "-t", defaultValue: 65);
 
             var extraMods = ParseCsvList(withModsRaw);
@@ -1079,7 +1124,9 @@ namespace SdvKb
                 customModsPath: modsPath,
                 projectDir: project,
                 extraWithMods: extraMods,
-                resetTestWorld: resetTestWorld);
+                resetTestWorld: resetTestWorld,
+                background: background,
+                noFocus: noFocus);
             Console.WriteLine(json);
             return 0;
         }
@@ -1097,6 +1144,11 @@ namespace SdvKb
             bool resetTestWorld = HasFlag(args, "--reset-test-world");
             bool cold = HasFlag(args, "--cold");
             bool force = HasFlag(args, "--force");
+            bool sameDesktop = HasFlag(args, "--same-desktop", "--keep-window", "--visible");
+            bool noFocus = !HasFlag(args, "--focus");
+            bool? bgOverride = HasFlag(args, "--background", "--no-window", "--headless")
+                ? true
+                : (sameDesktop ? false : (bool?)null);
             int timeout = GetIntOption(args, "--timeout", "-t", defaultValue: 65);
 
             var extraMods = ParseCsvList(withModsRaw);
@@ -1112,7 +1164,10 @@ namespace SdvKb
                 forceFullMods: fullMods,
                 customModsPath: modsPath,
                 extraWithMods: extraMods,
-                resetTestWorld: resetTestWorld);
+                resetTestWorld: resetTestWorld,
+                backgroundOverride: bgOverride,
+                sameDesktopExplicit: sameDesktop,
+                noFocus: noFocus);
             Console.WriteLine(json);
             return 0;
         }
@@ -1161,9 +1216,19 @@ namespace SdvKb
             bool reloadMap = !HasFlag(args, "--no-reload-map");
 
             string? deployedDir = null;
+            List<string> compiledShaders = new List<string>();
             if (!string.IsNullOrWhiteSpace(project))
             {
                 string fullProj = Path.GetFullPath(project!);
+                // 先自动编译全部 `.fx -> .mgfxo`，再执行静态检查与精准目录部署（自动识别 isolated-mods 或 Mods 中的实际文件夹名）
+                var (shadersOk, shaderOuts, shaderErrs) = ShaderCompiler.CompileAllInProject(fullProj);
+                if (!shadersOk)
+                {
+                    PrintJson(new { ok = false, stage = "shader_compile", errors = shaderErrs });
+                    return 1;
+                }
+                compiledShaders = shaderOuts;
+
                 var issues = ModValidator.ValidateModDirectory(fullProj);
                 if (issues.Any(i => i.Severity == "ERROR"))
                 {
@@ -1188,6 +1253,7 @@ namespace SdvKb
                 action = "reload_assets",
                 uniqueId = id,
                 assets,
+                compiledShaders = compiledShaders.Count > 0 ? compiledShaders : null,
                 reloadMap
             });
 
@@ -1197,6 +1263,7 @@ namespace SdvKb
                 {
                     ok = true,
                     deployedAssetsTo = deployedDir,
+                    compiledShaders,
                     bridge = JsonSerializer.Deserialize<object>(bridgeResp)
                 });
             }
@@ -1250,19 +1317,43 @@ namespace SdvKb
 
         private static int RunScreenshot(string[] args)
         {
-            string[] valOpts = { "--mode", "-m", "--out", "-o", "--scale", "-s", "--screen" };
-            EnsureCommandOptions("screenshot", args, valOpts, "--ui-overlay", "--ui");
+            string[] valOpts = { "--mode", "-m", "--out", "-o", "--scale", "-s", "--zoom", "-z", "--screen", "--ab-compare", "--ab", "--ab-toggle", "--interval-ticks", "--interval-ms", "--pan" };
+            EnsureCommandOptions("screenshot", args, valOpts, "--ui-overlay", "--ui", "--burst", "--grid", "--pan-test");
 
             string mode = (GetOption(args, "--mode", "-m") ?? "screen").Trim().ToLowerInvariant();
             string? outPath = GetOption(args, "--out", "-o");
             string? scaleStr = GetOption(args, "--scale", "-s");
+            string? zoomStr = GetOption(args, "--zoom", "-z");
             string? screen = GetOption(args, "--screen");
             bool uiOverlay = HasFlag(args, "--ui-overlay", "--ui");
+            string? abMod = GetOption(args, "--ab-compare", "--ab");
+            string? abToggle = GetOption(args, "--ab-toggle");
+            bool hasBurstFlag = HasFlag(args, "--burst");
+            bool panTestFlag = HasFlag(args, "--pan-test");
+            string? panRaw = GetOption(args, "--pan");
             float scale = float.TryParse(scaleStr, NumberStyles.Float, CultureInfo.InvariantCulture, out float sv) ? sv : 1.0f;
+            float? tempZoom = float.TryParse(zoomStr, NumberStyles.Float, CultureInfo.InvariantCulture, out float zv) && zv > 0.05f ? zv : (float?)null;
 
+            // 支持 `--burst` 无参默认 4 帧，或 `--burst 6` 显式帧数
+            int burstFrames = 4;
+            bool burstTakesNumericNext = false;
+            for (int i = 0; i < args.Length - 1; i++)
+            {
+                if (args[i].Equals("--burst", StringComparison.OrdinalIgnoreCase) &&
+                    int.TryParse(args[i + 1], out int parsedFrames) && parsedFrames >= 2 && parsedFrames <= 9)
+                {
+                    burstFrames = parsedFrames;
+                    burstTakesNumericNext = true;
+                    break;
+                }
+            }
+
+            var posOpts = burstTakesNumericNext
+                ? valOpts.Concat(new[] { "--burst" }).ToArray()
+                : valOpts;
             if (string.IsNullOrWhiteSpace(outPath))
             {
-                outPath = GetPositionalQuery(args, valOpts);
+                outPath = GetPositionalQuery(args, posOpts);
             }
 
             if (string.IsNullOrWhiteSpace(outPath))
@@ -1272,6 +1363,52 @@ namespace SdvKb
             }
 
             string fullOut = Path.GetFullPath(outPath!);
+
+            // 分支 1：带临时镜头缩放重建缓冲 (`--zoom`)、A/B 对比 (`--ab-compare`) 或 动态时序四宫格连拍 (`--burst` / `--pan-test`)
+            bool isMultiOrZoomScreen = mode == "screen" && (!string.IsNullOrWhiteSpace(abMod) || hasBurstFlag || panTestFlag || !string.IsNullOrWhiteSpace(panRaw) || (tempZoom.HasValue && !uiOverlay));
+            if (isMultiOrZoomScreen)
+            {
+                int intervalTicks = GetIntOption(args, "--interval-ticks", "--interval-ticks", defaultValue: -1);
+                if (intervalTicks <= 0)
+                {
+                    int intervalMs = GetIntOption(args, "--interval-ms", "--interval-ms", defaultValue: 250);
+                    intervalTicks = Math.Max(1, (int)Math.Round(intervalMs * 60.0 / 1000.0));
+                }
+
+                int panDx = 0, panDy = 0;
+                if (!string.IsNullOrWhiteSpace(panRaw))
+                {
+                    var pt = ParsePoint2(panRaw);
+                    if (pt.HasValue) { panDx = pt.Value.X; panDy = pt.Value.Y; }
+                }
+                else if (panTestFlag)
+                {
+                    panDx = 8; // 默认每 tick 向右平滑移动 8px（45 ticks 共平移 360px，足以暴露残影与 UV 错位）
+                }
+
+                string capMode = !string.IsNullOrWhiteSpace(abMod)
+                    ? "ab_compare"
+                    : ((hasBurstFlag || panTestFlag || !string.IsNullOrWhiteSpace(panRaw)) ? "burst" : "single_zoom");
+
+                string advResp = BridgeClient.SendRequired(new
+                {
+                    action = "screenshot_advanced",
+                    captureMode = capMode,
+                    outPath = fullOut,
+                    abMod,
+                    abToggle,
+                    burstFrames,
+                    intervalTicks,
+                    panDx,
+                    panDy,
+                    zoom = tempZoom,
+                    screen
+                }, connectTimeoutMs: 5000);
+
+                Console.WriteLine(advResp);
+                return 0;
+            }
+
             string resp = BridgeClient.SendRequired(new
             {
                 action = "screenshot",
@@ -1306,6 +1443,90 @@ namespace SdvKb
 
             Console.WriteLine(resp);
             return 0;
+        }
+
+        private static int RunModConfig(string[] args)
+        {
+            bool noSave = HasFlag(args, "--no-save");
+            bool reset = HasFlag(args, "--reset");
+            string? getKey = GetOption(args, "--get", "-k", "--key");
+            // 若用户只写了 `--get` 末尾标志而无参数，getKey 为 null（表示返回全部字段）
+            if (getKey != null && getKey.StartsWith("-", StringComparison.Ordinal))
+                getKey = null;
+
+            var setAssignments = new List<string>();
+            var positional = new List<string>();
+            for (int i = 0; i < args.Length; i++)
+            {
+                string a = args[i];
+                if (a.Equals("--set", StringComparison.OrdinalIgnoreCase) || a.Equals("-s", StringComparison.OrdinalIgnoreCase))
+                {
+                    while (i + 1 < args.Length && !args[i + 1].StartsWith("-", StringComparison.Ordinal))
+                    {
+                        i++;
+                        setAssignments.Add(args[i]);
+                    }
+                    continue;
+                }
+                if (a.Equals("--get", StringComparison.OrdinalIgnoreCase) ||
+                    a.Equals("-k", StringComparison.OrdinalIgnoreCase) ||
+                    a.Equals("--key", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (i + 1 < args.Length && !args[i + 1].StartsWith("-", StringComparison.Ordinal) && !args[i + 1].Contains('='))
+                        i++;
+                    continue;
+                }
+                if (a.StartsWith("-", StringComparison.Ordinal))
+                    continue;
+
+                if (a.Contains('=') && positional.Count >= 1)
+                    setAssignments.Add(a);
+                else
+                    positional.Add(a);
+            }
+
+            string? modId = GetOption(args, "--mod", "-m") ?? (positional.Count > 0 ? positional[0] : null);
+            if (string.IsNullOrWhiteSpace(modId))
+            {
+                PrintHelp("config");
+                return 1;
+            }
+
+            Dictionary<string, object?>? setObj = null;
+            if (setAssignments.Count > 0)
+            {
+                setObj = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+                foreach (var expr in setAssignments)
+                {
+                    int eq = expr.IndexOf('=');
+                    if (eq <= 0)
+                        throw new ArgumentException($"Invalid `--set` assignment `{expr}` (expected `Key=Value`).");
+                    string k = expr.Substring(0, eq).Trim();
+                    string rawVal = expr.Substring(eq + 1).Trim();
+                    setObj[k] = ParseLooseScalar(rawVal);
+                }
+            }
+
+            Console.WriteLine(BridgeClient.SendRequired(new
+            {
+                action = "mod_config",
+                modId,
+                key = getKey,
+                set = setObj,
+                reset,
+                save = !noSave
+            }, connectTimeoutMs: 5000));
+            return 0;
+        }
+
+        private static object? ParseLooseScalar(string raw)
+        {
+            if (raw.Equals("true", StringComparison.OrdinalIgnoreCase)) return true;
+            if (raw.Equals("false", StringComparison.OrdinalIgnoreCase)) return false;
+            if (raw.Equals("null", StringComparison.OrdinalIgnoreCase)) return null;
+            if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out int iv)) return iv;
+            if (double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out double dv)) return dv;
+            return raw;
         }
 
         private static int RunStop(string[] args)
@@ -1756,6 +1977,7 @@ namespace SdvKb
             string? addItem = GetOption(args, "--add-item", "--give");
             string? mail = GetOption(args, "--mail");
             string? advStr = GetOption(args, "--advance-days", "--days");
+            string? zoomStr = GetOption(args, "--zoom", "-z");
             string? screen = GetOption(args, "--screen");
             bool refill = HasFlag(args, "--refill");
             bool save = HasFlag(args, "--save");
@@ -1765,9 +1987,10 @@ namespace SdvKb
             int? time = int.TryParse(timeStr, out int tv) ? tv : (int?)null;
             int? money = int.TryParse(moneyStr, out int mv) ? mv : (int?)null;
             int? advanceDays = int.TryParse(advStr, out int av) ? av : (int?)null;
+            float? zoom = float.TryParse(zoomStr, NumberStyles.Float, CultureInfo.InvariantCulture, out float zv) && zv > 0.05f ? zv : (float?)null;
 
             if (season == null && !day.HasValue && !year.HasValue && !time.HasValue && weather == null &&
-                !money.HasValue && friendship == null && addItem == null && mail == null && !advanceDays.HasValue && !refill)
+                !money.HasValue && friendship == null && addItem == null && mail == null && !advanceDays.HasValue && !zoom.HasValue && !refill)
             {
                 PrintHelp("world");
                 return 1;
@@ -1787,6 +2010,7 @@ namespace SdvKb
                 addItem,
                 mail,
                 advanceDays,
+                zoom,
                 save,
                 screen
             }, connectTimeoutMs: 5000));
@@ -1868,7 +2092,7 @@ namespace SdvKb
                 return;
             }
 
-            Console.WriteLine(@"sdv-dev 星露谷物语 1.6 模组开发、项目依赖、地图渲染与实机自动化测试命令行
+            Console.WriteLine(@"sdv-dev 星露谷物语 1.6 模组开发资料库、着色器/C# 免 SDK 构建、静态体检、地图离线渲染与实机自动化测试工具
 
 sdv-dev [OPTIONS] SUBCOMMAND
 
@@ -1876,50 +2100,54 @@ OPTIONS:
   -h, --help                  打印帮助信息；子命令详情用 `sdv-dev <命令> --help` 或 `sdv-dev help <命令>`
 
 知识检索与源码检视:
-  help                        查看子命令或流程详细说明（如 `sdv-dev help deps`、`sdv-dev help map-render`）
-  api                         用模糊英文意图词或驼峰词搜未知类、方法（含私有方法）与 SMAPI 事件
-  decompile                   按 MetadataToken 实时反编译原版/SMAPI 源码并输出 Harmony 补丁提示
+  help                        查看子命令详细参数与示例（如 `sdv-dev help shader`、`sdv-dev help screenshot`、`sdv-dev help deps`）
+  api                         模糊搜索 C# 类、方法（含私有方法）与事件（支持 `--asm sdv|smapi|gamedata|monogame|xtile|harmony|toolkit`）
+  decompile                   实时反编译原版/SMAPI(含内部类)/MonoGame/xTile/Harmony 源码，支持 `--grep <关键词> -C 15` 局部切片
   schema                      查询 1.6 GameData 数据表强类型字段与官方 XML 注释
-  data                        按中文名、英文名或 ID 检索原版解包 JSON 配置模板
-  doc                         全文检索 Content Patcher、SMAPI、Wiki、GameStateQuery、TriggerAction、EventCommand 文档
+  data                        按中英文名或 ID 检索原版解包 JSON 条目与 `Audio/Cues` XACT 音效库
+  doc                         全文检索 Content Patcher、SMAPI、官方 Wiki、GameStateQuery、TriggerAction、EventCommand 文档
   status / sync               查看知识库状态，或同步重建本地 SQLite FTS5 索引
 
-工程构建、项目依赖管理、1.6 语义体检与发布打包:
-  deps                        项目依赖管理（扫描本地 Mods、兜底拉取 GitHub Releases、导出前置 API 接口、自动挂载隔离环境）
+工程构建、着色器编译、依赖管理、1.6 深度体检与发布打包:
+  deps                        项目依赖管理（扫描本地 Mods、兜底拉取 GitHub Releases、反编译前置 `I*Api` 接口、挂载隔离环境）
   new                         创建 1.6 Content Patcher 内容包 (`cp`) 或 SMAPI C# 模组 (`csharp`，预集成 Publicizer) 工程骨架
   gen-gmcm                    解析 `ModConfig.cs` AST 一键生成 GMCM 配置菜单 (`IGenericModConfigMenuApi` + 注册代码 + 双语 `i18n`)
-  check                       1.6 深度语义校验（GameData 强类型字段/GSQ/Event脚本/EditImage越界/i18n对账/Harmony静态验签/联机隐患/.tmx）
-  build                       免装 .NET SDK 编译 .NET 6.0 C# 模组（内置 `BepInEx.AssemblyPublicizer` 免反射直访私有成员 + Harmony 验签）
-  pack                        规范化发布打包：自动编译+全量静态校验并生成 Nexus/CurseForge 标准结构 `<ModName> <Version>.zip`
+  shader                      内置免装 HLSL `.fx -> .mgfxo` 编译器（对齐星露谷 1.6 DesktopGL MGFX v9 字节码，支持子目录 `#include`）
+  check                       深度静态校验（1.6 GameData/跨表外键断链/NPC日程对话肖像/.fx着色器/Harmony验签/MonoGame渲染坑/联机隐患/.tmx）
+  build                       免 SDK 秒编 C# 模组与全部 `*.fx` 着色器（默认启用 `AssemblyPublicizer` 免反射直访私有成员 + Harmony 验签）
+  pack                        规范化发布打包：自动编译+全量静态校验并生成剔除源码/`.fx`/PDB 的标准 `<ModName> <Version>.zip`
 
 地图、精灵图与贴图离线/实机工具链:
   tilesheet                   从原版解包目录导出贴图 PNG，支持 `--grid` 自动叠加 `0..N` TileIndex 编号网格
   sprite                      物品/建筑/NPC 4方向行走帧 (`16x32`) / 肖像表情格 (`64x64`) 切分体检与包围盒对齐预览图导出
   map-inspect                 检视地图图层、TileSheets、Warp/Light/动画帧与指定 `--rect` 局部图块/通行掩码矩阵
-  map-render                  1 秒离线合成多图层 `.tmx` 预览图（`--debug-overlay` 标注红阻挡/蓝水面/绿Warp/黄Action与标尺）
+  map-render                  离线合成 `.tmx` 或叠加 `--cp <ModDir> --auto-crop` 预览 CP 地图补丁（`--debug-overlay` 标碰撞/水面/Warp）
   map-prefab / map-extract    列出内置原版跨层预制件（棕榈树/栈桥/浪花等）或从原版地图抠取 5 层结构+动画保存为预制件
   map-stamp                   将跨层预制件盖章合入目标 `.tmx`（自动合并 tileset、动画与属性，默认不盖 Back 防沙块穿帮）
   map-autotile                根据紧凑字符网格（W水/S沙/G草/P桥/C崖）自动过渡边缘并挂接 13 帧海浪生成 `.tmx`
   map-check                   离线深度体检 `.tmx`：PNG 真实像素尺寸、GID 越界、跨图 Warp 落点安全与 BFS 连通性孤岛检测
   map-find-space              在实机（含 CP/SVE 合并后）扫描地图安全空地，自动避开水面/灌木/建筑/Warp 与 NPC 日程路线
 
-实机自动化控制、资产/Harmony 探针、剧情沙盒与分屏联调:
-  live / saves                查看当前游戏进程、桥接状态、活跃 Mods 路径、分屏数、所处世界坐标，或列出本机存档
-  start                       启动 SMAPI（支持 `--isolated` 模组隔离自动带入前置、`--test-world` SVE 兼容专属测试档）
-  restart                     先 check+build（失败保留原进程），通过后重启部署（支持 `--isolated` 极速隔离重启）
-  reload / reload-assets      免重启热重载 CP 包，或对 C#/CP 模组仅同步非 DLL 资产（.tmx/.png/.json）并立即刷新当前地图
+实机自动化控制、免重启调参、视觉对比/连拍、快照与性能探针:
+  live / saves                查看当前游戏进程、桥接状态、活跃 Mods 路径、是否隔离/后台模式、所处坐标，或列出本机存档
+  start                       启动 SMAPI（支持 `--isolated` 隔离秒开、`--test-world` 专属测试档、`--background` 无弹窗后台隐藏运行）
+  restart                     先 check+build（失败保留原进程），通过后无锁暂存热重启（支持 `--same-desktop` 无焦点原位刷新 / `--background`）
+  reload / reload-assets      免重启热重载 CP 包，或对 C#/CP 模组自动重编 `.fx` 并 0.2s 热刷内存 `Effect` 着色器与地图贴图
+  config                      免重启 0.05 秒实时读取/修改/重置模组配置（`--get [Key]` / `--set Key=Val` / `--reset`）
+  screenshot                  实机截图：`--mode screen|map`、`--zoom 0.75` 大视野、`--ui-overlay`、`--ab-compare`、`--burst` 四宫格
+  interact                    世界交互模拟：`--place` 摆机器、`--drop-in` 投料、`--right-click` 右键收获/对话/开店、`--use-tool` 挥农具
+  checkpoint                  测试档秒级时光机快照：`save`/`load`/`list`/`delete`（冷重启后也能 1 秒回档到精确分钟与坐标反复测分支）
+  schedule-check              实机调用原版 `NPC.parseMasterSchedule` 推演 NPC 全天日程跨图寻路，排查不可达目标格或断链 Warp
   asset                       透视实机合并后的最终资产数据/贴图，支持 `--cp-trace` 抓取官方 Content Patcher `patch summary` 链路
   harmony                     查询实机 Harmony 补丁链；加 `--il` 导出经全部 Transpiler 改写后的实时 IL 指令序列与每段模组归属
-  profile                     按需开启（平时零开销）实时采样帧率、1% Low FPS、GC 分配速率及耗时 Top N 的 SMAPI 事件与 Harmony 补丁
-  interact                    世界实体交互模拟：`--place` 摆机器、`--drop-in` 投料、`--right-click` 右键收获/对话/开店、`--use-tool` 挥农具
+  profile                     按需动态采样（完事自动卸载 0 残留）：统计帧率、1% Low、GC 速率及耗时 Top N 的 SMAPI 事件与 Harmony 补丁
   event-play                  剧情事件实时沙盒：按 EventID 强制重播（自动清已读）或通过 `--stdin` 直接预览原始 Event 脚本字符串
   world                       确定性世界控制：改时间/季节/天气/好感/发物品/塞信件，支持 `--advance-days N` 驱动真实跨夜结算管线
   mp                          本地分屏联机测试：列出分屏实例、`add-farmhand` 一键拉起客机，全系实机命令均支持 `--screen host|farmhand`
-  warp                        主线程瞬移玩家至指定地点与坐标（如 `sdv-dev warp IslandSouth 20 35`）
-  screenshot                  实机截图：`--mode screen` 截取实时画面（光影/UI/粒子），`--mode map` 全图高清截图
+  warp                        主线程同步瞬移玩家至指定地点与坐标（如 `sdv-dev warp IslandSouth 20 35`）
   eval                        在 SMAPI 主线程动态执行 C# 代码（默认内置 Publicizer 免反射直访私有成员、支持 `--stdin` 与 `--screen`）
   cmd / player / ui / ui-click / logs / menu / stop
-  daemon-status / daemon-stop 查看或关闭 10 分钟空闲自退的热驻加速守护进程");
+  daemon-status / daemon-stop 查看或关闭 10 分钟空闲自退的热驻加速守护进程（重编后自动指纹校验淘汰旧进程）");
         }
 
         private static void PrintTopicHelp(string topic)
@@ -1970,8 +2198,10 @@ OPTIONS:
    sdv-dev tilesheet Maps/island_tilesheet_1 --grid --out sheet_grid.png
    sdv-dev map-inspect IslandSouth --rect 14,32,8,6
 
-2. 免进游戏 1 秒离线渲染 `.tmx`（支持四季切换与碰撞/水面/传送调试叠加层）：
+2. 免进游戏 1 秒离线渲染 `.tmx` 与 Content Patcher `EditMap` 补丁叠加预览：
    sdv-dev map-render assets/CoralBay.tmx --out preview.png --season summer --debug-overlay
+   sdv-dev map-render Maps/Town --cp d:\myProject\MyCpMod --auto-crop --debug-overlay --out town_patch.png
+   - `--cp <ModDir>` 自动解析 `content.json` 中的 `EditMap`（PatchMap / MapTiles / MapProperties / AddWarps）叠到原版底图；加 `--auto-crop` 自动裁切变更包围盒区域；
    - `--debug-overlay` 图例：红色=不可通行阻挡，蓝色=`Water=T` 水波纹格，绿色=Warp 传送点，黄色=Action/TouchAction，青色=光源。
 
 3. 原版跨层预制件抠取与盖章（自动处理 Back2/Buildings/Front/AlwaysFront、动画帧与属性）：
@@ -1989,25 +2219,19 @@ OPTIONS:
    sdv-dev map-find-space Beach --size 5x4 --near 40,20");
                     break;
 
-                case "screenshot":
                 case "warp":
                 case "reload-assets":
-                    Console.WriteLine(@"# sdv-dev screenshot / warp / reload-assets — 实机视觉验收与秒级热刷
+                    Console.WriteLine(@"# sdv-dev warp / reload-assets — 实机瞬移与资产秒级热刷
 
 用法：
   sdv-dev warp <LocationName> [x] [y] [--facing 0..3]
-  sdv-dev screenshot --mode screen --out <screen.png>
-  sdv-dev screenshot --mode map [--scale 1.0] --out <fullmap.png>
   sdv-dev reload-assets [--project <ModDir>] --assets <Asset1,Asset2> [--no-reload-map]
 
 说明：
-  - `screenshot --mode screen` 在渲染帧末尾直接保存完整画面（含光影、水面波纹、粒子与当前 UI）；
-  - `screenshot --mode map` 调用原版 `takeMapScreenshot` 导出整张当前地图并自动清理默认截图目录临时文件；
-  - `reload-assets` 仅拷贝非 DLL 资产（`.tmx`/`.png`/`.json`），即使 C# 模组 DLL 正被游戏锁定也能 1 秒热刷新当前地图！
+  - `reload-assets` 仅拷贝非 DLL 资产（`.tmx`/`.png`/`.json`/`.mgfxo`），即使 C# 模组 DLL 正被游戏锁定也能 1 秒热刷新当前地图与贴图！
 
 示例：
   sdv-dev warp IslandSouth 20 35
-  sdv-dev screenshot --mode map --out C:\temp\island_map.png
   sdv-dev reload-assets --project d:\myProject\CoralMod --assets Maps/CoralBay");
                     break;
 
@@ -2042,22 +2266,26 @@ OPTIONS:
                 case "player":
                 case "cmd":
                 case "logs":
-                    Console.WriteLine(@"# sdv-dev 实机生命周期、模组隔离 (--isolated) 与无焦点交互详情
+                    Console.WriteLine(@"# sdv-dev 实机生命周期、模组隔离 (--isolated)、同桌面热重启与后台隐藏模式
 
 启动、模组隔离与热迭代：
-  sdv-dev live                                                         查看进程、桥接状态、活跃 modsPath、是否隔离模式与当前坐标
-  sdv-dev start --isolated [--project <dir>] [--with-mods A,B] --test-world
-      使用 SMAPI `--mods-path` 隔离启动：仅加载 `_SdvDevBridge` + 目标模组 + 自动解析的全部传递前置模组（3~4 秒极速进档！）
-  sdv-dev start --test-world [--reset-test-world]
+  sdv-dev live                                                         查看进程、桥接状态、活跃 modsPath、是否隔离/后台模式与当前坐标
+  sdv-dev start --isolated [--project <dir>] [--with-mods A,B] [--background] [--no-focus] --test-world
+      使用 SMAPI `--mods-path` 隔离启动：仅加载 `_SdvDevBridge` + 目标模组 + 自动解析的全部传递前置模组（加 `--background` 则无打扰隐藏窗口运行）
+  sdv-dev start --test-world [--reset-test-world] [--background]
       使用全量 `Mods` 启动并进入专属测试槽位 `SdvDevTest_999999999`（具备真实 CurrentSavePath，完美兼容 SVE / SpaceCore，绝不触碰个人存档）
-  sdv-dev restart --project <dir> [--isolated | --full-mods] --test-world
-      先执行 check+build（失败不关原游戏），通过后自动部署并重进世界
+  sdv-dev restart --project <dir> [--isolated | --full-mods] [--same-desktop | --background] [--no-focus] --test-world
+      先执行 check+build（失败不关原游戏），通过后无锁暂存并在旧进程退出后自动替换 DLL；
+      在 `SdvDevTest_` 测试档可见窗口下（或显式加 `--same-desktop`）自动原位无焦点刷新，加 `--background` 则强制切为无弹窗离屏模式！
   sdv-dev reload --project <cpDir> [--assets A,B]                      免重启热重载 Content Patcher 包
   sdv-dev reload-assets --project <dir> --assets Maps/MyMap            免重启热刷 C#/CP 模组的地图与贴图资产
+  sdv-dev config <ModId> [--get [Key] | --set Key=Val ...] [--no-save] 免重启 0.05 秒实时读写模组配置
 
 游戏内检视、传送、截图与日志：
   sdv-dev warp <Location> [x] [y]                                      瞬移至目标地图坐标
-  sdv-dev screenshot --mode screen|map --out <file.png>                实机画面或全图截图
+  sdv-dev screenshot --mode screen|map [--ui-overlay] --out <file.png> 实机画面或全图截图
+  sdv-dev screenshot --ab-compare <ModId> --out <ab.png>               同机位一键生成「原版关闭 vs 模组开启」左右对比图
+  sdv-dev screenshot --burst [4] [--interval-ticks 15] [--pan-test] --out <grid.png>
   sdv-dev player / sdv-dev ui / sdv-dev ui-click (--id|--match|--response|--close)
   sdv-dev cmd ""patch summary""                                          执行任意 SMAPI / CP / debug 控制台命令
   sdv-dev logs [--level Error|Warn] [--mod <Id>] [-n 40]               读取 SMAPI-latest.txt 日志
@@ -2068,25 +2296,67 @@ OPTIONS:
                     Console.WriteLine(@"# sdv-dev api — 模糊搜索 C# 类、方法（含私有方法）、属性、字段与 SMAPI 事件
 
 用法：
-  sdv-dev api <keywords> [--kind class|method|property|event|field|constructor] [--asm sdv|smapi|gamedata] [-n 15] [--json]
+  sdv-dev api <keywords> [--kind class|method|property|event|field|constructor] [--asm sdv|smapi|gamedata|monogame|xtile|harmony|toolkit] [-n 15] [--json]
 
 示例：
   sdv-dev api ""shop purchase""
-  sdv-dev api ""takeMapScreenshot""
-  sdv-dev api ""asset requested"" --asm smapi --kind event");
+  sdv-dev api ""RenderTarget2D"" --asm monogame
+  sdv-dev api ""XnaDisplayDevice"" --asm xtile
+  sdv-dev api ""SModHooks"" --asm smapi");
                     break;
 
                 case "decompile":
                 case "dec":
-                    Console.WriteLine(@"# sdv-dev decompile — 基于 MetadataToken 直跳的实时 C# 源码反编译
+                    Console.WriteLine(@"# sdv-dev decompile — 覆盖 Stardew / SMAPI / MonoGame / xTile / Harmony 的实时 C# 反编译
 
 用法：
-  sdv-dev decompile <Type | Type.Member> [--lines 200] [--full] [-g <gamePath>]
+  sdv-dev decompile <Type | Type.Member> [--lines 200] [--full] [--grep <pattern> [-C 15]] [-g <gamePath>]
 
 示例：
   sdv-dev decompile StardewValley.Locations.Beach.resetLocalState
-  sdv-dev decompile ShopMenu.tryToPurchaseItem
-  sdv-dev decompile GameLocation.isTilePassable");
+  sdv-dev decompile Game1.DrawWorld --grep lighting -C 12
+  sdv-dev decompile SModHooks.OnRendered
+  sdv-dev decompile XnaDisplayDevice");
+                    break;
+
+                case "shader":
+                case "shader-compile":
+                case "fx":
+                    Console.WriteLine(@"# sdv-dev shader — 内置免安装 HLSL (.fx) -> MonoGame DesktopGL (.mgfxo) 编译器
+
+用法：
+  sdv-dev shader <file.fx | modProjectDir> [--out <file.mgfxo>] [--defines A=1;B=2] [--profile OpenGL|DirectX_11] [--debug]
+
+说明：
+  - 内嵌与星露谷 1.6 (MonoGame 3.8.0.1641) 字节码版本严格对齐的 `mgfxc` + `MojoShader` (MGFX v9 OpenGL)；
+  - `sdv-dev build` 会自动把模组工程内全部 `*.fx` 编译为同名 `.mgfxo`，`sdv-dev check` 也会在编译前静态预检 HLSL 语法。");
+                    break;
+
+                case "config":
+                case "mod-config":
+                    Console.WriteLine(@"# sdv-dev config — 免重启 0.05 秒实时读取/修改/重置模组配置（兼容 C# SMAPI 模组与 CP 包）
+
+用法：
+  sdv-dev config <ModUniqueID> [--get [Key]]
+  sdv-dev config <ModUniqueID> --set Key1=Val1 [Key2=Val2 ...] [--no-save]
+  sdv-dev config <ModUniqueID> --reset [--no-save]
+
+示例：
+  sdv-dev config Author.LightingMod --get
+  sdv-dev config Author.LightingMod --set SunsetWarmth=1.4 BloomIntensity=0.85
+  sdv-dev config Author.LightingMod --reset");
+                    break;
+
+                case "screenshot":
+                    Console.WriteLine(@"# sdv-dev screenshot — 实机画面/全图截图、安全缩放、UI 拓扑叠图、A/B 光影对比与动态四宫格连拍
+
+用法：
+  sdv-dev screenshot --mode screen|map [--zoom 0.75] [--ui-overlay] --out <shot.png>
+  sdv-dev screenshot --ab-compare <ModId[:BoolProp]> [--ab-toggle <BoolProp>] [--zoom 0.8] --out <ab_compare.png>
+      同机位同时间自动切换目标模组开关（关闭截左图 -> 开启跑 2 ticks 截右图 -> 恢复原值），合成左右标注对比图！
+  sdv-dev screenshot --burst [4] [--interval-ticks 15 | --interval-ms 250] [--pan <dx,dy> | --pan-test] [--zoom 0.8] --out <burst_grid.png>
+      按固定游戏 Tick 间隔连续抓拍多帧（可选同步平滑平移镜头测残影/视差），自动合成带帧号与 Tick 角标的 2x2 时序四宫格 PNG！
+  - 注：`--zoom <0.35..3.0>` 内部自动调用 `SetWindowSize` 重建 `@Game1.screen` 缓冲，拍完自动还原，绝不产生右侧 UV 撕裂假竖线。");
                     break;
 
                 case "schema":
@@ -2133,21 +2403,24 @@ OPTIONS:
                 case "build":
                 case "pack":
                 case "package":
-                    Console.WriteLine(@"# sdv-dev new / gen-gmcm / check / build / pack — 工程构建、1.6 语义体检、Publicizer 与发布打包
+                    Console.WriteLine(@"# sdv-dev new / gen-gmcm / shader / check / build / pack — 工程与着色器构建、1.6 深度体检与发布打包
 
 用法：
   sdv-dev new <cp|csharp> --name <ModName> [--author <Author>] [--out <ParentDir>]
   sdv-dev gen-gmcm [--project <ModDir>] [--config <ModConfig.cs>]
-      基于 NRefactory/ILSpy AST 解析 `ModConfig.cs` 属性、注释与 `[Range]`，自动生成 `IGenericModConfigMenuApi.cs`、`GmcmIntegration.g.cs` 并增量补齐 `i18n/default.json` 与 `zh.json`！
+      基于 AST 解析 `ModConfig.cs` 属性（含 `SButton`/`KeybindList`）、注释与 `[Range]`，自动生成 `IGenericModConfigMenuApi.cs`、`GmcmIntegration.g.cs` 并增量补齐 `i18n/default.json` 与 `zh.json`！
+  sdv-dev shader <file.fx | ModDir> [--out <file.mgfxo>] [--defines A=1;B=2] [--profile OpenGL|DirectX_11]
+      内置免装 `mgfxc 3.8.0.1641` + `MojoShader` 将 `.fx` 编译为星露谷 1.6 DesktopGL 对齐的 `.mgfxo` 字节码（兼容中文路径与子目录 `#include`）。
   sdv-dev check [--project <ModDir>] [--json]
       执行 1.6 深度静态校验：
-      - Content Patcher: `GameData` 强类型字段与 JSON 类型对账、`GameStateQuery`/`TriggerAction`/`Event` 脚本语法、`EditImage`/`SpriteIndex` 像素越界、`i18n` 双向漏译对账；
-      - C# SMAPI: `[HarmonyPatch]` 目标方法存在性/重载歧义(`AmbiguousMatchException`)/注入参数(`__instance`/`__result`/`___field`/同名参数)静态核验 + 分屏/联机可变 `static` 隐患扫描；
+      - Content Patcher: `GameData` 强类型字段与 JSON 类型对账（含 `List<T>` 表与食谱斜杠表）、跨表物品/信件/Buff/任务 ID 外键断链与 `(O)`/`(BC)` 前缀核验、`GSQ`/`TriggerAction`/`Event` 语法及 XACT 音效拼写、NPC 日程/对话控制符/肖像 `64x64` 帧越界、`EditImage`/`SpriteIndex` 越界、`i18n` 双向漏译对账；
+      - 着色器: 静态预编译校验全部 `*.fx` 的 HLSL 语法、OpenGL `ps_3_0`/`vs_3_0` 兼容性及漏编 `.mgfxo` 提醒；
+      - C# SMAPI & MonoGame: `[HarmonyPatch]` 目标存在性/重载歧义/返回值与注入参数(`__instance`/`__result`/`___field`)静态验签、`Display.Rendered*` 内重复 `SpriteBatch.Begin` 崩溃、每帧无缓存 `new Texture2D/RenderTarget2D` 显存泄漏、离屏 `SetRenderTarget` 未还原、非预乘 `new Color(r,g,b,a)` 泛白及分屏静态变量隐患；
       - 地图: 全部 `.tmx` 尺寸、GID、Warp 与 BFS 孤岛检测。
   sdv-dev build [--project <ModDir>] [--deploy] [--mods-path <Dir>] [--no-publicize]
-      免装 .NET SDK 秒编 .NET 6.0 C# 模组；默认启用 `BepInEx.AssemblyPublicizer` + `IgnoresAccessChecksTo`（无需反射直接访问原版私有字段与方法，且完美兼容 `protected override`）并在编译后自动校验 Harmony 补丁签名。
+      免装 .NET SDK 秒编 .NET 6.0 C# 模组并自动将工程内全部 `*.fx` 编译为 `.mgfxo`；默认启用 `BepInEx.AssemblyPublicizer` + `IgnoresAccessChecksTo`（兼容 `.csproj` 的 `ImplicitUsings`/`DefineConstants`/`Compile Remove`）并在编译后自动校验 Harmony 补丁签名。
   sdv-dev pack [--project <ModDir>] [--out <Release.zip>] [--skip-check]
-      编译 + 全量静态校验通过后，生成顶层带 `<ModName>/manifest.json`、剔除全部源码/PDB/临时配置的标准发布压缩包并输出 SHA256。");
+      编译 + 全量静态校验通过后，生成顶层带 `<ModName>/manifest.json`、剔除全部源码/`.fx`/PDB/临时配置的标准发布压缩包并输出 SHA256。");
                     break;
 
                 case "sprite":
@@ -2224,8 +2497,8 @@ OPTIONS:
    '@ | sdv-dev event-play Town --stdin                         免改 JSON 实时排演原始 Event 脚本字符串！
    sdv-dev event-play --status | --step | --skip                查看当前执行到第几条指令/演员坐标、单步推进对话或跳过卡死剧情
 
-2. 确定性世界控制与真实跨日管线 (`world`)：
-   sdv-dev world --time 1800 --weather rain                     切换时间与 1.6 LocationWeather 天气（Sun/Rain/Storm/Wind/Snow/GreenRain）
+2. 确定性世界控制、安全视野缩放与真实跨日管线 (`world`)：
+   sdv-dev world --time 1800 --weather rain --zoom 0.80         切换时间、天气与视野缩放（正规重建 Game1.screen 缓冲防 UV 接缝！）
    sdv-dev world --season fall --day 15 --money 50000 --refill
    sdv-dev world --friendship Abigail:1000 --add-item (O)74:5:4 --mail MyMod_Letter
    sdv-dev world --advance-days 3 [--save]                      驱动真实的 `Game1.NewDay` 跨夜结算管线（触发作物生长/机器产出/信件投递/SMAPI DayStarted）
@@ -2264,20 +2537,20 @@ OPTIONS:
 
         private static readonly HashSet<string> GlobalKnownOptions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
-            "--action", "--add-item", "--advance-days", "--asm", "--asset", "--assets", "--at", "--author", "--auto-crop",
-            "--button", "--cat", "--cell", "--clear", "--close", "--code-b64", "--cold", "--config", "--cp", "--cp-trace", "--crop",
-            "--day", "--days", "--db", "--debug-overlay", "--debug", "--deploy", "--docs-only", "--docs-out", "--drop-in", "--dropin",
-            "--entry", "--export", "--facing-up", "--facing", "--file", "--force", "--friendship", "--full-mods", "--full",
-            "--game-path", "--github", "--give", "--grid", "--help", "--id", "--il", "--include-back", "--instructions", "--isolated",
-            "--json", "--keep-seen", "--key", "--kind", "--layer", "--level", "--limit", "--lines", "--list-assets", "--list",
+            "--ab", "--ab-compare", "--ab-toggle", "--action", "--add-item", "--advance-days", "--asm", "--asset", "--assets", "--at", "--author", "--auto-crop",
+            "--background", "--burst", "--button", "--cat", "--cell", "--clear", "--close", "--code-b64", "--cold", "--config", "--context", "--cp", "--cp-trace", "--crop",
+            "--day", "--days", "--db", "--debug-overlay", "--debug", "--defines", "--deploy", "--docs-only", "--docs-out", "--drop-in", "--dropin",
+            "--entry", "--export", "--facing-up", "--facing", "--file", "--focus", "--force", "--friendship", "--full-mods", "--full",
+            "--game-path", "--get", "--github", "--give", "--grep", "--grid", "--headless", "--help", "--id", "--il", "--include-back", "--instructions", "--interval-ms", "--interval-ticks", "--isolated",
+            "--json", "--keep-seen", "--keep-window", "--key", "--kind", "--layer", "--level", "--limit", "--lines", "--list-assets", "--list",
             "--mail", "--match", "--min-version", "--mod", "--mode", "--mods-path", "--money", "--name", "--near", "--new-test-save",
-            "--no-back", "--no-bbox", "--no-move", "--no-publicize", "--no-ref", "--no-reload-map", "--off", "--offline", "--optional",
-            "--out", "--place", "--power", "--prefab", "--preset", "--project", "--rect", "--refill", "--reload-map",
-            "--reset-test-world", "--response", "--right-click", "--save", "--scale", "--screen", "--script-b64", "--script",
-            "--season", "--seconds", "--show-paths", "--size", "--skip-check", "--skip", "--spec", "--status", "--stdin", "--step",
+            "--no-back", "--no-bbox", "--no-focus", "--no-move", "--no-publicize", "--no-ref", "--no-reload-map", "--no-save", "--no-window", "--off", "--offline", "--optional",
+            "--out", "--pan", "--pan-test", "--place", "--power", "--prefab", "--preset", "--profile", "--project", "--rect", "--refill", "--reload-map",
+            "--reset", "--reset-test-world", "--response", "--right-click", "--same-desktop", "--save", "--scale", "--screen", "--script-b64", "--script", "--search",
+            "--season", "--seconds", "--set", "--show-paths", "--size", "--skip-check", "--skip", "--spec", "--status", "--stdin", "--step",
             "--tail", "--target", "--test-world", "--theme", "--tile-size", "--time", "--timeout", "--tool", "--top", "--trace",
-            "--ui", "--ui-overlay", "--unpack", "--use-tool", "--weather", "--with-mods", "--xy", "--year", "--zoom",
-            "-a", "-c", "-d", "-e", "-f", "-g", "-h", "-k", "-l", "-m", "-n", "-o", "-p", "-r", "-s", "-t", "-w", "-y", "-z", "-"
+            "--ui", "--ui-overlay", "--unpack", "--use-tool", "--visible", "--weather", "--with-mods", "--xy", "--year", "--zoom",
+            "-a", "-c", "-C", "-d", "-e", "-f", "-g", "-h", "-k", "-l", "-m", "-n", "-o", "-p", "-r", "-s", "-t", "-w", "-y", "-z", "-"
         };
 
         private static void ValidateNoUnknownGlobalFlags(string cmd, string[] args)

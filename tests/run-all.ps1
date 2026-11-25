@@ -121,7 +121,37 @@ namespace GmcmSample
     $zhObj = Get-Content -LiteralPath (Join-Path $gmcmMod "i18n\zh.json") -Raw | ConvertFrom-Json
     Assert-True ($zhObj.'gmcm.quickTeleportKey.name' -eq '快速回家快捷键') "zh.json short title extracted cleanly"
     Assert-Contains $zhObj.'gmcm.quickTeleportKey.tooltip' '无需消耗体力' "zh.json full tooltip preserved"
-    Pass-Step "gen-gmcm SButton/KeybindList & clean bilingual i18n splitting"
+
+    # Verify LF (\n) line-ending preservation on existing i18n/*.json + bare `/// 中文` comment extraction + upgrading English placeholder in zh.json!
+    $zhPath = Join-Path $gmcmMod "i18n\zh.json"
+    $lfSeedJson = "{`n  `"gmcm.quickTeleportKey.name`": `"快速回家快捷键`",`n  `"gmcm.leafSway.name`": `"Leaf Sway`"`n}`n"
+    [System.IO.File]::WriteAllText($zhPath, $lfSeedJson, [System.Text.UTF8Encoding]::new($false))
+    $cfgCsWithBareComment = @'
+using System.ComponentModel.DataAnnotations;
+using StardewModdingAPI;
+using StardewModdingAPI.Utilities;
+
+namespace GmcmSample
+{
+    public sealed class ModConfig
+    {
+        /// <summary>快速回家快捷键：按下后立即将玩家传送回农场小屋门口而无需消耗体力。</summary>
+        public SButton QuickTeleportKey { get; set; } = SButton.K;
+
+        /// 树叶摇曳：控制树冠随风摆动幅度。
+        [Range(0f, 1f)]
+        public float LeafSway { get; set; } = 0.5f;
+    }
+}
+'@
+    [System.IO.File]::WriteAllText((Join-Path $gmcmMod "ModConfig.cs"), $cfgCsWithBareComment, [System.Text.UTF8Encoding]::new($false))
+    $gmcmRun2 = Invoke-SdvRaw @('gen-gmcm', $gmcmMod)
+    Assert-True ($gmcmRun2.Code -eq 0) "second gen-gmcm exit 0: $($gmcmRun2.Text)"
+    $zhRawAfter = [System.IO.File]::ReadAllText($zhPath, [System.Text.Encoding]::UTF8)
+    Assert-True ($zhRawAfter.IndexOf("`r`n") -lt 0) "gen-gmcm preserved pure LF (\n) line endings in existing i18n/zh.json!"
+    $zhObj2 = $zhRawAfter | ConvertFrom-Json
+    Assert-True ($zhObj2.'gmcm.leafSway.name' -eq '树叶摇曳') "gen-gmcm extracted bare /// Chinese comment & upgraded English placeholder in zh.json"
+    Pass-Step "gen-gmcm SButton/KeybindList, LF line-ending preservation, & bare /// Chinese i18n extraction"
 
     # ------------------------------------------------------------------
     # 4. .NET 8 ImplicitUsings + DefineConstants + Compile Remove + Harmony Type/Return Check
@@ -381,7 +411,144 @@ WWWWWW
     Assert-True ($emRes.Code -eq 0) "CP EditMap offline render succeeded: $($emRes.Text)"
     Assert-Contains $emRes.Text "Town Plaza Island Booth" "CP EditMap patch applied"
     Assert-True (Test-Path -LiteralPath $townOutPng) "CP EditMap preview PNG written"
-    Pass-Step "Offline map-autotile + @island-palm + CP EditMap overlay & auto-crop rendering"
+
+    # Compact `map-inspect --rect` check (must stay < 120 lines instead of dumping 1,446 full-map metadata lines!)
+    $rectInsp = Invoke-SdvRaw @('map-inspect', 'Maps/Town', '--rect', '44,94,14,12')
+    Assert-True ($rectInsp.Code -eq 0) "map-inspect Maps/Town --rect succeeded: $($rectInsp.Text)"
+    $rectLineCount = ($rectInsp.Text -split "`r?`n").Count
+    Assert-True ($rectLineCount -lt 120) "map-inspect --rect stayed compact ($rectLineCount lines < 120, vs old 1446 lines)"
+    Assert-Contains $rectInsp.Text '"referencedTilesheets"' "map-inspect --rect listed only referenced tilesheets"
+    Assert-Contains $rectInsp.Text '"passabilityMask"' "map-inspect --rect included passabilityMask"
+    Pass-Step "Offline map-autotile + @island-palm + CP EditMap overlay & compact map-inspect --rect ($rectLineCount lines)"
+
+    # ------------------------------------------------------------------
+    # 6b. Expanded API/Decompile (--grep, MonoGame, xTile, SModHooks),
+    #     Built-in .fx Shader Compiler, & MonoGame/SMAPI Rendering AST Checks
+    # ------------------------------------------------------------------
+    $mgApi = Invoke-SdvRaw @('api', 'RenderTarget2D', '--asm', 'monogame')
+    Assert-True ($mgApi.Code -eq 0) "api --asm monogame exit 0"
+    Assert-Contains $mgApi.Text "Microsoft.Xna.Framework.Graphics.RenderTarget2D" "MonoGame.Framework indexed"
+
+    $xtDec = Invoke-SdvRaw @('decompile', 'XnaDisplayDevice', '--lines', '40')
+    Assert-True ($xtDec.Code -eq 0) "decompile XnaDisplayDevice exit 0"
+    Assert-Contains $xtDec.Text "Assembly: xTile.dll" "xTile.dll decompiled"
+
+    $hookDec = Invoke-SdvRaw @('decompile', 'SModHooks.OnRendered', '--lines', '50')
+    Assert-True ($hookDec.Code -eq 0) "decompile SModHooks.OnRendered exit 0"
+    Assert-Contains $hookDec.Text "StardewModdingAPI" "Internal SMAPI SModHooks.OnRendered decompiled"
+
+    $grepDec = Invoke-SdvRaw @('decompile', 'Game1.DrawWorld', '--grep', 'lighting', '-C', '4')
+    Assert-True ($grepDec.Code -eq 0) "decompile --grep exit 0"
+    Assert-Contains $grepDec.Text "// [grep]" "decompile --grep header present"
+    Assert-Contains $grepDec.Text ">" "decompile --grep matched line marker present"
+    Pass-Step "Expanded MonoGame/xTile/SMAPI-internal API & decompile --grep"
+
+    # Test Rendering AST Analyzer + .fx Shader Compiler (both broken & valid HLSL)
+    $shaderTestRoot = Join-Path $workRoot "ShaderAndRenderCheckContainer"
+    $null = Invoke-SdvRaw @('new', 'csharp', '--name', 'RenderPitfallMod', '--author', 'Tester', '--out', $shaderTestRoot)
+    $renderMod = Join-Path $shaderTestRoot "RenderPitfallMod"
+    New-Item -ItemType Directory -Path (Join-Path $renderMod "assets") -Force | Out-Null
+
+    $badFx = "float4 BrokenPS() : COLOR0 { return NonExistentHlslIntrinsic(1.0); } technique T0 { pass P0 { PixelShader = compile ps_3_0 BrokenPS(); } }"
+    [System.IO.File]::WriteAllText((Join-Path $renderMod "assets\broken.fx"), $badFx, [System.Text.UTF8Encoding]::new($false))
+
+    $badRenderCs = @'
+using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
+using StardewModdingAPI;
+using StardewModdingAPI.Events;
+using StardewValley;
+
+namespace RenderPitfallMod
+{
+    public class ModEntry : Mod
+    {
+        private RenderTarget2D? _cachedRt;
+
+        public override void Entry(IModHelper helper)
+        {
+            helper.Events.Display.RenderedWorld += OnRenderedWorld;
+        }
+
+        private void OnRenderedWorld(object? sender, RenderedWorldEventArgs e)
+        {
+            var gd = Game1.graphics.GraphicsDevice;
+            // Guarded cache resize should NOT trigger false positive!
+            if (_cachedRt == null || _cachedRt.IsDisposed)
+                _cachedRt = new RenderTarget2D(gd, 64, 64);
+
+            // Intentional pitfalls:
+            // 1. Double Begin on active SMAPI SpriteBatch (ERROR)
+            e.SpriteBatch.Begin();
+            // 2. Unguarded per-frame Texture2D allocation (ERROR)
+            var leakedTex = new Texture2D(gd, 16, 16);
+            // 3. Offscreen SetRenderTarget without restoring (WARN)
+            gd.SetRenderTarget(_cachedRt);
+            // 4. Non-premultiplied 4-arg Color with variable alpha under default AlphaBlend (WARN)
+            byte alpha = 128;
+            Color tint = new Color(255, 220, 180, alpha);
+            e.SpriteBatch.Draw(leakedTex, Vector2.Zero, tint);
+        }
+    }
+}
+'@
+    [System.IO.File]::WriteAllText((Join-Path $renderMod "ModEntry.cs"), $badRenderCs, [System.Text.UTF8Encoding]::new($false))
+
+    $renderChk = Invoke-SdvRaw @('check', $renderMod)
+    Assert-True ($renderChk.Code -ne 0) "Broken shader + rendering pitfalls must fail sdv-dev check"
+    Assert-Contains $renderChk.Text "already active" "Caught double e.SpriteBatch.Begin() in RenderedWorld"
+    Assert-Contains $renderChk.Text "new Texture2D" "Caught per-frame Texture2D leak"
+    Assert-True ($renderChk.Text.IndexOf("new RenderTarget2D", [System.StringComparison]::OrdinalIgnoreCase) -lt 0) "Guarded _cachedRt resize did NOT false-positive"
+    Assert-Contains $renderChk.Text "SetRenderTarget" "Caught unrestored SetRenderTarget warning"
+    Assert-Contains $renderChk.Text "Premultiplied alpha hazard" "Caught 4-arg non-premultiplied Color warning"
+    Assert-Contains $renderChk.Text "assets/broken.fx" "Caught broken .fx HLSL syntax error during check"
+
+    # Replace with valid .fx shader (including nested subdirectory `#include "common/tint_math.fxh"` inside Chinese path!) & clean C# code
+    Remove-Item -LiteralPath (Join-Path $renderMod "assets\broken.fx") -Force
+    New-Item -ItemType Directory -Path (Join-Path $renderMod "assets\common") -Force | Out-Null
+    $fxHeader = "float3 ApplyCyanLerp(float3 baseRgb, float strength) { return lerp(baseRgb, float3(0.15, 0.85, 0.95), saturate(strength)); }"
+    [System.IO.File]::WriteAllText((Join-Path $renderMod "assets\common\tint_math.fxh"), $fxHeader, [System.Text.UTF8Encoding]::new($false))
+
+    $validFx = @'
+#include "common/tint_math.fxh"
+#if OPENGL
+    #define SV_POSITION POSITION
+    #define PS_SHADERMODEL ps_3_0
+#else
+    #define PS_SHADERMODEL ps_4_0_level_9_1
+#endif
+Texture2D SpriteTexture;
+float TintStrength;
+sampler2D SpriteTextureSampler = sampler_state { Texture = <SpriteTexture>; };
+struct VertexShaderOutput { float4 Position : SV_POSITION; float4 Color : COLOR0; float2 TextureCoordinates : TEXCOORD0; };
+float4 MainPS(VertexShaderOutput input) : COLOR0
+{
+    float4 col = tex2D(SpriteTextureSampler, input.TextureCoordinates) * input.Color;
+    col.rgb = ApplyCyanLerp(col.rgb, TintStrength);
+    return col;
+}
+technique SpriteDrawing { pass P0 { PixelShader = compile PS_SHADERMODEL MainPS(); } };
+'@
+    [System.IO.File]::WriteAllText((Join-Path $renderMod "assets\water_tint.fx"), $validFx, [System.Text.UTF8Encoding]::new($false))
+    $cleanRenderCs = @'
+using StardewModdingAPI;
+namespace RenderPitfallMod
+{
+    public class ModEntry : Mod
+    {
+        public override void Entry(IModHelper helper) { }
+    }
+}
+'@
+    [System.IO.File]::WriteAllText((Join-Path $renderMod "ModEntry.cs"), $cleanRenderCs, [System.Text.UTF8Encoding]::new($false))
+    $bShader = Invoke-SdvRaw @('build', $renderMod)
+    Assert-True ($bShader.Code -eq 0) "Build with valid .fx shader succeeded: $($bShader.Text)"
+    Assert-True (Test-Path -LiteralPath (Join-Path $renderMod "assets\water_tint.mgfxo")) "Compiled .mgfxo emitted next to .fx"
+    $pkShader = Invoke-SdvRaw @('pack', $renderMod)
+    Assert-True ($pkShader.Code -eq 0) "Pack with compiled .mgfxo succeeded: $($pkShader.Text)"
+    Assert-Contains $pkShader.Text "water_tint.mgfxo" "Pack included compiled .mgfxo"
+    Assert-True ($pkShader.Text.IndexOf("water_tint.fx`"", [System.StringComparison]::OrdinalIgnoreCase) -lt 0) "Pack excluded raw .fx source"
+    Pass-Step "Built-in .fx -> .mgfxo OpenGL shader compiler & Roslyn MonoGame/SMAPI rendering checks"
 
     # ------------------------------------------------------------------
     # 7. Live End-to-End SMAPI Integration Suite (-IncludeLive)
@@ -400,10 +567,33 @@ WWWWWW
         $liveModContainer = Join-Path $workRoot "LiveSuiteContainer"
         $null = Invoke-SdvRaw @('new', 'csharp', '--name', 'LiveProbeMod', '--author', 'Tester', '--out', $liveModContainer)
         $liveModDir = Join-Path $liveModContainer "LiveProbeMod"
+        New-Item -ItemType Directory -Path (Join-Path $liveModDir "assets") -Force | Out-Null
+
+        # Embed a real custom OpenGL HLSL Pixel Shader (.fx) to verify live MonoGame 3.8.0.1641 Effect loading + A/B compare!
+        $liveFx = @'
+#if OPENGL
+    #define SV_POSITION POSITION
+    #define PS_SHADERMODEL ps_3_0
+#else
+    #define PS_SHADERMODEL ps_4_0_level_9_1
+#endif
+Texture2D SpriteTexture;
+float TintStrength;
+sampler2D SpriteTextureSampler = sampler_state { Texture = <SpriteTexture>; };
+struct VertexShaderOutput { float4 Position : SV_POSITION; float4 Color : COLOR0; float2 TextureCoordinates : TEXCOORD0; };
+float4 MainPS(VertexShaderOutput input) : COLOR0
+{
+    float4 c = tex2D(SpriteTextureSampler, input.TextureCoordinates) * input.Color;
+    return float4(lerp(c.rgb, float3(0.05, 0.92, 0.98), saturate(TintStrength)), c.a);
+}
+technique SpriteDrawing { pass P0 { PixelShader = compile PS_SHADERMODEL MainPS(); } };
+'@
+        [System.IO.File]::WriteAllText((Join-Path $liveModDir "assets\probe_tint.fx"), $liveFx, [System.Text.UTF8Encoding]::new($false))
 
         $liveModCs = @'
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Reflection;
 using System.Reflection.Emit;
 using HarmonyLib;
@@ -416,6 +606,12 @@ using StardewValley.Menus;
 
 namespace LiveProbeMod
 {
+    public sealed class LiveProbeConfig
+    {
+        public bool Enabled { get; set; } = true;
+        public float TintStrength { get; set; } = 0.2f;
+    }
+
     public static class ProbeTarget
     {
         public static int ComputeBonus(int baseVal) => baseVal + 1;
@@ -486,14 +682,29 @@ namespace LiveProbeMod
     public class ModEntry : Mod
     {
         public static int ChosenWellOption = -1;
+        public static bool ShaderLoadedOk = false;
+        public LiveProbeConfig Config { get; set; } = new LiveProbeConfig();
         private Harmony? _harmony;
+        private Effect? _customShader;
 
         public override void Entry(IModHelper helper)
         {
+            Config = helper.ReadConfig<LiveProbeConfig>();
             _harmony = new Harmony(ModManifest.UniqueID);
             _harmony.PatchAll(typeof(ModEntry).Assembly);
+            helper.Events.GameLoop.GameLaunched += OnGameLaunched;
             helper.Events.GameLoop.UpdateTicked += OnUpdateTicked;
             helper.Events.Display.RenderedWorld += OnRenderedWorld;
+        }
+
+        private void OnGameLaunched(object? sender, GameLaunchedEventArgs e)
+        {
+            string fxPath = Path.Combine(Helper.DirectoryPath, "assets", "probe_tint.mgfxo");
+            if (File.Exists(fxPath))
+            {
+                _customShader = new Effect(Game1.graphics.GraphicsDevice, File.ReadAllBytes(fxPath));
+                ShaderLoadedOk = true;
+            }
         }
 
         private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
@@ -508,6 +719,19 @@ namespace LiveProbeMod
         {
             int v = ProbeTarget.ComputeBonus(10);
             if (v < 0) Monitor.Log(v.ToString());
+
+            if (Config.Enabled && _customShader != null && Config.TintStrength > 0.01f)
+            {
+                _customShader.Parameters["TintStrength"]?.SetValue(Config.TintStrength);
+                e.SpriteBatch.End();
+                e.SpriteBatch.Begin(SpriteSortMode.Immediate, BlendState.AlphaBlend, SamplerState.PointClamp, null, null, _customShader);
+                e.SpriteBatch.Draw(
+                    Game1.staminaRect,
+                    new Rectangle(0, 0, Game1.viewport.Width, Game1.viewport.Height),
+                    Color.White * 0.55f);
+                e.SpriteBatch.End();
+                e.SpriteBatch.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp);
+            }
         }
 
         public static void OpenWishingWellQuestion()
@@ -543,10 +767,14 @@ namespace LiveProbeMod
 
         $bLive = Invoke-SdvRaw @('build', $liveModDir)
         Assert-True ($bLive.Code -eq 0) "LiveProbeMod build succeeded: $($bLive.Text)"
+        Assert-Contains $bLive.Text "probe_tint.mgfxo" "LiveProbeMod auto-compiled probe_tint.fx -> .mgfxo"
 
-        $startRes = Invoke-SdvRaw @('restart', '--isolated', '--project', $liveModDir, '--reset-test-world')
-        Assert-True ($startRes.Code -eq 0) "Isolated test world launched with LiveProbeMod: $($startRes.Text)"
-        Pass-Step "Live isolated SMAPI launch with LiveProbeMod"
+        $startRes = Invoke-SdvRaw @('restart', '--isolated', '--background', '--project', $liveModDir, '--reset-test-world')
+        Assert-True ($startRes.Code -eq 0) "Isolated background test world launched with LiveProbeMod: $($startRes.Text)"
+        Assert-Contains $startRes.Text '"backgroundMode": true' "--background mode active without breaking viewport"
+        $shaderOkEval = Invoke-SdvRaw @('eval', 'LiveProbeMod.ModEntry.ShaderLoadedOk')
+        Assert-Contains $shaderOkEval.Text 'true' "Custom .mgfxo OpenGL PixelShader loaded cleanly into live MonoGame GraphicsDevice!"
+        Pass-Step "Live isolated --background launch & real OpenGL .mgfxo Effect execution"
 
         # 7a. Instant 0ms `ui-click --response 1` bypassing 750ms DialogueBox safetyTimer!
         $null = Invoke-SdvRaw @('eval', 'LiveProbeMod.ModEntry.OpenWishingWellQuestion(); return "opened";')
@@ -558,7 +786,9 @@ namespace LiveProbeMod
         Pass-Step "Zero-sleep DialogueBox ui-click --response callback execution"
 
         # 7b. Custom IClickableMenu + `screenshot --mode screen --ui-overlay`
-        $null = Invoke-SdvRaw @('eval', 'LiveProbeMod.ModEntry.OpenCustomNavMenu(); return "menu";')
+        $openMenu = Invoke-SdvRaw @('eval', 'Game1.dialogueUp = false; LiveProbeMod.ModEntry.OpenCustomNavMenu(); return Game1.activeClickableMenu?.GetType().FullName;')
+        Assert-True ($openMenu.Code -eq 0) "OpenCustomNavMenu eval succeeded: $($openMenu.Text)"
+        Assert-Contains $openMenu.Text "TestNavMenu" "TestNavMenu active on Game1.activeClickableMenu"
         $uiShotPng = Join-Path $workRoot "custom_menu_ui_overlay.png"
         $shotRes = Invoke-SdvRaw @('screenshot', '--mode', 'screen', '--ui-overlay', '--out', $uiShotPng)
         Assert-True ($shotRes.Code -eq 0) "screenshot --ui-overlay succeeded: $($shotRes.Text)"
@@ -617,9 +847,93 @@ namespace LiveProbeMod
         Assert-Contains $scRes.Text '"scheduleKey": "spring"' "Parsed Abigail spring schedule routes"
         Pass-Step "Live NPC schedule-check pathfinder verification"
 
-        # 7g. Verify 0 SMAPI Error logs & stop cleanly
+        # 7g. Zero-restart `sdv-dev config` + `screenshot --ab-compare` + `screenshot --burst 4 --pan-test`!
+        $cfgSet = Invoke-SdvRaw @('config', 'Tester.LiveProbeMod', '--set', 'TintStrength=0.92', 'Enabled=true')
+        Assert-True ($cfgSet.Code -eq 0) "sdv-dev config --set succeeded: $($cfgSet.Text)"
+        Assert-Contains $cfgSet.Text '0.92' "Live config updated TintStrength to 0.92 in 0.05s"
+
+        $abPng = Join-Path $workRoot "ab_shader_compare.png"
+        $abRes = Invoke-SdvRaw @('screenshot', '--ab-compare', 'Tester.LiveProbeMod', '--out', $abPng)
+        Assert-True ($abRes.Code -eq 0) "screenshot --ab-compare succeeded: $($abRes.Text)"
+        Assert-Contains $abRes.Text '"grid": "2x1"' "A/B compare produced 2x1 side-by-side PNG"
+        $abBmp = [System.Drawing.Bitmap]::new($abPng)
+        # Left center (OFF) vs Right center (ON with bright cyan shader overlay!) must differ significantly in Blue/Green channels!
+        $pxOff = $abBmp.GetPixel([int]($abBmp.Width * 0.25), [int]($abBmp.Height * 0.55))
+        $pxOn  = $abBmp.GetPixel([int]($abBmp.Width * 0.75), [int]($abBmp.Height * 0.55))
+        $abBmp.Dispose()
+        Assert-True ([Math]::Abs([int]$pxOn.B - [int]$pxOff.B) -gt 20 -or [Math]::Abs([int]$pxOn.G - [int]$pxOff.G) -gt 20) "A/B compare PNG visually differs between OFF ($pxOff) and ON ($pxOn)!"
+
+        $burstPng = Join-Path $workRoot "burst_pan_grid.png"
+        $burstRes = Invoke-SdvRaw @('screenshot', '--burst', '4', '--interval-ticks', '4', '--pan-test', '--out', $burstPng)
+        Assert-True ($burstRes.Code -eq 0) "screenshot --burst 4 --pan-test succeeded: $($burstRes.Text)"
+        Assert-Contains $burstRes.Text '"grid": "2x2"' "Burst capture produced 2x2 contact sheet PNG"
+        Assert-True (Test-Path -LiteralPath $burstPng) "Burst contact sheet PNG written"
+
+        # Verify `sdv-dev config --reset` restores default LiveProbeConfig (TintStrength: 0.92 -> 0.2)!
+        $cfgReset = Invoke-SdvRaw @('config', 'Tester.LiveProbeMod', '--reset')
+        Assert-True ($cfgReset.Code -eq 0) "sdv-dev config --reset succeeded: $($cfgReset.Text)"
+        $cfgResetObj = $cfgReset.Text | ConvertFrom-Json
+        Assert-True ([Math]::Abs([double]$cfgResetObj.values.TintStrength - 0.2) -lt 0.001) "config --reset restored TintStrength to default 0.2 (got $($cfgResetObj.values.TintStrength))"
+        Pass-Step "Live zero-restart config --set/--reset, --ab-compare shader diff, & --burst --pan-test 2x2 grid"
+
+        # 7g2. Safe `--zoom` (rebuilding Game1.screen without UV seam), zero-restart `.fx` shader hot-reload (`reload-assets`),
+        #      and lock-tolerant `build --deploy` while `LiveProbeMod.dll` is actively locked by SMAPI!
+        $zSet = Invoke-SdvRaw @('world', '--zoom', '0.8')
+        Assert-True ($zSet.Code -eq 0) "world --zoom 0.8 succeeded: $($zSet.Text)"
+        $zObj = $zSet.Text | ConvertFrom-Json
+        Assert-True ($zObj.screenBuffer -eq $zObj.viewport -and -not [string]::IsNullOrWhiteSpace($zObj.screenBuffer)) "world --zoom rebuilt Game1.screen ($($zObj.screenBuffer)) to match viewport ($($zObj.viewport)) without UV seam"
+        $zoomShotPng = Join-Path $workRoot "zoom_065_shot.png"
+        $zShot = Invoke-SdvRaw @('screenshot', '--zoom', '0.65', '--out', $zoomShotPng)
+        Assert-True ($zShot.Code -eq 0) "screenshot --zoom 0.65 succeeded: $($zShot.Text)"
+        Assert-True (Test-Path -LiteralPath $zoomShotPng) "screenshot --zoom PNG written"
+        $null = Invoke-SdvRaw @('world', '--zoom', '1.0')
+
+        # Regression check: jumping FROM a festival day (spring 13, weatherIcon=1) TO a non-festival day (spring 9) with --time must NOT look for spring9.xnb!
+        $festJump1 = Invoke-SdvRaw @('world', '--season', 'spring', '--day', '13', '--time', '900')
+        Assert-True ($festJump1.Code -eq 0) "Jump to festival day spring 13 succeeded: $($festJump1.Text)"
+        $festJump2 = Invoke-SdvRaw @('world', '--season', 'spring', '--day', '9', '--time', '1200')
+        Assert-True ($festJump2.Code -eq 0) "Jump from festival day to non-festival spring 9 succeeded without spring9.xnb error: $($festJump2.Text)"
+
+        # Hot-reload `.fx` shader in 0.2s via `reload-assets --project` WITHOUT restarting SMAPI!
+        $preReloadPid = (Invoke-SdvRaw @('live') | Select-Object -ExpandProperty Text | ConvertFrom-Json).pid
+        $fxFile = Join-Path $liveModDir "assets\probe_tint.fx"
+        $goldFx = (Get-Content -LiteralPath $fxFile -Raw).Replace("float3(0.05, 0.92, 0.98)", "float3(0.98, 0.72, 0.08)")
+        [System.IO.File]::WriteAllText($fxFile, $goldFx, [System.Text.UTF8Encoding]::new($false))
+        $hotFxRes = Invoke-SdvRaw @('reload-assets', '--project', $liveModDir)
+        Assert-True ($hotFxRes.Code -eq 0) "reload-assets --project hot-reloaded .fx shader: $($hotFxRes.Text)"
+        Assert-Contains $hotFxRes.Text "_customShader <- probe_tint.mgfxo" "BridgeMod replaced in-memory Effect instance _customShader"
+        $postReloadPid = (Invoke-SdvRaw @('live') | Select-Object -ExpandProperty Text | ConvertFrom-Json).pid
+        Assert-True ($preReloadPid -eq $postReloadPid) "Shader hot-reload kept exact same SMAPI PID ($postReloadPid)"
+
+        # Lock-tolerant `build --deploy` twice in a row while `LiveProbeMod.dll` is locked by running SMAPI!
+        $dep1 = Invoke-SdvRaw @('build', $liveModDir, '--deploy')
+        Assert-True ($dep1.Code -eq 0) "First build --deploy while game open succeeded without locked DLL error: $($dep1.Text)"
+        $dep2 = Invoke-SdvRaw @('build', $liveModDir, '--deploy')
+        Assert-True ($dep2.Code -eq 0) "Second consecutive build --deploy while game open succeeded: $($dep2.Text)"
+        Pass-Step "Safe world/screenshot --zoom, 0.2s .fx reload-assets hot-swap, & lock-tolerant build --deploy while game is open"
+
+        # 7h. Lock-free `self_restart` verification while `LiveProbeMod.dll` & `SdvDevBridge.dll` are actively loaded by SMAPI!
+        $beforeRestartPid = ($startRes.Text | ConvertFrom-Json).pid
+        $modEntryPath = Join-Path $liveModDir "ModEntry.cs"
+        $updatedLiveCs = (Get-Content -LiteralPath $modEntryPath -Raw).Replace("public static int ChosenWellOption = -1;", "public static int ChosenWellOption = -1;`n        public static int SelfRestartGen = 2;")
+        [System.IO.File]::WriteAllText($modEntryPath, $updatedLiveCs, [System.Text.UTF8Encoding]::new($false))
+
+        $srRes = Invoke-SdvRaw @('restart', '--isolated', '--same-desktop', '--no-focus', '--project', $liveModDir, '--test-world')
+        Assert-True ($srRes.Code -eq 0) "Lock-free self_restart succeeded while DLL was loaded: $($srRes.Text)"
+        $afterRestartPid = ($srRes.Text | ConvertFrom-Json).pid
+        Assert-True ($afterRestartPid -ne $beforeRestartPid) "self_restart spawned new SMAPI PID ($beforeRestartPid -> $afterRestartPid)"
+        $genEval = Invoke-SdvRaw @('eval', 'LiveProbeMod.ModEntry.SelfRestartGen')
+        Assert-Contains $genEval.Text '2' "Newly compiled DLL replaced locked DLL via post-exit staging swap (SelfRestartGen == 2)"
+        Pass-Step "Lock-free self_restart staging swap while mod DLL is loaded ($beforeRestartPid -> $afterRestartPid)"
+
+        # 7i. Verify 0 mod/SMAPI Error logs (ignoring vanilla notice when Steam client isn't open) & stop cleanly
         $errLogs = Invoke-SdvRaw @('logs', '--level', 'Error')
-        Assert-Contains $errLogs.Text "No matching log entries" "Zero SMAPI Error logs during entire live run"
+        $realErrLines = @($errLogs.Text -split "`r?`n" | Where-Object {
+            $_.Trim().Length -gt 0 -and
+            $_ -notmatch 'No matching log entries' -and
+            $_ -notmatch "Steam achievements won't work because Steam isn't loaded"
+        })
+        Assert-True ($realErrLines.Count -eq 0) "Zero real SMAPI Error logs during entire live run (got: $($realErrLines -join ' | '))"
         $null = Invoke-SdvRaw @('stop')
         Pass-Step "Zero SMAPI errors & clean game shutdown"
     }

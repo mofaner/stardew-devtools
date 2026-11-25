@@ -106,16 +106,19 @@ namespace SdvKb.Build
             File.WriteAllText(helperPath, BuildGmcmHelperCode(ns, className, props), new UTF8Encoding(false));
             res.RegistrationHelperFile = helperPath;
 
-            // 3. Merge i18n/default.json & i18n/zh.json keys
+            string configSourceText = File.ReadAllText(fullConfigPath);
+            string defaultNewline = configSourceText.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+
+            // 3. Merge i18n/default.json & i18n/zh.json keys (preserving each file's existing LF vs CRLF line endings!)
             string i18nDir = Path.Combine(fullModDir, "i18n");
             Directory.CreateDirectory(i18nDir);
 
             string defaultJson = Path.Combine(i18nDir, "default.json");
-            MergeI18nFile(defaultJson, props, preferChinese: false);
+            MergeI18nFile(defaultJson, props, preferChinese: false, fallbackNewline: defaultNewline);
             res.UpdatedTranslationFiles.Add(defaultJson);
 
             string zhJson = Path.Combine(i18nDir, "zh.json");
-            MergeI18nFile(zhJson, props, preferChinese: true);
+            MergeI18nFile(zhJson, props, preferChinese: true, fallbackNewline: defaultNewline);
             res.UpdatedTranslationFiles.Add(zhJson);
 
             res.UsageSnippet =
@@ -158,6 +161,7 @@ namespace SdvKb.Build
 
                 var xmlDocs = new XmlDocReader();
                 xmlDocs.LoadXmlFile(tempXml);
+                var rawSourceComments = ExtractLeadingCommentsFromSource(File.ReadAllText(configFilePath));
 
                 var resolver = new UniversalAssemblyResolver(tempDll, throwOnError: false, ".NETCoreApp,Version=v6.0");
                 resolver.AddSearchDirectory(gamePath);
@@ -225,6 +229,12 @@ namespace SdvKb.Build
                     }
 
                     string summary = xmlDocs.GetSummary(IdStringProvider.GetIdString(p)).Trim();
+                    // 若开发者写了裸 `/// 树叶摇曳：控制摆动幅度`（未包 <summary> 标签）或普通 `//` 行注释，Roslyn -doc 不会输出 XML；
+                    // 此处从源码行首注释兜底提取，确保中文注释能一步写入 zh.json，无需二次手改 JSON！
+                    if (string.IsNullOrWhiteSpace(summary) && rawSourceComments.TryGetValue(p.Name, out var fallbackComment))
+                    {
+                        summary = fallbackComment;
+                    }
                     props.Add(new GmcmOptionProp
                     {
                         Name = p.Name,
@@ -401,14 +411,32 @@ namespace {ns}
             return sb.ToString();
         }
 
-        private static void MergeI18nFile(string jsonPath, List<GmcmOptionProp> props, bool preferChinese)
+        /// <summary>
+        /// 增量合并 `i18n/*.json` 翻译键值。
+        ///
+        /// 【当初为什么要保留原文件换行符并支持自动升级英文占位符】：
+        /// 1. `JsonSerializer.Serialize` 在 Windows 下默认输出 `\r\n`，之前末尾又硬拼了 `"\n"`，导致原本为 LF (`\n`) 的 JSON
+        ///    被改写成 CRLF 或混合换行符，使后续 AI 工具调用 `edit_file` 时因空白符不匹配连续报错；
+        /// 2. 若第一次跑 `gen-gmcm` 时属性还没写中文注释（`zh.json` 暂填了英文名），后续补上中文注释重跑 `gen-gmcm` 时，
+        ///    自动识别并把旧英文占位值升级为提取出的中文标题与说明，省去手写脚本改 JSON。
+        /// </summary>
+        private static void MergeI18nFile(string jsonPath, List<GmcmOptionProp> props, bool preferChinese, string fallbackNewline)
         {
             var dict = new Dictionary<string, string>(StringComparer.Ordinal);
+            string detectedNewline = fallbackNewline;
+            string? existingRaw = null;
+
             if (File.Exists(jsonPath))
             {
                 try
                 {
-                    using var doc = JsonDocument.Parse(File.ReadAllText(jsonPath), JsoncOpts);
+                    existingRaw = File.ReadAllText(jsonPath, Encoding.UTF8);
+                    if (existingRaw.Contains("\r\n", StringComparison.Ordinal))
+                        detectedNewline = "\r\n";
+                    else if (existingRaw.Contains('\n'))
+                        detectedNewline = "\n";
+
+                    using var doc = JsonDocument.Parse(existingRaw, JsoncOpts);
                     if (doc.RootElement.ValueKind == JsonValueKind.Object)
                     {
                         foreach (var p in doc.RootElement.EnumerateObject())
@@ -429,7 +457,12 @@ namespace {ns}
 
                 string fullDoc = !string.IsNullOrWhiteSpace(p.ExplicitDescription) ? p.ExplicitDescription! : p.Summary;
 
-                if (!dict.ContainsKey(nameKey))
+                bool canUpgradeZhName = preferChinese &&
+                    dict.TryGetValue(nameKey, out var curName) &&
+                    curName.Equals(englishFallback, StringComparison.Ordinal) &&
+                    (!string.IsNullOrWhiteSpace(p.ExplicitTitle) || ContainsChinese(p.Summary));
+
+                if (!dict.ContainsKey(nameKey) || canUpgradeZhName)
                 {
                     if (preferChinese)
                     {
@@ -449,7 +482,12 @@ namespace {ns}
                     }
                 }
 
-                if (!dict.ContainsKey(tipKey))
+                bool canUpgradeZhTip = preferChinese &&
+                    dict.TryGetValue(tipKey, out var curTip) &&
+                    curTip.Equals(englishFallback, StringComparison.Ordinal) &&
+                    !string.IsNullOrWhiteSpace(fullDoc);
+
+                if (!dict.ContainsKey(tipKey) || canUpgradeZhTip)
                 {
                     if (preferChinese)
                     {
@@ -470,7 +508,52 @@ namespace {ns}
                 WriteIndented = true,
                 Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
             });
-            File.WriteAllText(jsonPath, jsonOut + "\n", new UTF8Encoding(false));
+            string normalized = jsonOut.Replace("\r\n", "\n").Replace("\n", detectedNewline) + detectedNewline;
+            if (existingRaw != normalized)
+            {
+                File.WriteAllText(jsonPath, normalized, new UTF8Encoding(false));
+            }
+        }
+
+        private static Dictionary<string, string> ExtractLeadingCommentsFromSource(string csText)
+        {
+            var map = new Dictionary<string, string>(StringComparer.Ordinal);
+            var lines = csText.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+            var commentBuf = new List<string>();
+            var propRegex = new Regex(@"^\s*public\s+(?!class\b|interface\b|enum\b|struct\b|static\b)[\w<>\.\?\[\]]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{");
+
+            foreach (var rawLine in lines)
+            {
+                string trimmed = rawLine.Trim();
+                if (trimmed.StartsWith("///", StringComparison.Ordinal))
+                {
+                    string cleaned = Regex.Replace(trimmed.Substring(3), @"</?[a-zA-Z0-9_]+[^>]*>", "").Trim();
+                    if (!string.IsNullOrEmpty(cleaned))
+                        commentBuf.Add(cleaned);
+                    continue;
+                }
+                if (trimmed.StartsWith("//", StringComparison.Ordinal))
+                {
+                    string cleaned = trimmed.Substring(2).Trim();
+                    if (!string.IsNullOrEmpty(cleaned))
+                        commentBuf.Add(cleaned);
+                    continue;
+                }
+                if (trimmed.StartsWith("[", StringComparison.Ordinal))
+                {
+                    // Skip [Range(...)] / [Display(...)] attributes between comment and property without clearing buffer
+                    continue;
+                }
+
+                var m = propRegex.Match(rawLine);
+                if (m.Success && commentBuf.Count > 0)
+                {
+                    map[m.Groups[1].Value] = string.Join(" ", commentBuf).Trim();
+                }
+                commentBuf.Clear();
+            }
+
+            return map;
         }
 
         private static string ExtractShortChineseOptionTitle(string summary, string fallback)

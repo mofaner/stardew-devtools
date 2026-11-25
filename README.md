@@ -2,7 +2,7 @@
 
 面向 AI Agent 与开发者的星露谷物语 1.6 模组开发资料库、静态体检与实机自动化测试工具（`sdv-dev` CLI + AI Skill）。
 
-内置原版与 SMAPI 接口、源码实时反编译、1.6 数据表结构、中英原版条目、XACT 音效及官方 Wiki 离线资料库；支持工程构建、GMCM 配置菜单生成、1.6 语义/跨表外键/NPC 日程对话/Harmony 静态校验、`.tmx` 与 CP `EditMap` 地图贴图离线渲染，以及隔离进档交互、快照回档、UI 线框和帧耗时/IL 实机自动化测试。
+内置原版、SMAPI、`MonoGame` 与 `xTile` 接口检索及源码反编译、1.6 数据表结构、中英原版条目、XACT 音效与官方 Wiki 离线资料库；支持 C# 工程与 `.fx` HLSL 着色器免安装工具链编译、GMCM 配置菜单生成、1.6 语义/跨表外键/NPC/Harmony/MonoGame 渲染静态校验、`.tmx` 与 CP `EditMap` 地图贴图离线渲染，以及隔离进档交互、免重启改配置、A/B 光影对比与动态四宫格截图、快照回档和帧耗时/IL 实机自动化测试。
 
 ---
 
@@ -29,33 +29,35 @@ sdv-dev sync --offline --game-path "D:\你的游戏路径\Stardew Valley"
 
 ## 二、主要功能
 
-### 1. 查原版源码、1.6 数据结构与音效库
-内置预建好的 SQLite FTS5 知识库（29,000+ API、168 张 1.6 数据表结构、6,200+ 中英原版条目与 XACT 音效名、官方 Wiki 文档），支持按类名或方法名实时反编译原版与 SMAPI 代码：
+### 1. 查原版/SMAPI/MonoGame/xTile 源码、1.6 数据结构与音效库
+内置预建好的 SQLite FTS5 知识库（覆盖 `Stardew Valley`、`StardewModdingAPI` 含内部框架类、`MonoGame.Framework`、`xTile`、`0Harmony`、168 张 1.6 数据表结构、6,200+ 中英原版条目与 XACT 音效名、官方 Wiki 文档），支持按类名或方法名实时反编译并用 `--grep` 局部切片：
 ```powershell
-sdv-dev api "performObjectDropInAction"
-sdv-dev decompile StardewValley.Object.performObjectDropInAction
+sdv-dev api "RenderTarget2D" --asm monogame
+sdv-dev decompile Game1.DrawWorld --grep lighting -C 12
+sdv-dev decompile SModHooks.OnRendered
 sdv-dev schema Data/Machines
 sdv-dev data "小桶" --asset Data/BigCraftables
 sdv-dev data dwop --asset Audio/Cues
 sdv-dev docs "TriggerActions"
 ```
 
-### 2. 工程构建、GMCM 生成与深度静态查错
-内置 Roslyn 编译器与 `AssemblyPublicizer`（自动兼容 `.csproj` 的 `ImplicitUsings`、`DefineConstants`、`Compile Remove`），支持从 `ModConfig.cs` 生成 GMCM 配置菜单，并在进游戏前做全套静态体检：
+### 2. C# 与 `.fx` 着色器免 SDK 构建、GMCM 生成与深度静态查错
+内置 Roslyn 编译器、`AssemblyPublicizer` 与对齐星露谷 1.6 (MonoGame 3.8.0.1641) 的 `.fx -> .mgfxo` OpenGL 着色器编译器，支持从 `ModConfig.cs` 生成 GMCM 配置菜单，并在进游戏前做全套静态体检：
 ```powershell
-sdv-dev new csharp --name MyMachineMod --author You
-sdv-dev deps add spacechase0.GenericModConfigMenu --optional
-sdv-dev gen-gmcm .\MyMachineMod
-sdv-dev build .\MyMachineMod --deploy
-sdv-dev check .\MyMachineMod
-sdv-dev pack .\MyMachineMod
+sdv-dev new csharp --name MyShaderMod --author You
+sdv-dev shader .\MyShaderMod\assets\water.fx     # 单文件编译 HLSL -> MGFX v9 (.mgfxo)，build 也会自动编译全部 .fx
+sdv-dev gen-gmcm .\MyShaderMod
+sdv-dev build .\MyShaderMod --deploy
+sdv-dev check .\MyShaderMod
+sdv-dev pack .\MyShaderMod
 ```
 `sdv-dev check` 会同时检查：
 - 1.6 `GameData` 字段名与类型（含 `Data/TriggerActions` 等 `List<T>` 数组表与食谱斜杠表）；
 - 跨表物品 / 信件 / Buff / 任务 ID 断链与 `(O)` / `(BC)` 前缀错配（防 Error Item）；
 - `Event` 剧本前置条件、第 3 段演员四元组站位、指令名与原版音效拼写；
 - 自定义 NPC 的 `Characters/schedules/*` 时间递增、动作名、落点阻挡，以及 `Characters/Dialogue/*` 控制符（`$q`/`$r`/`$p`）与肖像 PNG 帧数越界；
-- C# `[HarmonyPatch]` 目标存在性、重载歧义、`Prefix`/`Postfix` 返回值与注入参数类型/`ref` 匹配，以及分屏静态字段隐患。
+- `.fx` 着色器 HLSL 语法、OpenGL `ps_3_0`/`vs_3_0` MojoShader 兼容性与漏编 `.mgfxo` 提醒；
+- C# `[HarmonyPatch]` 目标存在性、重载歧义、`Prefix`/`Postfix` 返回值与注入参数类型/`ref` 匹配、MonoGame/SMAPI 渲染坑（`Rendered*` 内重复 `SpriteBatch.Begin` 崩溃、每帧无缓存 `new Texture2D/RenderTarget2D` 显存泄漏、离屏 `SetRenderTarget` 未还原、非预乘 `new Color(r,g,b,a)` 泛白），以及分屏静态字段隐患。
 
 ### 3. 离线地图与贴图预览
 不用启动游戏，直接在命令行切分校验精灵图、拼装 `.tmx` 地图，或把 Content Patcher 的 `EditMap` 补丁叠到原版地图上秒出局部预览图：
@@ -68,10 +70,15 @@ sdv-dev map-render Maps/Town --cp .\MyCpMod --auto-crop --debug-overlay --out to
 sdv-dev map-check assets/IslandBay.tmx --entry 10,2
 ```
 
-### 4. 隔离进档实测、时光机快照、UI 线框与性能采样
-通过 `--isolated --test-world` 在独立 `--mods-path` 下秒进测试档（不碰个人存档），用命令行完成交互、回档和排错：
+### 4. 隔离进档实测、免重启调参、视觉对比/连拍、时光机快照与性能采样
+通过 `--isolated --test-world` 在独立 `--mods-path` 下秒进测试档（不碰个人存档；玩家已开可见窗口时 `restart` 默认同桌面原位刷新，不想弹窗口则加 `--background` 切为后台隐藏模式）：
 ```powershell
-sdv-dev start --isolated --project .\MyMachineMod --test-world
+sdv-dev start --isolated --project .\MyShaderMod --test-world
+sdv-dev reload-assets --project .\MyShaderMod              # 改完 .fx 着色器免重启 0.2s 自动重编并热刷内存 Effect！
+sdv-dev world --zoom 0.80 --time 1800                      # 安全切换视野缩放（自动重建 Game1.screen 防右侧 UV 撕裂）
+sdv-dev config Author.MyShaderMod --set SunsetWarmth=1.4   # 0.05 秒免重启实时改内存配置（加 --reset 一键恢复默认）
+sdv-dev screenshot --ab-compare Author.MyShaderMod -o ab.png # 同机位一键拍「关闭 vs 开启」左右对比图
+sdv-dev screenshot --burst 4 --pan-test -o motion_grid.png   # 动态连拍 2x2 时序四宫格（审波纹动画与镜头残影）
 sdv-dev warp Farm 64 15
 sdv-dev interact --place "(BC)12" 65,16
 sdv-dev interact --drop-in "(O)258" 65,16
@@ -96,6 +103,7 @@ sdv-dev stop
 - `client/`：`sdv-dev.exe` 薄客户端（NativeAOT）
 - `src/`：`sdv-dev-worker.exe` 后端热驻服务（知识库、编译、静态分析、地图与贴图渲染）
 - `bridge/`：`SdvDevBridge.dll` 游戏内自动化桥接模组（编译后内嵌进 worker）
+- `tools/mgfxc-3.8.0/`：内置对齐星露谷 1.6 (MonoGame 3.8.0.1641) 的 `.fx -> .mgfxo` 着色器编译器依赖
 - `skills/stardew-devtools/`：AI Agent 技能文件
 - `tests/`：离线与实机端到端回归测试集
 
@@ -104,5 +112,5 @@ sdv-dev stop
 .\build.ps1                        # 编译并安装到本机 ~/.local/bin
 .\tests\run-all.ps1                # 运行离线全量回归测试
 .\tests\run-all.ps1 -IncludeLive   # 额外启动隔离测试档运行实机端到端验收
-.\pack-release.ps1 -Version v1.0.0 # 生成 releases/*.zip 发布包
+.\pack-release.ps1 -Version v1.1.0 # 生成 releases/*.zip 发布包
 ```
