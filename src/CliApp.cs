@@ -101,6 +101,7 @@ namespace SdvKb
                 "player" => RunPlayer(rest),
                 "ui" => RunUi(rest),
                 "ui-click" => RunUiClick(rest),
+                "input" or "key" or "keys" or "gamepad" => RunInput(rest),
                 "logs" => RunLogs(rest),
 
                 _ => UnknownCommand(cmd)
@@ -882,7 +883,7 @@ namespace SdvKb
 
         private static int RunMapRender(string[] args)
         {
-            string[] valOpts = { "--game-path", "-g", "--out", "-o", "--season", "-s", "--zoom", "-z", "--cp", "--target", "-t", "--crop" };
+            string[] valOpts = { "--game-path", "-g", "--out", "-o", "--season", "-s", "--zoom", "-z", "--cp", "--target", "-t", "--crop", "--rect", "-r" };
             EnsureCommandOptions("map-render", args, valOpts, "--debug-overlay", "--debug", "--show-paths", "--auto-crop");
 
             var cfg = KbConfig.Load(GetOption(args, "--game-path", "-g"));
@@ -890,7 +891,7 @@ namespace SdvKb
             string? season = GetOption(args, "--season", "-s");
             string? cpMod = GetOption(args, "--cp");
             string? targetOpt = GetOption(args, "--target", "-t");
-            string? cropStr = GetOption(args, "--crop");
+            string? cropStr = GetOption(args, "--crop", "--rect", "-r");
             bool autoCrop = HasFlag(args, "--auto-crop") || string.Equals(cropStr, "auto", StringComparison.OrdinalIgnoreCase);
             bool debugOverlay = HasFlag(args, "--debug-overlay", "--debug");
             bool showPaths = HasFlag(args, "--show-paths");
@@ -1650,6 +1651,74 @@ namespace SdvKb
             return 0;
         }
 
+        private static int RunInput(string[] args)
+        {
+            string[] valOpts =
+            {
+                "--hold", "--press", "--tap", "--keys", "--gamepad",
+                "--move", "--hover", "--xy", "--aim-tile",
+                "--click", "--scroll",
+                "--ticks", "-t", "--interval-ticks", "--interval-ms", "--settle-ticks",
+                "--out", "-o", "--screen"
+            };
+            EnsureCommandOptions("input", args, valOpts);
+
+            string? hold = GetOption(args, "--hold");
+            string? seqRaw = GetOption(args, "--press", "--tap", "--keys", "--gamepad");
+            string? moveStr = GetOption(args, "--move", "--hover", "--xy");
+            string? aimTileStr = GetOption(args, "--aim-tile");
+            string? click = GetOption(args, "--click");
+            string? scrollStr = GetOption(args, "--scroll");
+            string? ticksStr = GetOption(args, "--ticks", "-t");
+            string? intervalTicksStr = GetOption(args, "--interval-ticks");
+            string? intervalMsStr = GetOption(args, "--interval-ms");
+            string? settleStr = GetOption(args, "--settle-ticks");
+            string? outPath = GetOption(args, "--out", "-o");
+            string? screen = GetOption(args, "--screen");
+
+            // 若没有传显式键值选项但给了位置参数（如 `sdv-dev input DPadDown,DPadRight`），视为按键序列
+            string posQuery = GetPositionalQuery(args, valOpts);
+            if (string.IsNullOrWhiteSpace(seqRaw) && string.IsNullOrWhiteSpace(hold) && !string.IsNullOrWhiteSpace(posQuery))
+                seqRaw = posQuery;
+
+            var sequence = ParseCsvList(seqRaw);
+            var movePt = ParsePoint2(moveStr);
+            var aimPt = ParsePoint2(aimTileStr);
+            int? scroll = int.TryParse(scrollStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int scv) ? scv : (int?)null;
+            int? ticks = int.TryParse(ticksStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int tkv) && tkv > 0 ? tkv : (int?)null;
+            int? settleTicks = int.TryParse(settleStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int stv) && stv >= 0 ? stv : (int?)null;
+
+            int? intervalTicks = null;
+            if (int.TryParse(intervalTicksStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int itv) && itv > 0)
+                intervalTicks = itv;
+            else if (int.TryParse(intervalMsStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int ims) && ims > 0)
+                intervalTicks = Math.Max(1, (int)Math.Round(ims / (1000.0 / 60.0)));
+
+            if (string.IsNullOrWhiteSpace(hold) && sequence.Count == 0 && !movePt.HasValue && !aimPt.HasValue && !scroll.HasValue && string.IsNullOrWhiteSpace(click))
+            {
+                PrintHelp("input");
+                return 1;
+            }
+
+            string? fullOut = !string.IsNullOrWhiteSpace(outPath) ? Path.GetFullPath(outPath!) : null;
+            Console.WriteLine(BridgeClient.SendRequired(new
+            {
+                action = "input_simulate",
+                hold,
+                sequence = sequence.Count > 0 ? sequence : null,
+                move = movePt.HasValue ? $"{movePt.Value.X},{movePt.Value.Y}" : null,
+                aimTile = aimPt.HasValue ? $"{aimPt.Value.X},{aimPt.Value.Y}" : null,
+                click,
+                scroll,
+                ticks,
+                intervalTicks,
+                settleTicks,
+                outPath = fullOut,
+                screen
+            }, connectTimeoutMs: 5000));
+            return 0;
+        }
+
         private static int RunHarmony(string[] args)
         {
             string? modId = GetOption(args, "--mod", "-m");
@@ -2135,6 +2204,7 @@ OPTIONS:
   reload / reload-assets      免重启热重载 CP 包，或对 C#/CP 模组自动重编 `.fx` 并 0.2s 热刷内存 `Effect` 着色器与地图贴图
   config                      免重启 0.05 秒实时读取/修改/重置模组配置（`--get [Key]` / `--set Key=Val` / `--reset`）
   screenshot                  实机截图：`--mode screen|map`、`--zoom 0.75` 大视野、`--ui-overlay`、`--ab-compare`、`--burst` 四宫格
+  input                       无焦点真实输入模拟：`--hold W --ticks 30` 走动/蓄力、`--move` 悬停抓 Tooltip、`--gamepad` 测手柄焦点跳转
   interact                    世界交互模拟：`--place` 摆机器、`--drop-in` 投料、`--right-click` 右键收获/对话/开店、`--use-tool` 挥农具
   checkpoint                  测试档秒级时光机快照：`save`/`load`/`list`/`delete`（冷重启后也能 1 秒回档到精确分钟与坐标反复测分支）
   schedule-check              实机调用原版 `NPC.parseMasterSchedule` 推演 NPC 全天日程跨图寻路，排查不可达目标格或断链 Warp
@@ -2156,30 +2226,52 @@ OPTIONS:
             {
                 case "deps":
                 case "dep":
-                    Console.WriteLine(@"# sdv-dev deps — 项目依赖管理（前置模组解析、编译引用与隔离环境自动挂载）
+                    Console.WriteLine(@"# sdv-dev deps — 项目依赖管理（前置模组解析、特殊仓库自动拉取、编译引用与隔离环境挂载）
 
 用法：
-  sdv-dev deps [--project <ModDir>] [--offline]              解析工程 manifest.json 与 sdv-project.json 的全部直接+传递前置依赖
+  sdv-dev deps [--project <ModDir>] [--offline]              解析工程 manifest.json、GMCM 软依赖与 sdv-project.json 的全部前置
   sdv-dev deps list [<关键词>]                               扫描本机 `<GamePath>\Mods` 与本地缓存中所有可用前置模组
   sdv-dev deps add <UniqueID|别名> [--project <ModDir>] [--optional] [--no-ref] [--github <owner/repo>]
   sdv-dev deps remove <UniqueID|别名> [--project <ModDir>]   移除前置依赖声明
-  sdv-dev deps api <UniqueID|别名> [<TypeOrMethod>]          直接反编译前置模组公开的 `I*Api` / `GetApi()` 接口签名（免猜参数！）
+  sdv-dev deps api <UniqueID|别名> [<TypeOrMethod>]          直接反编译前置模组公开的 `I*Api` / `GetApi()` 接口签名（本地未装时自动拉取！）
   sdv-dev deps isolated [--on|--off] [--project <ModDir>]    设置该工程默认启用 `--isolated` 隔离测试模式
 
 核心机制：
   1. 优先从玩家本地 `<GamePath>\Mods` 递归扫描 `manifest.json`（兼容带版本号嵌套目录），零网络耗时；
-  2. 若本地缺失某个开源前置（如 `cp`、`ftm`、`automate`、`uiinfosuite2` 等），自动从 GitHub Releases 拉取 `.zip` 到缓存（绝不访问 N 网）；
-  3. `sdv-dev build` 自动将前置模组 DLL 加入编译引用；`start/restart --isolated` 自动把工程及全部传递前置复制到独立 `--mods-path` 秒开测试！
+  2. 若本地缺失开源前置：自动区分常规 GitHub Releases 仓库与单仓只打 tag 的特殊仓库（如 `Pathoschild` / `spacechase0` 全家桶：`cp`、`gmcm`、`spacecore`、`automate` 等），自动经 GitHub Releases 或官方 CurseForge 公共 CDN 免登录直拉最新预编译 `.zip` 到缓存；
+  3. 自动感知 C# 工程中的 `GenericModConfigMenu` 软依赖（`GmcmIntegration.g.cs` / `GetApi`），在 `--isolated` 测试时自动挂载 GMCM！
 
 常用别名：
   `cp` (Pathoschild.ContentPatcher), `gmcm` (spacechase0.GenericModConfigMenu), `spacecore` (spacechase0.SpaceCore),
-  `ftm` (Esca.FarmTypeManager), `sve` (FlashShifter.StardewValleyExpandedCP), `automate`, `stardewhack`, `kokoro`
+  `ftm` (Esca.FarmTypeManager), `sve` (FlashShifter.StardewValleyExpandedCP), `automate`, `lookupanything`, `stardewhack`, `kokoro`
 
 示例：
   sdv-dev deps list gmcm
   sdv-dev deps add gmcm --optional --no-ref --project d:\myProject\MyMod
   sdv-dev deps api gmcm
   sdv-dev deps add spacecore --project d:\myProject\MyMod");
+                    break;
+
+                case "input":
+                case "key":
+                case "keys":
+                case "gamepad":
+                    Console.WriteLine(@"# sdv-dev input — 无焦点真实键鼠 / 农具蓄力 / 鼠标悬停 Tooltip / 手柄焦点跳转按帧模拟
+
+用法：
+  sdv-dev input --hold <Button[+Button2]> [--ticks 30] [--aim-tile <x,y>] [--out <shot.png>]
+      在进程内按帧注入持续按键（完全不抢玩家桌面键鼠焦点，兼容 `--background` 离屏窗口！）：
+      - 真实物理走动/冲刺/碰撞/踩传送点：`sdv-dev input --hold W --ticks 30` 或 `--hold ""LeftShift+D"" --ticks 25`
+      - 农具长按蓄力与释放：`sdv-dev input --aim-tile 65,16 --hold C --ticks 48`（记录 `maxToolPowerReached` 并自动跑完收招帧）
+  sdv-dev input --keys <Btn1[,Btn2:Ticks,...]> [--interval-ticks 3] [--out <shot.png>]
+  sdv-dev input --gamepad <DPadDown,DPadRight,ControllerA> [--interval-ticks 4]
+      自动临时启用手柄控制模式，逐拍注入手柄方向键/肩键/ABXY，完整返回菜单 `currentlySnappedComponent` 的焦点跳转轨迹 (`snapTrail`)！
+  sdv-dev input --move <uiX,uiY> [--ticks 4] [--click left|right] [--scroll -120] [--out <hover.png>]
+      注入虚拟鼠标坐标触发 SMAPI `CursorMoved` 与菜单 `performHoverAction(x, y)`，直接抓回当前菜单的 `hoverText`、`hoverTitle`、`hoveredItem` 及可选悬停态截图！
+
+常用按键名（兼容全部 SMAPI `SButton`）：
+  `W`,`A`,`S`,`D`, `C`(挥工具/确认), `X`(交互), `E`/`Escape`(菜单), `LeftShift`, `MouseLeft`, `MouseRight`,
+  `DPadUp`, `DPadDown`, `DPadLeft`, `DPadRight`, `ControllerA`, `ControllerB`, `ControllerX`, `ControllerY`, `LeftShoulder`, `RightShoulder`");
                     break;
 
                 case "tilesheet":
@@ -2194,9 +2286,10 @@ OPTIONS:
                 case "maps":
                     Console.WriteLine(@"# sdv-dev 地图与贴图全套制作/检视/离线预览工具链
 
-1. 贴图编号网格导出与原版地图检视：
+1. 贴图编号网格导出与原版地图检视（无 `Content (unpacked)` 时自动按需直读 `Content\*.xnb`）：
    sdv-dev tilesheet Maps/island_tilesheet_1 --grid --out sheet_grid.png
-   sdv-dev map-inspect IslandSouth --rect 14,32,8,6
+   sdv-dev map-inspect IslandSouth --rect 14,32,8,6 [--full]
+   - 传 `--rect` 时默认精简输出局部图块、局部 Warp/光源与实际引用的 TileSheet（需全图元数据再加 `--full`）。
 
 2. 免进游戏 1 秒离线渲染 `.tmx` 与 Content Patcher `EditMap` 补丁叠加预览：
    sdv-dev map-render assets/CoralBay.tmx --out preview.png --season summer --debug-overlay
@@ -2221,17 +2314,19 @@ OPTIONS:
 
                 case "warp":
                 case "reload-assets":
-                    Console.WriteLine(@"# sdv-dev warp / reload-assets — 实机瞬移与资产秒级热刷
+                    Console.WriteLine(@"# sdv-dev warp / reload-assets — 实机瞬移与着色器/地图/贴图 0.2s 免重启热刷
 
 用法：
   sdv-dev warp <LocationName> [x] [y] [--facing 0..3]
-  sdv-dev reload-assets [--project <ModDir>] --assets <Asset1,Asset2> [--no-reload-map]
+  sdv-dev reload-assets [--project <ModDir>] [--assets <Asset1,Asset2>] [--no-reload-map]
 
 说明：
-  - `reload-assets` 仅拷贝非 DLL 资产（`.tmx`/`.png`/`.json`/`.mgfxo`），即使 C# 模组 DLL 正被游戏锁定也能 1 秒热刷新当前地图与贴图！
+  - 只改了 `.fx` 着色器、`.tmx` 地图或 `.png`/`.json` 时优先用 `reload-assets --project <ModDir>`，无需重启游戏！
+  - 会自动将工程内全部 `.fx` 重编为 `.mgfxo`、精准拷入当前活跃 `modsPath` 对应的模组目录，并在主线程自动调用模组 `ReloadShaders()` 或直接原地替换内存中的 `Effect` 实例！
 
 示例：
   sdv-dev warp IslandSouth 20 35
+  sdv-dev reload-assets --project d:\myProject\MyShaderMod
   sdv-dev reload-assets --project d:\myProject\CoralMod --assets Maps/CoralBay");
                     break;
 
@@ -2247,10 +2342,11 @@ OPTIONS:
   sdv-dev eval --file <script.cs>
   sdv-dev eval ""<简单无引号表达式>""
 
-特性：
+特性与防踩坑提示：
   - 推荐在 PowerShell 中用 `@' ... '@ | sdv-dev eval --stdin` 管道传入代码，彻底避免命令行双引号被剥离！
-  - 脚本顶部的 `using ...;` 会自动提升到编译单元顶层；
-  - 已默认预置 `StardewValley.*`、`StardewModdingAPI.*`、`Microsoft.Xna.Framework(.Graphics)`、`xTile.*`、`System.Text` 与当前活跃 Mods 目录中所有模组 DLL；
+  - 严禁手写 `eval` 只改 `Game1.options.desiredBaseZoomLevel` 调视野（未同步重建 `@Game1.screen` 会导致画面右侧出现假 UV 撕裂线）——切缩放请直接用 `sdv-dev world --zoom 0.8` 或 `screenshot --zoom 0.8`！
+  - 实时修改模组配置请优先用 `sdv-dev config <ModId> --set Key=Val`（或 `--reset`），模拟键鼠/手柄请用 `sdv-dev input`！
+  - 脚本顶部的 `using ...;` 会自动提升到编译单元顶层；已默认预置 `StardewValley.*`、`StardewModdingAPI.*`、`Microsoft.Xna.Framework(.Graphics)`、`xTile.*`、`System.Text` 与当前活跃 Mods 目录中所有模组 DLL；
   - 内置变量：`Helper` (`IModHelper`), `Monitor` (`IMonitor`), `Player` (`Farmer`), `Location` (`GameLocation`)。");
                     break;
 
@@ -2537,18 +2633,18 @@ OPTIONS:
 
         private static readonly HashSet<string> GlobalKnownOptions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
-            "--ab", "--ab-compare", "--ab-toggle", "--action", "--add-item", "--advance-days", "--asm", "--asset", "--assets", "--at", "--author", "--auto-crop",
-            "--background", "--burst", "--button", "--cat", "--cell", "--clear", "--close", "--code-b64", "--cold", "--config", "--context", "--cp", "--cp-trace", "--crop",
+            "--ab", "--ab-compare", "--ab-toggle", "--action", "--add-item", "--advance-days", "--aim-tile", "--asm", "--asset", "--assets", "--at", "--author", "--auto-crop",
+            "--background", "--burst", "--button", "--cat", "--cell", "--clear", "--click", "--close", "--code-b64", "--cold", "--config", "--context", "--cp", "--cp-trace", "--crop",
             "--day", "--days", "--db", "--debug-overlay", "--debug", "--defines", "--deploy", "--docs-only", "--docs-out", "--drop-in", "--dropin",
             "--entry", "--export", "--facing-up", "--facing", "--file", "--focus", "--force", "--friendship", "--full-mods", "--full",
-            "--game-path", "--get", "--github", "--give", "--grep", "--grid", "--headless", "--help", "--id", "--il", "--include-back", "--instructions", "--interval-ms", "--interval-ticks", "--isolated",
-            "--json", "--keep-seen", "--keep-window", "--key", "--kind", "--layer", "--level", "--limit", "--lines", "--list-assets", "--list",
-            "--mail", "--match", "--min-version", "--mod", "--mode", "--mods-path", "--money", "--name", "--near", "--new-test-save",
+            "--game-path", "--gamepad", "--get", "--github", "--give", "--grep", "--grid", "--headless", "--help", "--hold", "--hover", "--id", "--il", "--include-back", "--instructions", "--interval-ms", "--interval-ticks", "--isolated",
+            "--json", "--keep-seen", "--keep-window", "--key", "--keys", "--kind", "--layer", "--level", "--limit", "--lines", "--list-assets", "--list",
+            "--mail", "--match", "--min-version", "--mod", "--mode", "--mods-path", "--money", "--move", "--name", "--near", "--new-test-save",
             "--no-back", "--no-bbox", "--no-focus", "--no-move", "--no-publicize", "--no-ref", "--no-reload-map", "--no-save", "--no-window", "--off", "--offline", "--optional",
-            "--out", "--pan", "--pan-test", "--place", "--power", "--prefab", "--preset", "--profile", "--project", "--rect", "--refill", "--reload-map",
-            "--reset", "--reset-test-world", "--response", "--right-click", "--same-desktop", "--save", "--scale", "--screen", "--script-b64", "--script", "--search",
-            "--season", "--seconds", "--set", "--show-paths", "--size", "--skip-check", "--skip", "--spec", "--status", "--stdin", "--step",
-            "--tail", "--target", "--test-world", "--theme", "--tile-size", "--time", "--timeout", "--tool", "--top", "--trace",
+            "--out", "--pan", "--pan-test", "--place", "--power", "--prefab", "--preset", "--press", "--profile", "--project", "--rect", "--refill", "--reload-map",
+            "--reset", "--reset-test-world", "--response", "--right-click", "--same-desktop", "--save", "--scale", "--screen", "--script-b64", "--script", "--scroll", "--search",
+            "--season", "--seconds", "--set", "--settle-ticks", "--show-paths", "--size", "--skip-check", "--skip", "--spec", "--status", "--stdin", "--step",
+            "--tail", "--tap", "--target", "--test-world", "--theme", "--ticks", "--tile-size", "--time", "--timeout", "--tool", "--top", "--trace",
             "--ui", "--ui-overlay", "--unpack", "--use-tool", "--visible", "--weather", "--with-mods", "--xy", "--year", "--zoom",
             "-a", "-c", "-C", "-d", "-e", "-f", "-g", "-h", "-k", "-l", "-m", "-n", "-o", "-p", "-r", "-s", "-t", "-w", "-y", "-z", "-"
         };

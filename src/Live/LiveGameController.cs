@@ -283,6 +283,11 @@ namespace SdvKb.Live
                 }
             }
 
+            else if (!string.IsNullOrWhiteSpace(projectDir))
+            {
+                ModDependencyResolver.EnsureRequiredPrerequisitesInModsRoot(projectDir, gamePath, Path.Combine(gamePath, "Mods"));
+            }
+
             EnsureBridgeModInstalled(gamePath, targetModsRoot);
 
             string smapiExe = Path.Combine(gamePath, "StardewModdingAPI.exe");
@@ -537,9 +542,10 @@ namespace SdvKb.Live
                 Thread.Sleep(400);
             }
 
-            // Step 4: Deploy to normal Mods/ when not isolated; when isolated, StartGameAndWait stages isolated-mods + prerequisites!
+            // Step 4: Deploy to normal Mods/ when not isolated (and ensure required prerequisites like CP exist); when isolated, StartGameAndWait stages isolated-mods + prerequisites!
             if (!wantsIsolated && !string.IsNullOrWhiteSpace(modDir) && buildRes != null)
             {
+                ModDependencyResolver.EnsureRequiredPrerequisitesInModsRoot(modDir, gamePath, Path.Combine(gamePath, "Mods"));
                 DotNet6ModCompiler.DeployModFolder(Path.GetFullPath(modDir!), gamePath, buildRes.UniqueId);
             }
 

@@ -72,29 +72,38 @@ namespace SdvKb.Project
             AllowTrailingCommas = true
         };
 
-        // Common Stardew 1.6 framework aliases & open-source GitHub Release repositories (fallback when missing in local Mods)
-        private static readonly (string Alias, string UniqueId, string? GitHubRepo, string? AssetHint)[] KnownFrameworks =
+        // Common Stardew 1.6 framework aliases, open-source GitHub Release repos, and CurseForge CDN slugs!
+        // 【当初为什么要给 Pathoschild / spacechase0 特殊仓库单独配 CurseForgeSlug】：
+        // 实测 `Pathoschild/StardewMods` 与 `spacechase0/StardewValleyMods` 在 GitHub 上只打源码 git tag（Releases 列表为空，不挂预编译 .zip），
+        // 新手电脑 `Mods\` 为空时走 GitHub Releases 会拉空；而它们同步发布的 CurseForge 官方 CDN (`edge.forgecdn.net`) 支持免登录 HTTP 200 直拉最新预编译 `.zip`！
+        private static readonly (string Alias, string UniqueId, string? GitHubRepo, string? AssetHint, string? CurseForgeSlug)[] KnownFrameworks =
         {
-            ("cp", "Pathoschild.ContentPatcher", "Pathoschild/StardewMods", "ContentPatcher"),
-            ("contentpatcher", "Pathoschild.ContentPatcher", "Pathoschild/StardewMods", "ContentPatcher"),
-            ("gmcm", "spacechase0.GenericModConfigMenu", "spacechase0/StardewValleyMods", "GenericModConfigMenu"),
-            ("genericmodconfigmenu", "spacechase0.GenericModConfigMenu", "spacechase0/StardewValleyMods", "GenericModConfigMenu"),
-            ("spacecore", "spacechase0.SpaceCore", "spacechase0/StardewValleyMods", "SpaceCore"),
-            ("ftm", "Esca.FarmTypeManager", "Esca-MMC/FarmTypeManager", "FarmTypeManager"),
-            ("farmtypemanager", "Esca.FarmTypeManager", "Esca-MMC/FarmTypeManager", "FarmTypeManager"),
-            ("automate", "Pathoschild.Automate", "Pathoschild/StardewMods", "Automate"),
-            ("lookupanything", "Pathoschild.LookupAnything", "Pathoschild/StardewMods", "LookupAnything"),
-            ("chestsanywhere", "Pathoschild.ChestsAnywhere", "Pathoschild/StardewMods", "ChestsAnywhere"),
-            ("tractormod", "Pathoschild.TractorMod", "Pathoschild/StardewMods", "TractorMod"),
-            ("centralstation", "Pathoschild.CentralStation", "Pathoschild/StardewMods", "CentralStation"),
-            ("uiinfosuite2", "Annosz.UiInfoSuite2", "Annosz/UIInfoSuite2", "UIInfoSuite2"),
-            ("alternativetextures", "PeacefulEnd.AlternativeTextures", "PeacefulEnd/AlternativeTextures", "AlternativeTextures"),
-            ("fashionSense", "PeacefulEnd.FashionSense", "PeacefulEnd/FashionSense", "FashionSense"),
-            ("customcompanions", "PeacefulEnd.CustomCompanions", "PeacefulEnd/CustomCompanions", "CustomCompanions"),
-            ("stardewhack", "bcmpinc.StardewHack", "bcmpinc/StardewHack", "StardewHack"),
-            ("kokoro", "Shockah.Kokoro", "Shockah/Stardew-Valley-Mods", "Kokoro"),
-            ("trinkettinker", "mushymato.TrinketTinker", "Mushymato/TrinketTinker", "TrinketTinker"),
-            ("sve", "FlashShifter.StardewValleyExpandedCP", null, null)
+            ("cp", "Pathoschild.ContentPatcher", "Pathoschild/StardewMods", "ContentPatcher", "content-patcher"),
+            ("contentpatcher", "Pathoschild.ContentPatcher", "Pathoschild/StardewMods", "ContentPatcher", "content-patcher"),
+            ("gmcm", "spacechase0.GenericModConfigMenu", "spacechase0/StardewValleyMods", "GenericModConfigMenu", "generic-mod-config-menu"),
+            ("genericmodconfigmenu", "spacechase0.GenericModConfigMenu", "spacechase0/StardewValleyMods", "GenericModConfigMenu", "generic-mod-config-menu"),
+            ("spacecore", "spacechase0.SpaceCore", "spacechase0/StardewValleyMods", "SpaceCore", "spacecore"),
+            ("ftm", "Esca.FarmTypeManager", "Esca-MMC/FarmTypeManager", "FarmTypeManager", null),
+            ("farmtypemanager", "Esca.FarmTypeManager", "Esca-MMC/FarmTypeManager", "FarmTypeManager", null),
+            ("automate", "Pathoschild.Automate", "Pathoschild/StardewMods", "Automate", "automate"),
+            ("lookupanything", "Pathoschild.LookupAnything", "Pathoschild/StardewMods", "LookupAnything", "lookup-anything"),
+            ("chestsanywhere", "Pathoschild.ChestsAnywhere", "Pathoschild/StardewMods", "ChestsAnywhere", "chests-anywhere"),
+            ("tractormod", "Pathoschild.TractorMod", "Pathoschild/StardewMods", "TractorMod", "tractor-mod"),
+            ("centralstation", "Pathoschild.CentralStation", "Pathoschild/StardewMods", "CentralStation", "central-station"),
+            ("uiinfosuite2", "Annosz.UiInfoSuite2", "Annosz/UIInfoSuite2", "UIInfoSuite2", null),
+            ("alternativetextures", "PeacefulEnd.AlternativeTextures", "PeacefulEnd/AlternativeTextures", "AlternativeTextures", null),
+            ("fashionSense", "PeacefulEnd.FashionSense", "PeacefulEnd/FashionSense", "FashionSense", null),
+            ("customcompanions", "PeacefulEnd.CustomCompanions", "PeacefulEnd/CustomCompanions", "CustomCompanions", null),
+            ("stardewhack", "bcmpinc.StardewHack", "bcmpinc/StardewHack", "StardewHack", null),
+            ("kokoro", "Shockah.Kokoro", "Shockah/Stardew-Valley-Mods", "Kokoro", null),
+            ("trinkettinker", "mushymato.TrinketTinker", "Mushymato/TrinketTinker", "TrinketTinker", null),
+            ("sve", "FlashShifter.StardewValleyExpandedCP", null, null, null)
+        };
+
+        private static readonly HashSet<string> TagOnlyGitHubMonorepos = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "Pathoschild/StardewMods",
+            "spacechase0/StardewValleyMods"
         };
 
         public static Dictionary<string, InstalledModInfo> ScanAvailableMods(string gamePath)
@@ -297,6 +306,14 @@ namespace SdvKb.Project
                     if (!string.IsNullOrWhiteSpace(extra))
                         queue.Enqueue((extra.Trim(), true, false, null, null));
                 }
+
+                // 自动识别代码中的 GMCM 软依赖（`GetApi("spacechase0.GenericModConfigMenu")` 或 `GmcmIntegration.g.cs`）：
+                // C# 模组通常不把 GMCM 写进 manifest.json 的 Dependencies，因此在隔离测试时自动将其作为可选前置带入，确保进游戏能直接看到小齿轮配置菜单！
+                if (!string.Equals(res.ModUniqueId, "spacechase0.GenericModConfigMenu", StringComparison.OrdinalIgnoreCase) &&
+                    ProjectReferencesSoftGmcm(fullModDir))
+                {
+                    queue.Enqueue(("spacechase0.GenericModConfigMenu", false, false, null, null));
+                }
             }
 
             if (extraModQueries != null)
@@ -321,7 +338,7 @@ namespace SdvKb.Project
 
                 if (!available.TryGetValue(canonicalId, out var modInfo) && allowGitHubDownload)
                 {
-                    var (fetched, note) = TryFetchFromGitHubReleases(canonicalId, item.ExplicitGitHub, item.AssetHint);
+                    var (fetched, note) = TryFetchRemotePrerequisite(canonicalId, item.ExplicitGitHub, item.AssetHint);
                     if (!string.IsNullOrEmpty(note))
                         res.Notes.Add(note!);
 
@@ -388,7 +405,7 @@ namespace SdvKb.Project
 
             if (!available.TryGetValue(targetId, out var resolvedMod))
             {
-                var (fetched, dlNote) = TryFetchFromGitHubReleases(targetId, explicitGitHubRepo, assetHint: null);
+                var (fetched, dlNote) = TryFetchRemotePrerequisite(targetId, explicitGitHubRepo, assetHint: null);
                 note = dlNote;
                 if (fetched != null)
                 {
@@ -525,7 +542,19 @@ namespace SdvKb.Project
             var available = ScanAvailableMods(gamePath);
             string targetId = ResolveAliasOrMatchLocal(queryOrId, available);
             if (!available.TryGetValue(targetId, out var mod))
-                throw new InvalidOperationException($"Mod `{queryOrId}` (`{targetId}`) is not installed in local Mods or deps-cache.");
+            {
+                // 新手电脑 `Mods\` 为空时，自动拉取远程前置到 `deps-cache` 后再反编译 `I*Api` 接口
+                var (fetched, _) = TryFetchRemotePrerequisite(targetId, null, null);
+                if (fetched != null)
+                {
+                    ScanRootIntoIndex(DepsCacheRoot, "deps-cache", available);
+                    available.TryGetValue(targetId, out mod);
+                    mod ??= fetched;
+                }
+            }
+
+            if (mod == null)
+                throw new InvalidOperationException($"Mod `{queryOrId}` (`{targetId}`) is not installed in local Mods or deps-cache, and could not be downloaded automatically.");
 
             if (string.IsNullOrWhiteSpace(mod.EntryDllFullPath) || !File.Exists(mod.EntryDllFullPath))
                 return $"// Mod `{mod.Name}` ({mod.UniqueId} v{mod.Version}) is a Content Pack without an EntryDll.";
@@ -639,6 +668,201 @@ namespace SdvKb.Project
                 return byName.UniqueId;
 
             return q;
+        }
+
+        private static bool ProjectReferencesSoftGmcm(string fullModDir)
+        {
+            try
+            {
+                if (File.Exists(Path.Combine(fullModDir, "GmcmIntegration.g.cs")) ||
+                    File.Exists(Path.Combine(fullModDir, "IGenericModConfigMenuApi.cs")))
+                {
+                    return true;
+                }
+
+                string[] skipped = { "bin", "obj", "releases", ".git", ".vs" };
+                foreach (var f in Directory.GetFiles(fullModDir, "*.*", SearchOption.AllDirectories))
+                {
+                    string ext = Path.GetExtension(f);
+                    if (!ext.Equals(".cs", StringComparison.OrdinalIgnoreCase) &&
+                        !ext.Equals(".json", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    string rel = Path.GetRelativePath(fullModDir, f);
+                    var parts = rel.Split(new[] { '\\', '/' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Take(Math.Max(0, parts.Length - 1)).Any(p => skipped.Contains(p, StringComparer.OrdinalIgnoreCase)))
+                        continue;
+
+                    if (new FileInfo(f).Length > 512 * 1024)
+                        continue;
+
+                    string txt = File.ReadAllText(f);
+                    if (txt.IndexOf("spacechase0.GenericModConfigMenu", StringComparison.OrdinalIgnoreCase) >= 0)
+                        return true;
+                }
+            }
+            catch
+            {
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 在非隔离模式下启动目标工程前，确保工程声明的必需前置（如新手没装的 `Pathoschild.ContentPatcher`）在目标 `Mods` 目录就位。
+        /// </summary>
+        public static void EnsureRequiredPrerequisitesInModsRoot(string? modDir, string gamePath, string targetModsRoot)
+        {
+            if (string.IsNullOrWhiteSpace(modDir) || !Directory.Exists(modDir))
+                return;
+
+            var existingInTarget = new Dictionary<string, InstalledModInfo>(StringComparer.OrdinalIgnoreCase);
+            ScanRootIntoIndex(targetModsRoot, "local-mods", existingInTarget);
+
+            var depRes = ResolveProjectDependencies(modDir, gamePath, extraModQueries: null, allowGitHubDownload: true);
+            foreach (var depMod in depRes.ResolvedMods)
+            {
+                if (existingInTarget.ContainsKey(depMod.UniqueId))
+                    continue;
+
+                string dst = Path.Combine(targetModsRoot, SanitizeFolderName(depMod.UniqueId));
+                CopyDirectoryAll(depMod.DirectoryPath, dst);
+            }
+        }
+
+        /// <summary>
+        /// 统一远程前置拉取路由：
+        /// 1. 对已知不在 GitHub Releases 挂预编译 `.zip` 的特殊单仓多模组库（如 `Pathoschild/StardewMods`、`spacechase0/StardewValleyMods`），
+        ///    直接走官方 CurseForge 公共 CDN (`api.cfwidget.com` -> `edge.forgecdn.net` / `mediafilez.forgecdn.net`) 免登录直拉最新发行包；
+        /// 2. 其余仓库优先走 GitHub Releases，若该仓库未挂预编译 `.zip` 且配置了 `CurseForgeSlug` 则自动兜底走 CurseForge CDN。
+        /// </summary>
+        private static (InstalledModInfo? Mod, string? Note) TryFetchRemotePrerequisite(
+            string uniqueIdOrRepo,
+            string? explicitGitHubRepo,
+            string? assetHint)
+        {
+            var known = KnownFrameworks.FirstOrDefault(k =>
+                k.UniqueId.Equals(uniqueIdOrRepo, StringComparison.OrdinalIgnoreCase) ||
+                k.Alias.Equals(uniqueIdOrRepo, StringComparison.OrdinalIgnoreCase));
+
+            bool isTagOnlyMonorepo = string.IsNullOrWhiteSpace(explicitGitHubRepo) &&
+                !string.IsNullOrEmpty(known.GitHubRepo) &&
+                TagOnlyGitHubMonorepos.Contains(known.GitHubRepo!);
+
+            if (isTagOnlyMonorepo && !string.IsNullOrEmpty(known.CurseForgeSlug))
+            {
+                var cfRes = TryFetchFromCurseForgeCdn(known.CurseForgeSlug!, known.UniqueId);
+                if (cfRes.Mod != null)
+                    return cfRes;
+            }
+
+            var ghRes = TryFetchFromGitHubReleases(uniqueIdOrRepo, explicitGitHubRepo, assetHint);
+            if (ghRes.Mod != null)
+                return ghRes;
+
+            if (!isTagOnlyMonorepo && !string.IsNullOrEmpty(known.CurseForgeSlug))
+            {
+                var cfFallback = TryFetchFromCurseForgeCdn(known.CurseForgeSlug!, known.UniqueId);
+                if (cfFallback.Mod != null)
+                    return cfFallback;
+            }
+
+            return ghRes;
+        }
+
+        private static (InstalledModInfo? Mod, string? Note) TryFetchFromCurseForgeCdn(string cfSlug, string expectedUniqueId)
+        {
+            try
+            {
+                using var http = CreateGitHubHttpClient();
+                string metaUrl = $"https://api.cfwidget.com/stardewvalley/mods/{cfSlug}";
+                var metaResp = http.GetAsync(metaUrl).GetAwaiter().GetResult();
+                if (!metaResp.IsSuccessStatusCode)
+                    return (null, $"CurseForge metadata lookup for `{cfSlug}` returned HTTP {(int)metaResp.StatusCode}.");
+
+                string metaJson = metaResp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                using var doc = JsonDocument.Parse(metaJson);
+                if (!doc.RootElement.TryGetProperty("download", out var dlEl) || dlEl.ValueKind != JsonValueKind.Object)
+                    return (null, $"CurseForge metadata for `{cfSlug}` did not include a latest `download` entry.");
+
+                int fileId = dlEl.TryGetProperty("id", out var idEl) && idEl.TryGetInt32(out int parsedId) ? parsedId : 0;
+                string? fileName = GetString(dlEl, "name");
+                if (fileId <= 0 || string.IsNullOrWhiteSpace(fileName))
+                    return (null, $"Invalid file descriptor in CurseForge metadata for `{cfSlug}`.");
+
+                int hi = fileId / 1000;
+                int lo = fileId % 1000;
+                string escapedName = Uri.EscapeDataString(fileName!);
+                string[] cdnUrls =
+                {
+                    $"https://edge.forgecdn.net/files/{hi}/{lo}/{escapedName}",
+                    $"https://mediafilez.forgecdn.net/files/{hi}/{lo}/{escapedName}"
+                };
+
+                byte[]? zipBytes = null;
+                string? usedUrl = null;
+                foreach (var url in cdnUrls)
+                {
+                    try
+                    {
+                        var dlResp = http.GetAsync(url).GetAwaiter().GetResult();
+                        if (dlResp.IsSuccessStatusCode)
+                        {
+                            zipBytes = dlResp.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+                            usedUrl = url;
+                            break;
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                if (zipBytes == null || zipBytes.Length == 0)
+                    return (null, $"Failed to download `{fileName}` (id={fileId}) from CurseForge CDN.");
+
+                Directory.CreateDirectory(DepsCacheRoot);
+                string tempZip = Path.Combine(Path.GetTempPath(), $"sdv-cf-{Guid.NewGuid():N}.zip");
+                string extractTemp = Path.Combine(Path.GetTempPath(), $"sdv-cf-ext-{Guid.NewGuid():N}");
+                try
+                {
+                    File.WriteAllBytes(tempZip, zipBytes);
+                    ZipFile.ExtractToDirectory(tempZip, extractTemp);
+
+                    var manifests = Directory.GetFiles(extractTemp, "manifest.json", SearchOption.AllDirectories);
+                    InstalledModInfo? primary = null;
+                    foreach (var mf in manifests)
+                    {
+                        var parsed = ParseManifestFile(mf, "deps-cache");
+                        if (parsed == null)
+                            continue;
+
+                        string dstDir = Path.Combine(DepsCacheRoot, SanitizeFolderName(parsed.UniqueId));
+                        if (Directory.Exists(dstDir))
+                            Directory.Delete(dstDir, recursive: true);
+                        CopyDirectoryAll(Path.GetDirectoryName(mf)!, dstDir);
+
+                        var cachedInfo = ParseManifestFile(Path.Combine(dstDir, "manifest.json"), "deps-cache");
+                        if (cachedInfo != null && (primary == null || cachedInfo.UniqueId.Equals(expectedUniqueId, StringComparison.OrdinalIgnoreCase)))
+                            primary = cachedInfo;
+                    }
+
+                    if (primary != null)
+                        return (primary, $"Downloaded `{fileName}` via CurseForge CDN (`{cfSlug}`) -> `{primary.UniqueId}` v{primary.Version} ({usedUrl}).");
+
+                    return (null, $"Downloaded `{fileName}` (`{cfSlug}`), but no valid `manifest.json` was found inside.");
+                }
+                finally
+                {
+                    try { if (File.Exists(tempZip)) File.Delete(tempZip); } catch { }
+                    try { if (Directory.Exists(extractTemp)) Directory.Delete(extractTemp, recursive: true); } catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                return (null, $"CurseForge CDN download failed for `{cfSlug}`: {ex.Message}");
+            }
         }
 
         private static (InstalledModInfo? Mod, string? Note) TryFetchFromGitHubReleases(

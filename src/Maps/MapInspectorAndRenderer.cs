@@ -22,7 +22,7 @@ namespace SdvKb.Maps
         {
             string? resolved = TmxMap.ResolveTilesheetPngPath(sheetQuery, Directory.GetCurrentDirectory(), gamePath);
             if (resolved == null || !File.Exists(resolved))
-                throw new FileNotFoundException($"Could not locate tilesheet PNG for `{sheetQuery}` locally or in `{Path.Combine(gamePath, "Content (unpacked)")}`.");
+                throw new FileNotFoundException($"Could not locate tilesheet `{sheetQuery}` locally, in `Content (unpacked)`, or in `{Path.Combine(gamePath, "Content")}` (.xnb).");
 
             using var srcBmp = LoadBitmapZeroLock(resolved);
             int cols = srcBmp.Width / tileSize;

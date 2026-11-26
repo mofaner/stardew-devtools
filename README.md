@@ -59,8 +59,8 @@ sdv-dev pack .\MyShaderMod
 - `.fx` 着色器 HLSL 语法、OpenGL `ps_3_0`/`vs_3_0` MojoShader 兼容性与漏编 `.mgfxo` 提醒；
 - C# `[HarmonyPatch]` 目标存在性、重载歧义、`Prefix`/`Postfix` 返回值与注入参数类型/`ref` 匹配、MonoGame/SMAPI 渲染坑（`Rendered*` 内重复 `SpriteBatch.Begin` 崩溃、每帧无缓存 `new Texture2D/RenderTarget2D` 显存泄漏、离屏 `SetRenderTarget` 未还原、非预乘 `new Color(r,g,b,a)` 泛白），以及分屏静态字段隐患。
 
-### 3. 离线地图与贴图预览
-不用启动游戏，直接在命令行切分校验精灵图、拼装 `.tmx` 地图，或把 Content Patcher 的 `EditMap` 补丁叠到原版地图上秒出局部预览图：
+### 3. 离线地图与贴图预览（支持免解包直读原版 `.xnb`）
+不用启动游戏，也无需预先运行 `StardewXnbHack` 解包 `Content (unpacked)`，直接在命令行按需提取原版 `.xnb` 贴图/地图、切分校验精灵图、拼装 `.tmx` 地图，或把 Content Patcher 的 `EditMap` 补丁叠到原版地图上秒出局部预览图：
 ```powershell
 sdv-dev sprite assets/portrait.png --preset portrait --out portrait_check.png
 sdv-dev map-autotile --spec terrain.txt --out assets/IslandBay.tmx --theme island
@@ -86,6 +86,9 @@ sdv-dev world --advance-days 7
 sdv-dev checkpoint save ready_to_harvest       # 存快照，改完代码重启也能 1 秒回档反复测收获
 sdv-dev interact --right-click 65,16
 sdv-dev ui-click --response 0                  # 秒点问答选项（自动跳过 750ms 保护锁）
+sdv-dev input --hold W --ticks 30              # 无焦点真实按帧走动/冲刺/蓄力（兼容 --background 后台窗口！）
+sdv-dev input --move 350,230 --ticks 4         # 注入虚拟鼠标悬停，直接抓回自定义菜单 hoverText Tooltip
+sdv-dev input --gamepad DPadDown,DPadRight     # 逐拍模拟手柄方向键，验证菜单 neighborID 焦点跳转轨迹
 sdv-dev screenshot --mode screen --ui-overlay --out menu_debug.png
 sdv-dev schedule-check Abigail --key spring    # 实机跑原版寻路校验 NPC 全天日程是否可达
 sdv-dev harmony StardewValley.Object:performObjectDropInAction --il
@@ -112,5 +115,5 @@ sdv-dev stop
 .\build.ps1                        # 编译并安装到本机 ~/.local/bin
 .\tests\run-all.ps1                # 运行离线全量回归测试
 .\tests\run-all.ps1 -IncludeLive   # 额外启动隔离测试档运行实机端到端验收
-.\pack-release.ps1 -Version v1.1.0 # 生成 releases/*.zip 发布包
+.\pack-release.ps1 -Version <版本号> # 自动同步全仓版本号并生成 releases/*.zip 发布包
 ```

@@ -1,12 +1,35 @@
 ﻿param(
-    [string]$Version = 'v1.1.0',
+    [string]$Version = '',
     [switch]$SkipBuild
 )
 
 $ErrorActionPreference = 'Stop'
 
+$propsPath = Join-Path $PSScriptRoot 'Directory.Build.props'
+$bridgeManifestPath = Join-Path $PSScriptRoot 'bridge\manifest.json'
+
+# 单一版本源：传入 -Version 时自动同步 Directory.Build.props 与 bridge/manifest.json；未传时自动读取 Directory.Build.props
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $propsXml = [xml](Get-Content -LiteralPath $propsPath -Raw)
+    $verNum = ($propsXml.Project.PropertyGroup.Version | Select-Object -First 1).Trim()
+    $Version = "v$($verNum.TrimStart('v','V'))"
+} else {
+    $verNum = $Version.Trim().TrimStart('v', 'V')
+    $Version = "v$verNum"
+    $propsRaw = [System.IO.File]::ReadAllText($propsPath, [System.Text.Encoding]::UTF8)
+    $propsUpdated = [regex]::Replace($propsRaw, '<Version>[^<]+</Version>', "<Version>$verNum</Version>")
+    if ($propsUpdated -ne $propsRaw) {
+        [System.IO.File]::WriteAllText($propsPath, $propsUpdated, [System.Text.UTF8Encoding]::new($false))
+    }
+    $mfRaw = [System.IO.File]::ReadAllText($bridgeManifestPath, [System.Text.Encoding]::UTF8)
+    $mfUpdated = [regex]::Replace($mfRaw, '"Version"\s*:\s*"[^"]+"', "`"Version`": `"$verNum`"")
+    if ($mfUpdated -ne $mfRaw) {
+        [System.IO.File]::WriteAllText($bridgeManifestPath, $mfUpdated, [System.Text.UTF8Encoding]::new($false))
+    }
+}
+
 if (-not $SkipBuild) {
-    & (Join-Path $PSScriptRoot 'build.ps1') -SkipInstall
+    & (Join-Path $PSScriptRoot 'build.ps1')
 }
 
 $distDir = Join-Path $PSScriptRoot 'dist'

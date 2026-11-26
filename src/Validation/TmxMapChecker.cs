@@ -181,12 +181,13 @@ namespace SdvKb.Validation
                 string? pngPath = TmxMap.ResolveTilesheetPngPath(ts.ImageSource, tmxDir, gamePath);
                 if (pngPath == null || !File.Exists(pngPath))
                 {
-                    bool hasUnpacked = !string.IsNullOrWhiteSpace(gamePath) && Directory.Exists(Path.Combine(gamePath, "Content (unpacked)"));
+                    bool hasGameContent = !string.IsNullOrWhiteSpace(gamePath) &&
+                        (Directory.Exists(Path.Combine(gamePath, "Content")) || Directory.Exists(Path.Combine(gamePath, "Content (unpacked)")));
                     issues.Add(new ValidationIssue
                     {
-                        Severity = hasUnpacked ? "ERROR" : "WARN",
+                        Severity = hasGameContent ? "ERROR" : "WARN",
                         File = sheetLabel,
-                        Message = $"Tilesheet image `{ts.ImageSource}` could not be resolved locally or in `Content (unpacked)`."
+                        Message = $"Tilesheet image `{ts.ImageSource}` could not be resolved locally or in game `Content` (.xnb / unpacked)."
                     });
                 }
                 else if (TryReadPngSizeZeroLock(pngPath, out int actualW, out int actualH))

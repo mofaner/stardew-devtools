@@ -99,7 +99,7 @@ namespace SdvKb.Maps
             "Door", "MagicWarp", "Warp"
         };
 
-        private static readonly Dictionary<string, string> LocationNameToMapFile = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        internal static readonly Dictionary<string, string> LocationNameToMapFile = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
             ["IslandSouth"] = "Island_S",
             ["IslandWest"] = "Island_W",
@@ -161,7 +161,12 @@ namespace SdvKb.Maps
                     return found;
             }
 
-            throw new FileNotFoundException($"Could not locate .tmx map for `{mapOrAsset}` locally or in `{unpackedMaps}`.");
+            // 无 `Content (unpacked)` 时，直接按需从 `<GamePath>\Content\Maps\*.xnb` 解包转换并缓存为 `.tmx`！
+            string? extractedTmx = XnbOnDemandExtractor.ResolveOrExtractMapTmx(mapOrAsset, gamePath);
+            if (extractedTmx != null && File.Exists(extractedTmx))
+                return extractedTmx;
+
+            throw new FileNotFoundException($"Could not locate map `{mapOrAsset}` locally, in `{unpackedMaps}`, or in `{Path.Combine(gamePath, "Content", "Maps")}`.");
         }
 
         public static string? ResolveTilesheetPngPath(string imageSource, string? tmxDirectory, string gamePath, string? seasonOverride = null)
@@ -232,7 +237,8 @@ namespace SdvKb.Maps
                     return ci;
             }
 
-            return null;
+            // 无 `Content (unpacked)` 时，直接按需从 `<GamePath>\Content\*.xnb` 解包提取并缓存为 `.png`！
+            return XnbOnDemandExtractor.ResolveOrExtractTexturePng(imageSource, gamePath, seasonOverride);
         }
 
         public static TmxMap Load(string tmxFilePath)

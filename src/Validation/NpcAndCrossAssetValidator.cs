@@ -1003,9 +1003,13 @@ namespace SdvKb.Validation
             }
             else if (!string.IsNullOrWhiteSpace(ctx.GamePath))
             {
-                string unpacked = Path.Combine(ctx.GamePath!, "Content (unpacked)", "Maps", locationName + ".tmx");
-                if (File.Exists(unpacked))
-                    tmxPath = unpacked;
+                try
+                {
+                    string resolvedMap = TmxMap.ResolveMapFilePath(locationName, ctx.GamePath!);
+                    if (File.Exists(resolvedMap))
+                        tmxPath = resolvedMap;
+                }
+                catch { }
             }
 
             if (tmxPath == null)
@@ -1083,7 +1087,15 @@ namespace SdvKb.Validation
             {
                 string unpackedPng = Path.Combine(ctx.GamePath!, "Content (unpacked)", "Portraits", npcName + ".png");
                 if (TryGetPngSize(unpackedPng, out int vw, out int vh))
+                {
                     size = (vw, vh);
+                }
+                else
+                {
+                    string? xnbPng = XnbOnDemandExtractor.ResolveOrExtractTexturePng($"Portraits/{npcName}", ctx.GamePath!);
+                    if (xnbPng != null && TryGetPngSize(xnbPng, out int xw, out int xh))
+                        size = (xw, xh);
+                }
             }
 
             if (size == null)

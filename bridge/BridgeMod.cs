@@ -429,6 +429,11 @@ namespace SdvDevBridge
                 TickMultiFrameCapture();
             }
 
+            if (ActiveInputSimInstance != null && Context.ScreenId == 0)
+            {
+                TickInputSimulation();
+            }
+
             // Tick-driven authentic multi-day overnight progression (`sdv-dev world --advance-days N`)
             if (_activeDayAdvanceJob != null && Context.ScreenId == 0)
             {
@@ -537,6 +542,11 @@ namespace SdvDevBridge
             if (_activeMultiFrameCapture != null && Context.ScreenId == 0 && _activeMultiFrameCapture.ReadyForRenderCapture)
             {
                 CaptureMultiFrameStepOnRendered();
+            }
+
+            if (ActiveInputSimInstance != null && Context.ScreenId == 0 && ActiveInputSimInstance.WaitingForFinalRender)
+            {
+                CaptureInputSimScreenshotOnRendered();
             }
         }
 
@@ -818,6 +828,8 @@ namespace SdvDevBridge
                     return HandleModConfig(req);
                 case "screenshot_advanced":
                     return StartMultiFrameCapture(req, tcs);
+                case "input_simulate":
+                    return StartInputSimulation(req, tcs);
                 case "self_restart":
                     return HandleSelfRestart(req);
                 case "load_save":

@@ -51,7 +51,7 @@ namespace SdvKb.Maps
         {
             string? resolved = ResolveSpritePngPath(targetQuery, gamePath);
             if (resolved == null || !File.Exists(resolved))
-                throw new FileNotFoundException($"Could not locate PNG `{targetQuery}` locally or in `{Path.Combine(gamePath, "Content (unpacked)")}`.");
+                throw new FileNotFoundException($"Could not locate texture `{targetQuery}` locally, in `Content (unpacked)`, or in `{Path.Combine(gamePath, "Content")}` (.xnb).");
 
             using var bmp = LoadBitmapUnlocked(resolved);
             string preset = DeterminePreset(resolved, targetQuery, bmp.Width, bmp.Height, presetRaw, explicitCellSize, out int cellW, out int cellH);

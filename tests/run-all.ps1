@@ -419,7 +419,45 @@ WWWWWW
     Assert-True ($rectLineCount -lt 120) "map-inspect --rect stayed compact ($rectLineCount lines < 120, vs old 1446 lines)"
     Assert-Contains $rectInsp.Text '"referencedTilesheets"' "map-inspect --rect listed only referenced tilesheets"
     Assert-Contains $rectInsp.Text '"passabilityMask"' "map-inspect --rect included passabilityMask"
-    Pass-Step "Offline map-autotile + @island-palm + CP EditMap overlay & compact map-inspect --rect ($rectLineCount lines)"
+
+    # Simulate a pure beginner PC that ONLY has `Content\*.xnb` + `MonoGame.Framework.dll` (ZERO `Content (unpacked)` folder!)
+    $realGameDir = "D:\steam\steamapps\common\Stardew Valley"
+    $cleanBeginnerGame = Join-Path $workRoot "CleanBeginnerStardew"
+    New-Item -ItemType Directory -Path (Join-Path $cleanBeginnerGame "Content\Maps") -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $cleanBeginnerGame "Content\Portraits") -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $realGameDir "MonoGame.Framework.dll") -Destination (Join-Path $cleanBeginnerGame "MonoGame.Framework.dll") -Force
+    foreach ($xnbRel in @("Maps\BusStop.xnb", "Maps\spring_outdoorsTileSheet.xnb", "Maps\paths.xnb", "Portraits\Abigail.xnb")) {
+        Copy-Item -LiteralPath (Join-Path $realGameDir "Content\$xnbRel") -Destination (Join-Path $cleanBeginnerGame "Content\$xnbRel") -Force
+    }
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $cleanBeginnerGame "Content (unpacked)"))) "CleanBeginnerStardew has NO Content (unpacked) directory"
+
+    $xnbSpriteOut = Join-Path $workRoot "xnb_abigail_portrait.png"
+    $xnbSp = Invoke-SdvRaw @('sprite', 'Portraits/Abigail', '--preset', 'portrait', '--game-path', $cleanBeginnerGame, '--out', $xnbSpriteOut)
+    Assert-True ($xnbSp.Code -eq 0) "On-demand .xnb portrait sprite extraction succeeded without Content (unpacked): $($xnbSp.Text)"
+    Assert-Contains $xnbSp.Text "xnb-cache" "Resolved Abigail portrait directly from on-demand xnb-cache"
+    Assert-True (Test-Path -LiteralPath $xnbSpriteOut) "Rendered XNB portrait inspection PNG"
+
+    $xnbMapInsp = Invoke-SdvRaw @('map-inspect', 'Maps/BusStop', '--rect', '10,8,8,6', '--game-path', $cleanBeginnerGame)
+    Assert-True ($xnbMapInsp.Code -eq 0) "On-demand .xnb map-inspect BusStop succeeded without Content (unpacked): $($xnbMapInsp.Text)"
+    Assert-Contains $xnbMapInsp.Text "xnb-cache" "Extracted BusStop.xnb (tBIN10 -> .tmx) on demand"
+
+    $xnbMapPng = Join-Path $workRoot "xnb_busstop_render.png"
+    $xnbMapRen = Invoke-SdvRaw @('map-render', 'Maps/BusStop', '--rect', '8,6,14,10', '--debug-overlay', '--game-path', $cleanBeginnerGame, '--out', $xnbMapPng)
+    Assert-True ($xnbMapRen.Code -eq 0) "On-demand .xnb map-render BusStop (map + tilesheets) succeeded without Content (unpacked): $($xnbMapRen.Text)"
+    Assert-True (Test-Path -LiteralPath $xnbMapPng) "Rendered XNB BusStop map PNG"
+
+    # Also verify special-repo CurseForge CDN auto-pull + soft-GMCM auto-detection when `<GamePath>\Mods` does NOT exist!
+    $depsCacheGmcm = Join-Path $HOME ".local\share\sdv-dev\deps-cache\spacechase0.GenericModConfigMenu"
+    if (Test-Path -LiteralPath $depsCacheGmcm) {
+        Remove-Item -LiteralPath $depsCacheGmcm -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $gmcmDepsCheck = Invoke-SdvRaw @('deps', '--project', $gmcmMod, '--game-path', $cleanBeginnerGame)
+    Assert-True ($gmcmDepsCheck.Code -eq 0) "Soft-GMCM auto-detection + CurseForge CDN fetch succeeded on empty Mods: $($gmcmDepsCheck.Text)"
+    Assert-Contains $gmcmDepsCheck.Text "spacechase0.GenericModConfigMenu" "Detected soft GMCM dependency & fetched via CurseForge CDN"
+    $cpDepsCheck = Invoke-SdvRaw @('deps', '--project', $cpMapDir, '--game-path', $cleanBeginnerGame)
+    Assert-True ($cpDepsCheck.Code -eq 0) "Content Patcher special-repo resolution succeeded on empty Mods: $($cpDepsCheck.Text)"
+    Assert-Contains $cpDepsCheck.Text "Pathoschild.ContentPatcher" "Resolved Pathoschild.ContentPatcher without local Mods"
+    Pass-Step "Offline map-autotile, CP EditMap, zero-unpacked .xnb extraction, & empty-Mods CP/GMCM auto-pull"
 
     # ------------------------------------------------------------------
     # 6b. Expanded API/Decompile (--grep, MonoGame, xTile, SModHooks),
@@ -639,6 +677,7 @@ namespace LiveProbeMod
 
     public sealed class TestNavMenu : IClickableMenu
     {
+        public string hoverText = "";
         public ClickableComponent BtnTop;
         public ClickableComponent BtnBottom;
         public ClickableComponent BtnRightBroken;
@@ -665,6 +704,23 @@ namespace LiveProbeMod
             populateClickableComponentList();
         }
 
+        public override void snapToDefaultClickableComponent()
+        {
+            currentlySnappedComponent = getComponentWithID(101);
+            snapCursorToCurrentSnappedComponent();
+        }
+
+        public override void performHoverAction(int x, int y)
+        {
+            base.performHoverAction(x, y);
+            if (BtnTop.containsPoint(x, y))
+                hoverText = "Tooltip: 祈福上按钮 #101";
+            else if (BtnBottom.containsPoint(x, y))
+                hoverText = "Tooltip: 祈福下按钮 #102";
+            else
+                hoverText = "";
+        }
+
         public override void draw(SpriteBatch b)
         {
             IClickableMenu.drawTextureBox(b, xPositionOnScreen, yPositionOnScreen, width, height, Color.White);
@@ -674,6 +730,8 @@ namespace LiveProbeMod
             b.DrawString(Game1.dialogueFont, "Top #101", new Vector2(BtnTop.bounds.X + 16, BtnTop.bounds.Y + 12), Color.Black);
             b.DrawString(Game1.dialogueFont, "Bot #102", new Vector2(BtnBottom.bounds.X + 16, BtnBottom.bounds.Y + 12), Color.Black);
             b.DrawString(Game1.dialogueFont, "Bad #103", new Vector2(BtnRightBroken.bounds.X + 16, BtnRightBroken.bounds.Y + 12), Color.DarkRed);
+            if (!string.IsNullOrEmpty(hoverText))
+                IClickableMenu.drawHoverText(b, hoverText, Game1.smallFont);
             base.draw(b);
             drawMouse(b);
         }
@@ -794,8 +852,32 @@ namespace LiveProbeMod
         Assert-True ($shotRes.Code -eq 0) "screenshot --ui-overlay succeeded: $($shotRes.Text)"
         Assert-Contains $shotRes.Text '"brokenNeighborLinks": 1' "UI overlay detected intentional dangling neighbor ID 999"
         Assert-True (Test-Path -LiteralPath $uiShotPng) "UI overlay PNG written"
+
+        # 7b2. Focus-free virtual mouse hover Tooltip + real Gamepad D-Pad neighborID focus trail inside `--background` window!
+        $hoverRes = Invoke-SdvRaw @('input', '--move', '350,232', '--ticks', '4')
+        Assert-True ($hoverRes.Code -eq 0) "sdv-dev input --move succeeded: $($hoverRes.Text)"
+        Assert-Contains $hoverRes.Text '祈福上按钮 #101' "Virtual mouse hover triggered performHoverAction & captured custom hoverText Tooltip"
+
+        $padRes = Invoke-SdvRaw @('input', '--gamepad', 'DPadDown,DPadUp,DPadRight', '--interval-ticks', '3')
+        Assert-True ($padRes.Code -eq 0) "sdv-dev input --gamepad succeeded: $($padRes.Text)"
+        Assert-Contains $padRes.Text '#102' "Gamepad DPadDown moved focus to #102"
+        Assert-Contains $padRes.Text '#103' "Gamepad DPadUp -> DPadRight moved focus to #103"
         $null = Invoke-SdvRaw @('ui-click', '--close')
-        Pass-Step "Custom IClickableMenu screenshot --ui-overlay & broken neighbor detection"
+
+        # Real WASD physical walking + Copper Hoe long-press tool charging (`maxToolPowerReached >= 1`) without window focus!
+        $null = Invoke-SdvRaw @('warp', 'Farm', '60', '16')
+        $walkRes = Invoke-SdvRaw @('input', '--hold', 'D', '--ticks', '18')
+        Assert-True ($walkRes.Code -eq 0) "sdv-dev input --hold D walking succeeded: $($walkRes.Text)"
+        $walkObj = $walkRes.Text | ConvertFrom-Json
+        Assert-True ([double]$walkObj.player.movedPixels -gt 30) "Real WASD physics moved farmer $($walkObj.player.movedPixels) px in background window"
+        Assert-True ([int]$walkObj.player.facingAfter -eq 1) "Real WASD set farmer facing East (1)"
+
+        $null = Invoke-SdvRaw @('eval', 'var hoe = Player.Items.OfType<StardewValley.Tools.Hoe>().First(); hoe.UpgradeLevel = 2; Player.CurrentToolIndex = Player.Items.IndexOf(hoe); Player.Stamina = 270f; return hoe.UpgradeLevel;')
+        $chargeRes = Invoke-SdvRaw @('input', '--hold', 'C', '--ticks', '50')
+        Assert-True ($chargeRes.Code -eq 0) "sdv-dev input --hold C tool charge succeeded: $($chargeRes.Text)"
+        $chargeObj = $chargeRes.Text | ConvertFrom-Json
+        Assert-True ([int]$chargeObj.player.maxToolPowerReached -ge 1) "Real C hold charged Steel Hoe to toolPower=$($chargeObj.player.maxToolPowerReached) in background window"
+        Pass-Step "Custom IClickableMenu --ui-overlay + focus-free input (hover Tooltip, Gamepad focus trail, WASD walk, & tool charge)"
 
         # 7c. `profile` capturing SMAPI 4.5.2 ManagedEvent callbacks + Harmony patches!
         $profRes = Invoke-SdvRaw @('profile', '--seconds', '2', '--top', '8')
