@@ -149,13 +149,8 @@ namespace SdvDevClient
                 }
             }
 
-            // If no persistent daemon is running yet and user invoked slow `start`/`restart`, run directly
-            if (first == "start" || first == "restart")
-            {
-                return RunWorkerDirect(workerExe, args);
-            }
-
-            // No daemon alive: spawn background auto-idle daemon and connect immediately
+            // No daemon alive: spawn background auto-idle daemon (attempting CREATE_BREAKAWAY_FROM_JOB so even
+            // `start`/`restart` run inside a job-detached warm daemon when the parent Job permits breakaway!)
             if (SpawnBackgroundDaemon(workerExe))
             {
                 var sw = Stopwatch.StartNew();
@@ -455,22 +450,42 @@ namespace SdvDevClient
             {
                 const uint CREATE_NO_WINDOW = 0x08000000;
                 const uint CREATE_NEW_PROCESS_GROUP = 0x00000200;
+                const uint CREATE_BREAKAWAY_FROM_JOB = 0x01000000;
+                const int ERROR_ACCESS_DENIED = 5;
 
                 var si = new STARTUPINFO { cb = Marshal.SizeOf<STARTUPINFO>() };
                 var cmdLine = new StringBuilder($"{QuoteWindowsArg(workerExe)} --daemon");
                 string? workDir = Path.GetDirectoryName(workerExe);
+                uint baseFlags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
 
+                // 优先尝试脱离当前临时命令行作业组，防止同步命令结束时后台守护进程与游戏被宿主连坐回收；无权限时自动回退
                 bool ok = CreateProcessW(
                     workerExe,
                     cmdLine,
                     IntPtr.Zero,
                     IntPtr.Zero,
                     bInheritHandles: false,
-                    dwCreationFlags: CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+                    dwCreationFlags: baseFlags | CREATE_BREAKAWAY_FROM_JOB,
                     IntPtr.Zero,
                     workDir,
                     ref si,
                     out var pi);
+
+                if (!ok && Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED)
+                {
+                    cmdLine = new StringBuilder($"{QuoteWindowsArg(workerExe)} --daemon");
+                    ok = CreateProcessW(
+                        workerExe,
+                        cmdLine,
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        bInheritHandles: false,
+                        dwCreationFlags: baseFlags,
+                        IntPtr.Zero,
+                        workDir,
+                        ref si,
+                        out pi);
+                }
 
                 if (ok)
                 {

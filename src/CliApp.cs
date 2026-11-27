@@ -26,6 +26,15 @@ namespace SdvKb
                 return 0;
             }
 
+            if (string.Equals(args[0], "-v", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(args[0], "--version", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(args[0], "version", StringComparison.OrdinalIgnoreCase))
+            {
+                string ver = typeof(CliApp).Assembly.GetName().Version?.ToString(3) ?? "1.3.0";
+                Console.WriteLine($"sdv-dev {ver}");
+                return 0;
+            }
+
             string cmd = args[0].ToLowerInvariant();
             string[] rest = args.Skip(1).ToArray();
 
@@ -77,6 +86,7 @@ namespace SdvKb
 
                 // Live In-Game Automated Testing, Asset/Harmony Inspection & Multiplayer Closed Loop
                 "live" or "game-status" => RunLiveStatus(),
+                "window" or "win" => RunWindowControl(rest),
                 "saves" => RunSaves(),
                 "start" => RunStart(rest),
                 "restart" => RunRestart(rest),
@@ -727,6 +737,8 @@ namespace SdvKb
         private static int RunBuild(string[] args)
         {
             bool deploy = HasFlag(args, "--deploy", "-d");
+            bool deployBoth = HasFlag(args, "--both", "--all-mods");
+            bool singleTargetOnly = HasFlag(args, "--single-target");
             bool noPublicize = HasFlag(args, "--no-publicize");
             string? explicitModsRoot = GetOption(args, "--mods-path");
             string modPath = GetOption(args, "--project", "-p") ?? GetPositionalQuery(args, "--project", "-p", "--game-path", "-g", "--mods-path");
@@ -734,14 +746,65 @@ namespace SdvKb
                 modPath = Directory.GetCurrentDirectory();
 
             var cfg = KbConfig.Load(GetOption(args, "--game-path", "-g"));
-            string? targetModsRoot = explicitModsRoot ?? (deploy ? LiveGameController.GetActiveModsRoot(cfg.GamePath) : null);
+
+            string? targetModsRoot = explicitModsRoot;
+            var extraDeployRoots = new List<string>();
+
+            if (deploy)
+            {
+                string fullModDir = Path.GetFullPath(modPath);
+                string mf = Path.Combine(fullModDir, "manifest.json");
+                string? uid = File.Exists(mf) ? ModDependencyResolver.ParseManifestFile(mf)?.UniqueId : null;
+                string fallbackFolder = Path.GetFileName(fullModDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+
+                string gameModsDir = Path.Combine(cfg.GamePath, "Mods");
+                string isoModsDir = ModDependencyResolver.DefaultIsolatedModsRoot;
+                string activeModsDir = LiveGameController.GetActiveModsRoot(cfg.GamePath);
+
+                if (!string.IsNullOrWhiteSpace(explicitModsRoot))
+                {
+                    targetModsRoot = explicitModsRoot;
+                    if (deployBoth)
+                    {
+                        extraDeployRoots.Add(gameModsDir);
+                        extraDeployRoots.Add(isoModsDir);
+                    }
+                }
+                else if (singleTargetOnly)
+                {
+                    targetModsRoot = activeModsDir;
+                }
+                else
+                {
+                    // 智能双端同步：
+                    // 1. 始终刷入当前活跃目录 `activeModsDir`（无隔离游戏运行时即真实 `GamePath\Mods`）；
+                    // 2. 若传了 `--both`，或另一端目录（真实 `Mods` / `isolated-mods`）已存在该模组目录，自动把另一端也无锁增量同步，
+                    //    既免去手写 `Copy-Item` 双边拷 `dll`/`assets`/`i18n`，又不会把纯临时隔离测试模组污染进玩家真实 `Mods\`！
+                    targetModsRoot = activeModsDir;
+
+                    bool activeIsIso = !Path.GetFullPath(activeModsDir).TrimEnd('\\', '/')
+                        .Equals(Path.GetFullPath(gameModsDir).TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase);
+
+                    if (activeIsIso)
+                    {
+                        if (deployBoth || (!string.IsNullOrWhiteSpace(uid) && DotNet6ModCompiler.ModsRootContainsMod(gameModsDir, uid!, fallbackFolder)))
+                            extraDeployRoots.Add(gameModsDir);
+                    }
+                    else
+                    {
+                        if (deployBoth || (!string.IsNullOrWhiteSpace(uid) && DotNet6ModCompiler.ModsRootContainsMod(isoModsDir, uid!, fallbackFolder)))
+                            extraDeployRoots.Add(isoModsDir);
+                    }
+                }
+            }
 
             var res = DotNet6ModCompiler.BuildAndOptionallyDeploy(
                 modPath,
                 cfg.GamePath,
                 deploy,
                 targetModsRoot,
-                publicize: !noPublicize);
+                publicize: !noPublicize,
+                additionalDeployRoots: extraDeployRoots);
             PrintJson(res);
             return res.Success ? 0 : 1;
         }
@@ -1112,6 +1175,7 @@ namespace SdvKb
             bool testWorld = HasFlag(args, "--test-world", "--new-test-save");
             bool resetTestWorld = HasFlag(args, "--reset-test-world");
             bool background = HasFlag(args, "--background", "--no-window", "--headless") && !HasFlag(args, "--visible");
+            bool hideConsole = HasFlag(args, "--no-console", "--hide-console") && !HasFlag(args, "--show-console");
             bool noFocus = HasFlag(args, "--no-focus");
             int timeout = GetIntOption(args, "--timeout", "-t", defaultValue: 65);
 
@@ -1127,8 +1191,43 @@ namespace SdvKb
                 extraWithMods: extraMods,
                 resetTestWorld: resetTestWorld,
                 background: background,
-                noFocus: noFocus);
+                noFocus: noFocus,
+                hideConsole: hideConsole);
             Console.WriteLine(json);
+            return 0;
+        }
+
+        private static int RunWindowControl(string[] args)
+        {
+            string[] valOpts = Array.Empty<string>();
+            EnsureCommandOptions(
+                "window",
+                args,
+                valOpts,
+                "--show", "--visible", "--background", "--hide", "--no-window",
+                "--no-console", "--hide-console", "--show-console", "--focus", "--no-focus");
+
+            string? mode = null;
+            if (HasFlag(args, "--background", "--hide", "--no-window"))
+                mode = "background";
+            else if (HasFlag(args, "--show", "--visible"))
+                mode = "show";
+
+            bool? hideConsole = null;
+            if (HasFlag(args, "--no-console", "--hide-console"))
+                hideConsole = true;
+            else if (HasFlag(args, "--show-console"))
+                hideConsole = false;
+
+            bool focus = HasFlag(args, "--focus") && !HasFlag(args, "--no-focus");
+
+            Console.WriteLine(BridgeClient.SendRequired(new
+            {
+                action = "window_control",
+                mode,
+                hideConsole,
+                focus
+            }));
             return 0;
         }
 
@@ -1150,6 +1249,9 @@ namespace SdvKb
             bool? bgOverride = HasFlag(args, "--background", "--no-window", "--headless")
                 ? true
                 : (sameDesktop ? false : (bool?)null);
+            bool? hideConsoleOverride = HasFlag(args, "--no-console", "--hide-console")
+                ? true
+                : (HasFlag(args, "--show-console") ? false : (bool?)null);
             int timeout = GetIntOption(args, "--timeout", "-t", defaultValue: 65);
 
             var extraMods = ParseCsvList(withModsRaw);
@@ -1168,7 +1270,8 @@ namespace SdvKb
                 resetTestWorld: resetTestWorld,
                 backgroundOverride: bgOverride,
                 sameDesktopExplicit: sameDesktop,
-                noFocus: noFocus);
+                noFocus: noFocus,
+                hideConsoleOverride: hideConsoleOverride);
             Console.WriteLine(json);
             return 0;
         }
@@ -1245,7 +1348,17 @@ namespace SdvKb
                 }
 
                 string activeModsRoot = LiveGameController.GetActiveModsRoot(cfg.GamePath);
-                deployedDir = DotNet6ModCompiler.DeployAssetsOnlyToModsRoot(fullProj, activeModsRoot, id ?? Path.GetFileName(fullProj));
+                string fallbackFolder = id ?? Path.GetFileName(fullProj);
+                deployedDir = DotNet6ModCompiler.DeployAssetsOnlyToModsRoot(fullProj, activeModsRoot, fallbackFolder);
+
+                // 同时把重编后的 `.mgfxo` / `assets/` / `i18n/` 增量同步到真实 `<GamePath>\Mods`（若当前跑在 isolated-mods 且真实 Mods 已安装该模组），免手写二次拷贝！
+                string realModsDir = Path.Combine(cfg.GamePath, "Mods");
+                if (!Path.GetFullPath(activeModsRoot).TrimEnd('\\', '/').Equals(Path.GetFullPath(realModsDir).TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase) &&
+                    !string.IsNullOrWhiteSpace(id) &&
+                    DotNet6ModCompiler.ModsRootContainsMod(realModsDir, id!, fallbackFolder))
+                {
+                    DotNet6ModCompiler.DeployAssetsOnlyToModsRoot(fullProj, realModsDir, fallbackFolder);
+                }
             }
 
             string[] assets = ParseCsvList(assetsRaw).ToArray();
@@ -2198,8 +2311,8 @@ OPTIONS:
   map-find-space              在实机（含 CP/SVE 合并后）扫描地图安全空地，自动避开水面/灌木/建筑/Warp 与 NPC 日程路线
 
 实机自动化控制、免重启调参、视觉对比/连拍、快照与性能探针:
-  live / saves                查看当前游戏进程、桥接状态、活跃 Mods 路径、是否隔离/后台模式、所处坐标，或列出本机存档
-  start                       启动 SMAPI（支持 `--isolated` 隔离秒开、`--test-world` 专属测试档、`--background` 无弹窗后台隐藏运行）
+  live / window / saves       查看进程与真实窗口可见性 (`windowVisible`/`desktopName`)、运行期秒切前后台/隐藏控制台 (`window`)、列出存档
+  start                       启动 SMAPI（`--isolated` 隔离秒开、`--no-console` 只显示游戏画面不弹黑框、`--background` 离屏隐藏运行）
   restart                     先 check+build（失败保留原进程），通过后无锁暂存热重启（支持 `--same-desktop` 无焦点原位刷新 / `--background`）
   reload / reload-assets      免重启热重载 CP 包，或对 C#/CP 模组自动重编 `.fx` 并 0.2s 热刷内存 `Effect` 着色器与地图贴图
   config                      免重启 0.05 秒实时读取/修改/重置模组配置（`--get [Key]` / `--set Key=Val` / `--reset`）
@@ -2352,6 +2465,8 @@ OPTIONS:
 
                 case "start":
                 case "restart":
+                case "window":
+                case "win":
                 case "reload":
                 case "live":
                 case "saves":
@@ -2362,17 +2477,18 @@ OPTIONS:
                 case "player":
                 case "cmd":
                 case "logs":
-                    Console.WriteLine(@"# sdv-dev 实机生命周期、模组隔离 (--isolated)、同桌面热重启与后台隐藏模式
+                    Console.WriteLine(@"# sdv-dev 实机生命周期、窗口前后台/无控制台控制、模组隔离 (--isolated) 与热重启
 
-启动、模组隔离与热迭代：
-  sdv-dev live                                                         查看进程、桥接状态、活跃 modsPath、是否隔离/后台模式与当前坐标
-  sdv-dev start --isolated [--project <dir>] [--with-mods A,B] [--background] [--no-focus] --test-world
-      使用 SMAPI `--mods-path` 隔离启动：仅加载 `_SdvDevBridge` + 目标模组 + 自动解析的全部传递前置模组（加 `--background` 则无打扰隐藏窗口运行）
-  sdv-dev start --test-world [--reset-test-world] [--background]
-      使用全量 `Mods` 启动并进入专属测试槽位 `SdvDevTest_999999999`（具备真实 CurrentSavePath，完美兼容 SVE / SpaceCore，绝不触碰个人存档）
-  sdv-dev restart --project <dir> [--isolated | --full-mods] [--same-desktop | --background] [--no-focus] --test-world
-      先执行 check+build（失败不关原游戏），通过后无锁暂存并在旧进程退出后自动替换 DLL；
-      在 `SdvDevTest_` 测试档可见窗口下（或显式加 `--same-desktop`）自动原位无焦点刷新，加 `--background` 则强制切为无弹窗离屏模式！
+启动、窗口模式与热迭代：
+  sdv-dev live                                                         查看进程、桥接状态、真实窗口可见性 (`windowVisible`/`consoleVisible`/`desktopName`) 与坐标
+  sdv-dev start --isolated [--project <dir>] [--no-console] [--background] [--no-focus] --test-world
+      - 默认显示前台游戏窗口；加 `--no-console` 则**只显示星露谷游戏画面窗口、不弹 SMAPI 黑色控制台窗口**！
+      - 加 `--background` 则连游戏画面也移至屏幕外无打扰隐藏运行（满分辨率 60FPS 照常截图）；
+      - 热驻 `--daemon` 在游戏运行期间会自动续命（不因 10 分钟空闲自退而连坐关闭游戏）。
+  sdv-dev window [--show | --background] [--no-console | --show-console] [--focus]
+      无需重启游戏，运行中 10ms 秒切前后台窗口显示，或单独隐藏/恢复 SMAPI 黑色控制台窗口！
+  sdv-dev restart --project <dir> [--isolated | --full-mods] [--no-console] [--same-desktop | --background] [--no-focus] --test-world
+      先执行 check+build（失败不关原游戏），通过后无锁暂存并在旧进程退出后自动替换 DLL（默认继承上一轮窗口与无控制台状态）！
   sdv-dev reload --project <cpDir> [--assets A,B]                      免重启热重载 Content Patcher 包
   sdv-dev reload-assets --project <dir> --assets Maps/MyMap            免重启热刷 C#/CP 模组的地图与贴图资产
   sdv-dev config <ModId> [--get [Key] | --set Key=Val ...] [--no-save] 免重启 0.05 秒实时读写模组配置
@@ -2513,8 +2629,8 @@ OPTIONS:
       - 着色器: 静态预编译校验全部 `*.fx` 的 HLSL 语法、OpenGL `ps_3_0`/`vs_3_0` 兼容性及漏编 `.mgfxo` 提醒；
       - C# SMAPI & MonoGame: `[HarmonyPatch]` 目标存在性/重载歧义/返回值与注入参数(`__instance`/`__result`/`___field`)静态验签、`Display.Rendered*` 内重复 `SpriteBatch.Begin` 崩溃、每帧无缓存 `new Texture2D/RenderTarget2D` 显存泄漏、离屏 `SetRenderTarget` 未还原、非预乘 `new Color(r,g,b,a)` 泛白及分屏静态变量隐患；
       - 地图: 全部 `.tmx` 尺寸、GID、Warp 与 BFS 孤岛检测。
-  sdv-dev build [--project <ModDir>] [--deploy] [--mods-path <Dir>] [--no-publicize]
-      免装 .NET SDK 秒编 .NET 6.0 C# 模组并自动将工程内全部 `*.fx` 编译为 `.mgfxo`；默认启用 `BepInEx.AssemblyPublicizer` + `IgnoresAccessChecksTo`（兼容 `.csproj` 的 `ImplicitUsings`/`DefineConstants`/`Compile Remove`）并在编译后自动校验 Harmony 补丁签名。
+  sdv-dev build [--project <ModDir>] [--deploy [--both | --single-target]] [--mods-path <Dir>] [--no-publicize]
+      免装 .NET SDK 秒编 .NET 6.0 C# 模组并自动将工程内全部 `*.fx` 编译为 `.mgfxo`；加 `--deploy` 时默认无锁同步到真实 `<GamePath>\Mods` 及已存在的 `isolated-mods` 双端目录（免手写 `Copy-Item`）！
   sdv-dev pack [--project <ModDir>] [--out <Release.zip>] [--skip-check]
       编译 + 全量静态校验通过后，生成顶层带 `<ModName>/manifest.json`、剔除全部源码/`.fx`/PDB/临时配置的标准发布压缩包并输出 SHA256。");
                     break;
@@ -2633,17 +2749,17 @@ OPTIONS:
 
         private static readonly HashSet<string> GlobalKnownOptions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
-            "--ab", "--ab-compare", "--ab-toggle", "--action", "--add-item", "--advance-days", "--aim-tile", "--asm", "--asset", "--assets", "--at", "--author", "--auto-crop",
-            "--background", "--burst", "--button", "--cat", "--cell", "--clear", "--click", "--close", "--code-b64", "--cold", "--config", "--context", "--cp", "--cp-trace", "--crop",
+            "--ab", "--ab-compare", "--ab-toggle", "--action", "--add-item", "--advance-days", "--aim-tile", "--all-mods", "--asm", "--asset", "--assets", "--at", "--author", "--auto-crop",
+            "--background", "--both", "--burst", "--button", "--cat", "--cell", "--clear", "--click", "--close", "--code-b64", "--cold", "--config", "--context", "--cp", "--cp-trace", "--crop",
             "--day", "--days", "--db", "--debug-overlay", "--debug", "--defines", "--deploy", "--docs-only", "--docs-out", "--drop-in", "--dropin",
             "--entry", "--export", "--facing-up", "--facing", "--file", "--focus", "--force", "--friendship", "--full-mods", "--full",
-            "--game-path", "--gamepad", "--get", "--github", "--give", "--grep", "--grid", "--headless", "--help", "--hold", "--hover", "--id", "--il", "--include-back", "--instructions", "--interval-ms", "--interval-ticks", "--isolated",
+            "--game-path", "--gamepad", "--get", "--github", "--give", "--grep", "--grid", "--headless", "--help", "--hide", "--hide-console", "--hold", "--hover", "--id", "--il", "--include-back", "--instructions", "--interval-ms", "--interval-ticks", "--isolated",
             "--json", "--keep-seen", "--keep-window", "--key", "--keys", "--kind", "--layer", "--level", "--limit", "--lines", "--list-assets", "--list",
             "--mail", "--match", "--min-version", "--mod", "--mode", "--mods-path", "--money", "--move", "--name", "--near", "--new-test-save",
-            "--no-back", "--no-bbox", "--no-focus", "--no-move", "--no-publicize", "--no-ref", "--no-reload-map", "--no-save", "--no-window", "--off", "--offline", "--optional",
+            "--no-back", "--no-bbox", "--no-console", "--no-focus", "--no-move", "--no-publicize", "--no-ref", "--no-reload-map", "--no-save", "--no-window", "--off", "--offline", "--optional",
             "--out", "--pan", "--pan-test", "--place", "--power", "--prefab", "--preset", "--press", "--profile", "--project", "--rect", "--refill", "--reload-map",
             "--reset", "--reset-test-world", "--response", "--right-click", "--same-desktop", "--save", "--scale", "--screen", "--script-b64", "--script", "--scroll", "--search",
-            "--season", "--seconds", "--set", "--settle-ticks", "--show-paths", "--size", "--skip-check", "--skip", "--spec", "--status", "--stdin", "--step",
+            "--season", "--seconds", "--set", "--settle-ticks", "--show", "--show-console", "--show-paths", "--single-target", "--size", "--skip-check", "--skip", "--spec", "--status", "--stdin", "--step",
             "--tail", "--tap", "--target", "--test-world", "--theme", "--ticks", "--tile-size", "--time", "--timeout", "--tool", "--top", "--trace",
             "--ui", "--ui-overlay", "--unpack", "--use-tool", "--visible", "--weather", "--with-mods", "--xy", "--year", "--zoom",
             "-a", "-c", "-C", "-d", "-e", "-f", "-g", "-h", "-k", "-l", "-m", "-n", "-o", "-p", "-r", "-s", "-t", "-w", "-y", "-z", "-"

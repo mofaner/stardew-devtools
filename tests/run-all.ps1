@@ -457,7 +457,16 @@ WWWWWW
     $cpDepsCheck = Invoke-SdvRaw @('deps', '--project', $cpMapDir, '--game-path', $cleanBeginnerGame)
     Assert-True ($cpDepsCheck.Code -eq 0) "Content Patcher special-repo resolution succeeded on empty Mods: $($cpDepsCheck.Text)"
     Assert-Contains $cpDepsCheck.Text "Pathoschild.ContentPatcher" "Resolved Pathoschild.ContentPatcher without local Mods"
-    Pass-Step "Offline map-autotile, CP EditMap, zero-unpacked .xnb extraction, & empty-Mods CP/GMCM auto-pull"
+
+    # Verify `build --deploy --both` syncs full mod folder (manifest, content, assets) to BOTH real Mods and isolated-mods!
+    $dualBuild = Invoke-SdvRaw @('build', $cpMapDir, '--deploy', '--both', '--game-path', $cleanBeginnerGame)
+    Assert-True ($dualBuild.Code -eq 0) "build --deploy --both succeeded: $($dualBuild.Text)"
+    $dualObj = $dualBuild.Text | ConvertFrom-Json
+    Assert-True ($dualObj.DeployedPaths.Count -ge 2) "build --deploy --both synced to $($dualObj.DeployedPaths.Count) directories"
+    Assert-True (Test-Path -LiteralPath (Join-Path $cleanBeginnerGame "Mods\CpEditMapPack\assets\booth.tmx")) "Real Mods received assets/booth.tmx"
+    # Clean up test pack from shared DefaultIsolatedModsRoot after verifying dual deploy
+    Remove-Item -LiteralPath (Join-Path $HOME ".local\share\sdv-dev\isolated-mods\CpEditMapPack") -Recurse -Force -ErrorAction SilentlyContinue
+    Pass-Step "Offline map-autotile, CP EditMap, zero-unpacked .xnb, empty-Mods CP/GMCM pull, & dual-target build --deploy --both"
 
     # ------------------------------------------------------------------
     # 6b. Expanded API/Decompile (--grep, MonoGame, xTile, SModHooks),
@@ -1000,13 +1009,26 @@ namespace LiveProbeMod
         $updatedLiveCs = (Get-Content -LiteralPath $modEntryPath -Raw).Replace("public static int ChosenWellOption = -1;", "public static int ChosenWellOption = -1;`n        public static int SelfRestartGen = 2;")
         [System.IO.File]::WriteAllText($modEntryPath, $updatedLiveCs, [System.Text.UTF8Encoding]::new($false))
 
-        $srRes = Invoke-SdvRaw @('restart', '--isolated', '--same-desktop', '--no-focus', '--project', $liveModDir, '--test-world')
-        Assert-True ($srRes.Code -eq 0) "Lock-free self_restart succeeded while DLL was loaded: $($srRes.Text)"
-        $afterRestartPid = ($srRes.Text | ConvertFrom-Json).pid
+        $srRes = Invoke-SdvRaw @('restart', '--isolated', '--same-desktop', '--no-console', '--no-focus', '--project', $liveModDir, '--test-world')
+        Assert-True ($srRes.Code -eq 0) "Lock-free self_restart with --no-console succeeded while DLL was loaded: $($srRes.Text)"
+        $srJsonObj = $srRes.Text | ConvertFrom-Json
+        $afterRestartPid = $srJsonObj.pid
         Assert-True ($afterRestartPid -ne $beforeRestartPid) "self_restart spawned new SMAPI PID ($beforeRestartPid -> $afterRestartPid)"
+        Assert-True ($srJsonObj.hideConsole -eq $true -and $srJsonObj.consoleVisible -eq $false -and $srJsonObj.windowVisible -eq $true) "--no-console hid SMAPI black console while keeping SDL2 game window visible"
         $genEval = Invoke-SdvRaw @('eval', 'LiveProbeMod.ModEntry.SelfRestartGen')
         Assert-Contains $genEval.Text '2' "Newly compiled DLL replaced locked DLL via post-exit staging swap (SelfRestartGen == 2)"
-        Pass-Step "Lock-free self_restart staging swap while mod DLL is loaded ($beforeRestartPid -> $afterRestartPid)"
+
+        # Verify runtime `sdv-dev window --background` <-> `sdv-dev window --show --no-console` instant toggle!
+        $winBg = Invoke-SdvRaw @('window', '--background')
+        Assert-True ($winBg.Code -eq 0) "sdv-dev window --background succeeded: $($winBg.Text)"
+        $winBgObj = $winBg.Text | ConvertFrom-Json
+        Assert-True ($winBgObj.backgroundMode -eq $true -and $winBgObj.windowVisible -eq $false) "window --background moved SDL2 window offscreen (windowVisible=false)"
+        $winShow = Invoke-SdvRaw @('window', '--show', '--no-console')
+        Assert-True ($winShow.Code -eq 0) "sdv-dev window --show --no-console succeeded: $($winShow.Text)"
+        $winShowObj = $winShow.Text | ConvertFrom-Json
+        Assert-True ($winShowObj.backgroundMode -eq $false -and $winShowObj.windowVisible -eq $true -and $winShowObj.consoleVisible -eq $false) "window --show --no-console restored visible SDL2 window without console"
+        $null = Invoke-SdvRaw @('window', '--background')
+        Pass-Step "Lock-free self_restart (--no-console) & instant runtime window --background/--show toggle ($beforeRestartPid -> $afterRestartPid)"
 
         # 7i. Verify 0 mod/SMAPI Error logs (ignoring vanilla notice when Steam client isn't open) & stop cleanly
         $errLogs = Invoke-SdvRaw @('logs', '--level', 'Error')

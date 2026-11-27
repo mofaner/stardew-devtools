@@ -23,6 +23,7 @@ namespace SdvKb.Build
         public string ModName { get; set; } = string.Empty;
         public string OutputDllPath { get; set; } = string.Empty;
         public string DeployedPath { get; set; } = string.Empty;
+        public List<string> DeployedPaths { get; set; } = new List<string>();
         public List<string> CompiledShaders { get; set; } = new List<string>();
         public string CompilerOutput { get; set; } = string.Empty;
     }
@@ -119,7 +120,8 @@ namespace System.Runtime.CompilerServices
             string gamePath,
             bool deploy,
             string? targetModsRootOverride = null,
-            bool publicize = true)
+            bool publicize = true,
+            IEnumerable<string>? additionalDeployRoots = null)
         {
             var res = new ModBuildResult();
             string fullModDir = Path.GetFullPath(modDir);
@@ -157,7 +159,7 @@ namespace System.Runtime.CompilerServices
                 res.Success = true;
                 if (deploy)
                 {
-                    res.DeployedPath = DeployModFolderToModsRoot(fullModDir, effectiveModsRoot, res.UniqueId);
+                    ExecuteMultiRootDeploy(fullModDir, res, effectiveModsRoot, additionalDeployRoots);
                 }
                 return res;
             }
@@ -250,7 +252,7 @@ namespace System.Runtime.CompilerServices
                 res.OutputDllPath = outDll;
                 if (deploy)
                 {
-                    res.DeployedPath = DeployModFolderToModsRoot(fullModDir, effectiveModsRoot, res.UniqueId);
+                    ExecuteMultiRootDeploy(fullModDir, res, effectiveModsRoot, additionalDeployRoots);
                 }
                 return res;
             }
@@ -259,6 +261,73 @@ namespace System.Runtime.CompilerServices
                 try { if (File.Exists(stagingDll)) File.Delete(stagingDll); } catch { }
                 try { if (File.Exists(stagingPdb)) File.Delete(stagingPdb); } catch { }
             }
+        }
+
+        /// <summary>
+        /// 支持单次 `build --deploy` 同时无锁增量同步多个目标根目录（如真实 `<GamePath>\Mods` 与 `isolated-mods`）：
+        ///
+        /// 【当初为什么要支持多目标同步部署】：
+        /// 实战中 AI 在 `isolated-mods` 隔离沙盒里跑自动化测试，同时玩家自己又会从 Steam 启动真实 `Mods\` 目录看效果；
+        /// 若 `build --deploy` 只刷其中一边，AI 每次改完代码或 `assets/` / `i18n/` 就得手写一串 `Copy-Item` 双边拷文件。
+        /// </summary>
+        private static void ExecuteMultiRootDeploy(
+            string fullModDir,
+            ModBuildResult res,
+            string primaryModsRoot,
+            IEnumerable<string>? additionalDeployRoots)
+        {
+            var roots = new List<string> { Path.GetFullPath(primaryModsRoot) };
+            if (additionalDeployRoots != null)
+            {
+                foreach (var r in additionalDeployRoots)
+                {
+                    if (string.IsNullOrWhiteSpace(r))
+                        continue;
+                    string fullR = Path.GetFullPath(r).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                    if (!roots.Any(x => x.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Equals(fullR, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        roots.Add(fullR);
+                    }
+                }
+            }
+
+            foreach (var root in roots)
+            {
+                string deployed = DeployModFolderToModsRoot(fullModDir, root, res.UniqueId);
+                res.DeployedPaths.Add(deployed);
+            }
+
+            res.DeployedPath = res.DeployedPaths.FirstOrDefault() ?? string.Empty;
+        }
+
+        /// <summary>
+        /// 判断指定 Mods 根目录下是否已存在给定模组（按 `manifest.json` 的 `UniqueID` 或同名文件夹匹配）。
+        /// </summary>
+        public static bool ModsRootContainsMod(string modsRoot, string uniqueId, string fallbackFolderName)
+        {
+            if (string.IsNullOrWhiteSpace(modsRoot) || !Directory.Exists(modsRoot))
+                return false;
+
+            if (Directory.Exists(Path.Combine(modsRoot, fallbackFolderName)) ||
+                Directory.Exists(Path.Combine(modsRoot, uniqueId)))
+            {
+                return true;
+            }
+
+            foreach (var sub in Directory.GetDirectories(modsRoot))
+            {
+                string mf = Path.Combine(sub, "manifest.json");
+                if (!File.Exists(mf))
+                    continue;
+                try
+                {
+                    var parsed = ModDependencyResolver.ParseManifestFile(mf);
+                    if (parsed != null && parsed.UniqueId.Equals(uniqueId, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+                catch { }
+            }
+            return false;
         }
 
         private sealed class CsprojCompilerSettings

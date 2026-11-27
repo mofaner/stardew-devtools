@@ -32,6 +32,8 @@ namespace SdvKb.Daemon
         private static int _prewarmScheduled;
         private static volatile bool _prewarmCompleted;
 
+        public static bool IsRunningInDaemon { get; private set; }
+
         private static KbDatabase? _warmDb;
         private static string _warmDbPath = string.Empty;
         private static DateTime _warmDbWriteUtc;
@@ -62,6 +64,7 @@ namespace SdvKb.Daemon
                 return 0;
             }
 
+            IsRunningInDaemon = true;
             using var cts = new CancellationTokenSource();
             _lastActivityUtc = DateTime.UtcNow;
 
@@ -74,6 +77,10 @@ namespace SdvKb.Daemon
             ScheduleDeferredIdlePrewarm(cts.Token, delayMs: 400);
 
             // 10-minute idle auto-exit watchdog
+            // 【当初为什么要加游戏存活续命保护】：
+            // 当 AI 以 `IsDaemon: true` 启动守护进程并拉起游戏后，若连续写代码/画贴图超过 10 分钟没敲 `sdv-dev`，
+            // 旧逻辑会让守护进程超时自退，导致下次同步调用 `sdv-dev restart` 退化为在短命临时作业组里拉起游戏、命令结束即被宿主连坐杀死！
+            // 因此只要检测到 `StardewModdingAPI` 仍在运行，自动刷新活跃时间戳，绝不在游戏运行期间自退。
             _ = Task.Run(async () =>
             {
                 while (!cts.Token.IsCancellationRequested)
@@ -81,6 +88,11 @@ namespace SdvKb.Daemon
                     try
                     {
                         await Task.Delay(TimeSpan.FromSeconds(15), cts.Token).ConfigureAwait(false);
+                        if (Live.LiveGameController.FindRunningSmapiProcess() != null)
+                        {
+                            _lastActivityUtc = DateTime.UtcNow;
+                            continue;
+                        }
                         if (Volatile.Read(ref _activeRequests) == 0 && (DateTime.UtcNow - _lastActivityUtc) >= IdleTimeout)
                         {
                             cts.Cancel();
@@ -220,12 +232,16 @@ namespace SdvKb.Daemon
                         if (mode == "PING")
                         {
                             TimeSpan up = DateTime.UtcNow - _startedAtUtc;
+                            bool gameAlive = Live.LiveGameController.FindRunningSmapiProcess() != null;
                             TimeSpan idleLeft = IdleTimeout - (DateTime.UtcNow - _lastActivityUtc);
                             if (idleLeft < TimeSpan.Zero) idleLeft = TimeSpan.Zero;
+                            string idleDesc = gameAlive
+                                ? "paused while game is running (10m after game stops)"
+                                : $"in {idleLeft.TotalMinutes:F1} min (timeout=10m)";
                             string statusMsg =
                                 $"Daemon PID      : {Process.GetCurrentProcess().Id}\n" +
                                 $"Uptime          : {up.TotalMinutes:F1} min\n" +
-                                $"Idle Auto-Exit  : in {idleLeft.TotalMinutes:F1} min (timeout=10m)\n" +
+                                $"Idle Auto-Exit  : {idleDesc}\n" +
                                 $"Served Queries  : {_servedCount}\n" +
                                 $"Warm DB Open    : {_warmDb != null}\n" +
                                 $"ILSpy Prewarmed : {_prewarmCompleted}\n";

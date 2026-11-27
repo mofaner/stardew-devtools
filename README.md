@@ -73,7 +73,8 @@ sdv-dev map-check assets/IslandBay.tmx --entry 10,2
 ### 4. 隔离进档实测、免重启调参、视觉对比/连拍、时光机快照与性能采样
 通过 `--isolated --test-world` 在独立 `--mods-path` 下秒进测试档（不碰个人存档；玩家已开可见窗口时 `restart` 默认同桌面原位刷新，不想弹窗口则加 `--background` 切为后台隐藏模式）：
 ```powershell
-sdv-dev start --isolated --project .\MyShaderMod --test-world
+sdv-dev start --isolated --no-console --project .\MyShaderMod --test-world # 只显示游戏画面窗口、不弹 SMAPI 黑框控制台！
+sdv-dev window --background                                # 运行中免重启 10ms 秒切为离屏隐藏模式（--show 切回桌面）
 sdv-dev reload-assets --project .\MyShaderMod              # 改完 .fx 着色器免重启 0.2s 自动重编并热刷内存 Effect！
 sdv-dev world --zoom 0.80 --time 1800                      # 安全切换视野缩放（自动重建 Game1.screen 防右侧 UV 撕裂）
 sdv-dev config Author.MyShaderMod --set SunsetWarmth=1.4   # 0.05 秒免重启实时改内存配置（加 --reset 一键恢复默认）

@@ -208,7 +208,8 @@ namespace SdvKb.Live
             IEnumerable<string>? extraWithMods = null,
             bool resetTestWorld = false,
             bool background = false,
-            bool noFocus = false)
+            bool noFocus = false,
+            bool hideConsole = false)
         {
             // Check if project has sdv-project.json requesting isolated mode by default
             if (!isolated && string.IsNullOrWhiteSpace(customModsPath) && !string.IsNullOrWhiteSpace(projectDir) && Directory.Exists(projectDir))
@@ -302,14 +303,36 @@ namespace SdvKb.Live
             else if (useDisposableTestWorld)
                 autoLoadEnv = "__NEW_TEST_SAVE__";
 
-            SpawnDetachedSmapiProcess(smapiExe, gamePath, targetModsRoot, autoLoadEnv, background, noFocus);
+            bool brokeAway = SpawnDetachedSmapiProcess(smapiExe, gamePath, targetModsRoot, autoLoadEnv, background, noFocus, hideConsole);
 
-            return WaitUntilNewBridgeSessionReady(
+            string statusJson = WaitUntilNewBridgeSessionReady(
                 saveFolder,
                 useDisposableTestWorld,
                 resetTestWorld,
                 timeoutSeconds,
                 previousPidToIgnore: null);
+
+            return AttachEphemeralJobWarningIfNeeded(statusJson, brokeAway);
+        }
+
+        private static string AttachEphemeralJobWarningIfNeeded(string statusJson, bool brokeAway)
+        {
+            if (brokeAway || Daemon.WorkerDaemonServer.IsRunningInDaemon || !IsCurrentProcessInsideJobObject())
+                return statusJson;
+
+            try
+            {
+                var node = System.Text.Json.Nodes.JsonNode.Parse(statusJson) as System.Text.Json.Nodes.JsonObject;
+                if (node != null)
+                {
+                    node["jobWarning"] =
+                        "Launched inside a non-breakaway host Job Object without `--daemon`. " +
+                        "If the host terminates child processes when this synchronous command exits, start `sdv-dev --daemon` with `IsDaemon: true` first!";
+                    return node.ToJsonString(IndentedJson());
+                }
+            }
+            catch { }
+            return statusJson;
         }
 
         private static string WaitUntilNewBridgeSessionReady(
@@ -366,7 +389,8 @@ namespace SdvKb.Live
             bool resetTestWorld = false,
             bool? backgroundOverride = null,
             bool sameDesktopExplicit = false,
-            bool noFocus = true)
+            bool noFocus = true,
+            bool? hideConsoleOverride = null)
         {
             ModBuildResult? buildRes = null;
 
@@ -449,6 +473,7 @@ namespace SdvKb.Live
                 }
 
                 bool prevWasBackground = false;
+                bool prevHideConsole = false;
                 if (conn)
                 {
                     try
@@ -456,6 +481,8 @@ namespace SdvKb.Live
                         using var sDoc = JsonDocument.Parse(statusJson);
                         if (sDoc.RootElement.TryGetProperty("backgroundMode", out var bgEl) && bgEl.ValueKind == JsonValueKind.True)
                             prevWasBackground = true;
+                        if (sDoc.RootElement.TryGetProperty("hideConsole", out var hcEl) && hcEl.ValueKind == JsonValueKind.True)
+                            prevHideConsole = true;
 
                         if (sDoc.RootElement.TryGetProperty("saveFolderName", out var sf) && sf.ValueKind == JsonValueKind.String)
                         {
@@ -479,8 +506,9 @@ namespace SdvKb.Live
                     }
                 }
 
-                // 若调用方未显式传 --background / --visible，则默认继承上一轮会话的可见/后台属性
+                // 若调用方未显式传 --background / --visible / --no-console，则默认继承上一轮会话的可见/后台/控制台属性
                 effectiveBackground = backgroundOverride ?? prevWasBackground;
+                bool effectiveHideConsoleForRestart = hideConsoleOverride ?? prevHideConsole;
 
                 // 允许走同桌面无锁 self_restart 的条件：
                 // 1) 未指定 `--background`；
@@ -517,6 +545,7 @@ namespace SdvKb.Live
                         clientExe = ResolveCompanionClientExe(),
                         pwshExe = FindExecutableInPath("pwsh.exe"),
                         background = false,
+                        hideConsole = effectiveHideConsoleForRestart,
                         noFocus
                     }), 2500);
 
@@ -560,7 +589,8 @@ namespace SdvKb.Live
                 extraWithMods: extraWithMods,
                 resetTestWorld: resetTestWorld,
                 background: effectiveBackground,
-                noFocus: noFocus);
+                noFocus: noFocus,
+                hideConsole: hideConsoleOverride ?? false);
         }
 
         /// <summary>
@@ -774,19 +804,40 @@ namespace SdvKb.Live
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr hObject);
 
-        private static void SpawnDetachedSmapiProcess(
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentProcess();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool IsProcessInJob(IntPtr processHandle, IntPtr jobHandle, out bool result);
+
+        private static bool IsCurrentProcessInsideJobObject()
+        {
+            try
+            {
+                if (IsProcessInJob(GetCurrentProcess(), IntPtr.Zero, out bool inJob))
+                    return inJob;
+            }
+            catch { }
+            return false;
+        }
+
+        private static bool SpawnDetachedSmapiProcess(
             string smapiExe,
             string gamePath,
             string? customModsRoot,
             string? autoLoadSaveValue,
             bool background = false,
-            bool noFocus = false)
+            bool noFocus = false,
+            bool hideConsole = false)
         {
             const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
             const uint CREATE_NEW_CONSOLE = 0x00000010;
             const uint CREATE_NEW_PROCESS_GROUP = 0x00000200;
+            const uint CREATE_BREAKAWAY_FROM_JOB = 0x01000000;
+            const int ERROR_ACCESS_DENIED = 5;
             const int STARTF_USESHOWWINDOW = 0x00000001;
             const short SW_HIDE = 0;
+            const short SW_SHOWNORMAL = 1;
             const short SW_SHOWNOACTIVATE = 4;
 
             // Prefer hosting SMAPI inside modern `pwsh.exe` (or direct UTF-8 console fallback) WITHOUT `SW_SHOWMINNOACTIVE`,
@@ -849,6 +900,12 @@ namespace SdvKb.Live
                 envDict["SDV_DEV_BACKGROUND"] = "1";
             else
                 envDict.Remove("SDV_DEV_BACKGROUND");
+
+            if (hideConsole)
+                envDict["SDV_DEV_HIDE_CONSOLE"] = "1";
+            else
+                envDict.Remove("SDV_DEV_HIDE_CONSOLE");
+
             if (!string.IsNullOrWhiteSpace(autoLoadSaveValue))
                 envDict["SDV_DEV_AUTOLOAD_SAVE"] = autoLoadSaveValue!;
             else
@@ -862,38 +919,63 @@ namespace SdvKb.Live
             envBlockSb.Append('\0');
             byte[] envBytes = Encoding.Unicode.GetBytes(envBlockSb.ToString());
 
+            string cmdLineSnapshot = cmdLine.ToString();
             IntPtr envPtr = Marshal.AllocHGlobal(envBytes.Length);
             try
             {
                 Marshal.Copy(envBytes, 0, envPtr, envBytes.Length);
                 var si = new STARTUPINFO
                 {
-                    cb = Marshal.SizeOf<STARTUPINFO>()
-                    // 可见模式下严禁传 SW_SHOWMINNOACTIVE（否则会把 SDL2 无边框窗口初始化成 0 尺寸导致半屏黑块）；
-                    // 仅当用户显式传 `--background` 时隐藏外层 pwsh 控制台，并由 BridgeMod 在 MonoGame 完成初始化后将 SDL2 窗口无损移出屏幕可视区。
+                    cb = Marshal.SizeOf<STARTUPINFO>(),
+                    dwFlags = STARTF_USESHOWWINDOW
+                    // 【当初为什么要显式补齐所有分支的 wShowWindow】：
+                    // 1. 当 `background` 或 `hideConsole` (`--no-console`) 为真时，外层控制台以 `SW_HIDE` 启动，不弹黑框（`--no-console` 模式下由 BridgeMod 单独点亮 SDL_app 游戏窗口）；
+                    // 2. 当正常前台启动 (`background=false && noFocus=false`) 时必须显式传 `SW_SHOWNORMAL (1)`，否则 `dwFlags=0` 会继承隐藏宿主终端的隐藏属性导致窗口“隐身”！
                 };
-                if (background)
-                {
-                    si.dwFlags = STARTF_USESHOWWINDOW;
+                if (background || hideConsole)
                     si.wShowWindow = SW_HIDE;
-                }
                 else if (noFocus)
-                {
-                    si.dwFlags = STARTF_USESHOWWINDOW;
                     si.wShowWindow = SW_SHOWNOACTIVATE;
-                }
+                else
+                    si.wShowWindow = SW_SHOWNORMAL;
 
+                uint baseFlags = CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP;
+                bool brokeAway = false;
+                var cmdTryBreakaway = new StringBuilder(cmdLineSnapshot);
+
+                // 先安全尝试 `CREATE_BREAKAWAY_FROM_JOB`：若宿主作业组允许脱离，则即便同步命令退出也不会连坐杀死游戏；
+                // 若宿主作业组未开放 `JOB_OBJECT_LIMIT_BREAKAWAY_OK` 返回 `ERROR_ACCESS_DENIED (5)`，立即自动回退普通创建。
                 bool ok = CreateProcessW(
                     appExe,
-                    cmdLine,
+                    cmdTryBreakaway,
                     IntPtr.Zero,
                     IntPtr.Zero,
                     bInheritHandles: false,
-                    dwCreationFlags: CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
+                    dwCreationFlags: baseFlags | CREATE_BREAKAWAY_FROM_JOB,
                     envPtr,
                     gamePath,
                     ref si,
                     out var pi);
+
+                if (ok)
+                {
+                    brokeAway = true;
+                }
+                else if (Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED)
+                {
+                    var cmdFallback = new StringBuilder(cmdLineSnapshot);
+                    ok = CreateProcessW(
+                        appExe,
+                        cmdFallback,
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        bInheritHandles: false,
+                        dwCreationFlags: baseFlags,
+                        envPtr,
+                        gamePath,
+                        ref si,
+                        out pi);
+                }
 
                 if (!ok)
                 {
@@ -903,6 +985,7 @@ namespace SdvKb.Live
 
                 if (pi.hProcess != IntPtr.Zero) CloseHandle(pi.hProcess);
                 if (pi.hThread != IntPtr.Zero) CloseHandle(pi.hThread);
+                return brokeAway;
             }
             finally
             {

@@ -221,6 +221,8 @@ namespace SdvDevBridge
         private bool _useDedicatedTestWorld;
         private bool _resetDedicatedTestWorld;
         private bool _automationBackgroundMode;
+        private bool _hideConsoleOnly;
+        private bool _launchNoFocus;
         private long _tickCounter;
 
         public static string ComputeUserToken()
@@ -336,6 +338,8 @@ namespace SdvDevBridge
             EnsureModernUtf8Console();
 
             _automationBackgroundMode = Environment.GetEnvironmentVariable("SDV_DEV_AUTOMATION") == "1";
+            _hideConsoleOnly = Environment.GetEnvironmentVariable("SDV_DEV_HIDE_CONSOLE") == "1";
+            _launchNoFocus = Environment.GetEnvironmentVariable("SDL_WINDOW_NO_ACTIVATION_WHEN_SHOWN") == "1";
             _pendingAutoLoadSave = Environment.GetEnvironmentVariable("SDV_DEV_AUTOLOAD_SAVE");
             if (!string.IsNullOrEmpty(_pendingAutoLoadSave))
                 _automationBackgroundMode = true;
@@ -367,7 +371,7 @@ namespace SdvDevBridge
             if (_automationBackgroundMode && Game1.options != null)
                 Game1.options.pauseWhenOutOfFocus = false;
 
-            ApplyBackgroundWindowModeIfRequested();
+            ApplyStartupWindowPolicy();
         }
 
         private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
@@ -377,11 +381,11 @@ namespace SdvDevBridge
             if (_automationBackgroundMode && Game1.options != null && Game1.options.pauseWhenOutOfFocus)
                 Game1.options.pauseWhenOutOfFocus = false;
 
-            // TitleMenu 首帧可能会重新居中窗口（CenterOnDisplay），在 --background 模式下前 120 ticks（以及 SetWindowSize 缩放恢复后）持续保持离屏隐藏且不缩放分辨率
-            if (_hiddenBackgroundWindow && ((_tickCounter <= 120 && (_tickCounter % 15 == 1)) || _reapplyBackgroundAfterZoomRestore))
+            // TitleMenu 首帧可能会重新居中窗口（CenterOnDisplay），前 120 ticks（以及 SetWindowSize 缩放恢复后）持续对齐前后台/无控制台窗口策略
+            if ((_tickCounter <= 120 && (_tickCounter % 15 == 1)) || _reapplyBackgroundAfterZoomRestore)
             {
                 _reapplyBackgroundAfterZoomRestore = false;
-                ApplyBackgroundWindowModeIfRequested();
+                ApplyStartupWindowPolicy();
             }
 
             // Handle startup auto-load once TitleMenu is ready
@@ -830,6 +834,8 @@ namespace SdvDevBridge
                     return StartMultiFrameCapture(req, tcs);
                 case "input_simulate":
                     return StartInputSimulation(req, tcs);
+                case "window_control":
+                    return HandleWindowControl(req);
                 case "self_restart":
                     return HandleSelfRestart(req);
                 case "load_save":
@@ -882,6 +888,7 @@ namespace SdvDevBridge
             if (Game1.activeClickableMenu is TitleMenu && TitleMenu.subMenu != null)
                 activeMenu += $" (subMenu: {TitleMenu.subMenu.GetType().FullName})";
 
+            var winInfo = InspectCurrentWindowState();
             var obj = new JObject
             {
                 ["ok"] = true,
@@ -891,6 +898,12 @@ namespace SdvDevBridge
                 ["modsPath"] = activeModsPath,
                 ["isolatedMods"] = isIsolated,
                 ["backgroundMode"] = _hiddenBackgroundWindow,
+                ["hideConsole"] = _hideConsoleOnly,
+                ["windowVisible"] = winInfo.Value<bool?>("windowVisible") ?? !_hiddenBackgroundWindow,
+                ["consoleVisible"] = winInfo.Value<bool?>("consoleVisible") ?? (!_hiddenBackgroundWindow && !_hideConsoleOnly),
+                ["windowBounds"] = winInfo["windowBounds"],
+                ["desktopName"] = winInfo["desktopName"],
+                ["onInteractiveDesktop"] = winInfo["onInteractiveDesktop"],
                 ["inWorld"] = Context.IsWorldReady,
                 ["isPlayerFree"] = Context.IsPlayerFree,
                 ["screenCount"] = GameRunner.instance?.gameInstances?.Count ?? 1,

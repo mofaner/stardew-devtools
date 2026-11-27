@@ -1459,6 +1459,33 @@ namespace SdvDevBridge
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern int GetClassNameW(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
 
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetWindowRect(IntPtr hWnd, out RECT_WIN lpRect);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr GetThreadDesktop(uint dwThreadId);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool GetUserObjectInformationW(IntPtr hObj, int nIndex, StringBuilder pvInfo, int nLength, out int lpnLengthNeeded);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT_WIN
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
         /// <summary>
         /// 由当前可见桌面中的游戏进程自己在退出前拉起过渡宿主脚本，等待旧进程彻底退出释放 DLL 文件锁后原子替换目录并启动新实例。
         ///
@@ -1484,6 +1511,7 @@ namespace SdvDevBridge
             string? clientExe = req.Value<string>("clientExe");
             string? pwshExe = req.Value<string>("pwshExe");
             bool background = req.Value<bool?>("background") == true;
+            bool hideConsole = req.Value<bool?>("hideConsole") ?? _hideConsoleOnly;
             bool noFocus = req.Value<bool?>("noFocus") ?? true;
             int myPid = Process.GetCurrentProcess().Id;
 
@@ -1493,6 +1521,7 @@ namespace SdvDevBridge
                 const uint CREATE_NEW_CONSOLE = 0x00000010;
                 const uint CREATE_NEW_PROCESS_GROUP = 0x00000200;
                 const int STARTF_USESHOWWINDOW = 0x00000001;
+                const short SW_SHOWNORMAL = 1;
                 const short SW_SHOWNOACTIVATE = 4;
                 const short SW_HIDE = 0;
 
@@ -1586,6 +1615,11 @@ namespace SdvDevBridge
                 else
                     envDict.Remove("SDV_DEV_BACKGROUND");
 
+                if (hideConsole)
+                    envDict["SDV_DEV_HIDE_CONSOLE"] = "1";
+                else
+                    envDict.Remove("SDV_DEV_HIDE_CONSOLE");
+
                 if (!string.IsNullOrWhiteSpace(autoLoadSave))
                     envDict["SDV_DEV_AUTOLOAD_SAVE"] = autoLoadSave!;
                 else
@@ -1606,20 +1640,43 @@ namespace SdvDevBridge
                     {
                         cb = Marshal.SizeOf<STARTUPINFO_RESTART>(),
                         dwFlags = STARTF_USESHOWWINDOW,
-                        wShowWindow = background ? SW_HIDE : SW_SHOWNOACTIVATE
+                        wShowWindow = (background || hideConsole) ? SW_HIDE : (noFocus ? SW_SHOWNOACTIVATE : SW_SHOWNORMAL)
                     };
 
-                    if (!CreateProcessW(
+                    const uint CREATE_BREAKAWAY_FROM_JOB = 0x01000000;
+                    const int ERROR_ACCESS_DENIED = 5;
+                    uint baseFlags = CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP;
+                    string rawCmdLine = cmdLine.ToString();
+
+                    bool created = CreateProcessW(
                         shellExe,
                         cmdLine,
                         IntPtr.Zero,
                         IntPtr.Zero,
                         false,
-                        CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
+                        baseFlags | CREATE_BREAKAWAY_FROM_JOB,
                         envPtr,
                         gamePath,
                         ref si,
-                        out var pi))
+                        out var pi);
+
+                    if (!created && Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED)
+                    {
+                        cmdLine = new StringBuilder(rawCmdLine);
+                        created = CreateProcessW(
+                            shellExe,
+                            cmdLine,
+                            IntPtr.Zero,
+                            IntPtr.Zero,
+                            false,
+                            baseFlags,
+                            envPtr,
+                            gamePath,
+                            ref si,
+                            out pi);
+                    }
+
+                    if (!created)
                     {
                         try { File.Delete(helperPs1); } catch { }
                         return new JObject { ["ok"] = false, ["error"] = $"CreateProcessW failed in self_restart (err={Marshal.GetLastWin32Error()})." };
@@ -1651,14 +1708,62 @@ namespace SdvDevBridge
         }
 
         /// <summary>
-        /// 当用户显式传入 `--background` (`SDV_DEV_BACKGROUND=1`) 不想看到桌面弹窗时：
-        /// 在 MonoGame 完成正常窗口尺寸 (`1280x720`) 与 `RenderTarget2D` 初始化后，隐藏控制台并将 SDL2 游戏窗口以
-        /// `SWP_NOSIZE | SWP_NOACTIVATE` 移至屏幕可视区外 (`-32000, -32000`)。
-        /// 这样既不会像 `SW_SHOWMINNOACTIVE` 那样把游戏渲染分辨率压成 0 导致黑屏错位，又能做到桌面完全无打扰且 60 FPS 满分辨率截图。
+        /// 统一执行启动期与运行期窗口可见性策略（覆盖前台正常窗口、`--no-console` 只显示游戏画面不弹控制台、`--background` 全离屏隐藏）：
+        ///
+        /// 【当初为什么要统一收口窗口控制并增加 `window_control`】：
+        /// 1. 之前 AI 在隐藏宿主终端里启动前台窗口时，若父进程 `STARTUPINFO` 为隐藏且未主动对 `SDL_app` 调 `ShowWindow`，会导致 `MainWindowHandle == 0` 隐身；
+        /// 2. 玩家希望实机看画面时经常“只想看星露谷游戏画面、不想桌面上多弹一个黑乎乎的 SMAPI 控制台窗口”（`--no-console`）；
+        /// 3. 运行中途想在“后台静默跑测试”和“切回桌面肉眼看效果”之间秒切（`sdv-dev window --show | --background | --hide-console`），无需重启游戏！
         /// </summary>
+        private void ApplyStartupWindowPolicy()
+        {
+            if (Environment.GetEnvironmentVariable("SDV_DEV_BACKGROUND") == "1")
+                _hiddenBackgroundWindow = true;
+
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                return;
+
+            if (_hiddenBackgroundWindow)
+            {
+                ApplyBackgroundWindowModeIfRequested();
+                return;
+            }
+
+            try
+            {
+                const int SW_HIDE = 0;
+                const int SW_SHOWNORMAL = 1;
+                const int SW_SHOWNOACTIVATE = 4;
+                const uint SWP_NOSIZE = 0x0001;
+                const uint SWP_NOZORDER = 0x0004;
+                const uint SWP_NOACTIVATE = 0x0010;
+
+                IntPtr conHwnd = GetConsoleWindow();
+                if (_hideConsoleOnly && conHwnd != IntPtr.Zero)
+                {
+                    ShowWindow(conHwnd, SW_HIDE);
+                }
+
+                IntPtr sdlHwnd = FindCurrentProcessSdlWindow();
+                if (sdlHwnd != IntPtr.Zero)
+                {
+                    if (!IsWindowVisible(sdlHwnd))
+                    {
+                        ShowWindow(sdlHwnd, _launchNoFocus ? SW_SHOWNOACTIVATE : SW_SHOWNORMAL);
+                    }
+
+                    if (GetWindowRect(sdlHwnd, out var rect) && (rect.Left < -10000 || rect.Top < -10000))
+                    {
+                        SetWindowPos(sdlHwnd, IntPtr.Zero, 80, 60, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                    }
+                }
+            }
+            catch { }
+        }
+
         private void ApplyBackgroundWindowModeIfRequested()
         {
-            if (Environment.GetEnvironmentVariable("SDV_DEV_BACKGROUND") != "1")
+            if (! _hiddenBackgroundWindow && Environment.GetEnvironmentVariable("SDV_DEV_BACKGROUND") != "1")
                 return;
             if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 return;
@@ -1675,23 +1780,148 @@ namespace SdvDevBridge
                 if (conHwnd != IntPtr.Zero)
                     ShowWindow(conHwnd, SW_HIDE);
 
-                uint myPid = (uint)Process.GetCurrentProcess().Id;
-                EnumWindows((hWnd, _) =>
+                IntPtr sdlHwnd = FindCurrentProcessSdlWindow();
+                if (sdlHwnd != IntPtr.Zero)
                 {
-                    GetWindowThreadProcessId(hWnd, out uint winPid);
-                    if (winPid != myPid)
-                        return true;
-
-                    var cls = new StringBuilder(64);
-                    GetClassNameW(hWnd, cls, 64);
-                    if (cls.ToString().Equals("SDL_app", StringComparison.Ordinal))
-                    {
-                        SetWindowPos(hWnd, IntPtr.Zero, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-                    }
-                    return true;
-                }, IntPtr.Zero);
+                    SetWindowPos(sdlHwnd, IntPtr.Zero, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                }
             }
             catch { }
+        }
+
+        private JObject HandleWindowControl(JObject req)
+        {
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                return new JObject { ["ok"] = false, ["error"] = "window_control is only supported on Windows." };
+
+            string? mode = req.Value<string>("mode")?.Trim().ToLowerInvariant();
+            bool? hideConsoleOpt = req.Value<bool?>("hideConsole");
+            bool focus = req.Value<bool?>("focus") == true;
+
+            const int SW_HIDE = 0;
+            const int SW_SHOWNORMAL = 1;
+            const int SW_SHOWNOACTIVATE = 4;
+            const uint SWP_NOSIZE = 0x0001;
+            const uint SWP_NOZORDER = 0x0004;
+            const uint SWP_NOACTIVATE = 0x0010;
+            const uint SWP_SHOWWINDOW = 0x0040;
+
+            if (hideConsoleOpt.HasValue)
+            {
+                _hideConsoleOnly = hideConsoleOpt.Value;
+                Environment.SetEnvironmentVariable("SDV_DEV_HIDE_CONSOLE", _hideConsoleOnly ? "1" : null);
+            }
+
+            IntPtr conHwnd = GetConsoleWindow();
+            IntPtr sdlHwnd = FindCurrentProcessSdlWindow();
+
+            if (mode == "background" || mode == "hide")
+            {
+                _hiddenBackgroundWindow = true;
+                Environment.SetEnvironmentVariable("SDV_DEV_BACKGROUND", "1");
+                if (conHwnd != IntPtr.Zero)
+                    ShowWindow(conHwnd, SW_HIDE);
+                if (sdlHwnd != IntPtr.Zero)
+                    SetWindowPos(sdlHwnd, IntPtr.Zero, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            else if (mode == "show" || mode == "visible")
+            {
+                _hiddenBackgroundWindow = false;
+                Environment.SetEnvironmentVariable("SDV_DEV_BACKGROUND", null);
+
+                if (conHwnd != IntPtr.Zero)
+                    ShowWindow(conHwnd, _hideConsoleOnly ? SW_HIDE : SW_SHOWNOACTIVATE);
+
+                if (sdlHwnd != IntPtr.Zero)
+                {
+                    ShowWindow(sdlHwnd, focus ? SW_SHOWNORMAL : SW_SHOWNOACTIVATE);
+                    if (GetWindowRect(sdlHwnd, out var rect) && (rect.Left < -10000 || rect.Top < -10000))
+                    {
+                        SetWindowPos(sdlHwnd, IntPtr.Zero, 80, 60, 0, 0, SWP_NOSIZE | (focus ? 0u : SWP_NOZORDER | SWP_NOACTIVATE) | SWP_SHOWWINDOW);
+                    }
+                    if (focus)
+                        SetForegroundWindow(sdlHwnd);
+                }
+            }
+            else if (hideConsoleOpt.HasValue && conHwnd != IntPtr.Zero)
+            {
+                Environment.SetEnvironmentVariable("SDV_DEV_HIDE_CONSOLE", _hideConsoleOnly ? "1" : null);
+                if (!_hiddenBackgroundWindow)
+                    ShowWindow(conHwnd, _hideConsoleOnly ? SW_HIDE : SW_SHOWNOACTIVATE);
+            }
+
+            var state = InspectCurrentWindowState();
+            state["ok"] = true;
+            state["backgroundMode"] = _hiddenBackgroundWindow;
+            state["hideConsole"] = _hideConsoleOnly;
+            return state;
+        }
+
+        private static IntPtr FindCurrentProcessSdlWindow()
+        {
+            IntPtr found = IntPtr.Zero;
+            uint myPid = (uint)Process.GetCurrentProcess().Id;
+            EnumWindows((hWnd, _) =>
+            {
+                GetWindowThreadProcessId(hWnd, out uint winPid);
+                if (winPid != myPid)
+                    return true;
+
+                var cls = new StringBuilder(64);
+                GetClassNameW(hWnd, cls, 64);
+                if (cls.ToString().Equals("SDL_app", StringComparison.Ordinal))
+                {
+                    found = hWnd;
+                    return false;
+                }
+                return true;
+            }, IntPtr.Zero);
+            return found;
+        }
+
+        private static JObject InspectCurrentWindowState()
+        {
+            var res = new JObject();
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                return res;
+
+            try
+            {
+                IntPtr sdlHwnd = FindCurrentProcessSdlWindow();
+                IntPtr conHwnd = GetConsoleWindow();
+                bool sdlVisibleFlag = sdlHwnd != IntPtr.Zero && IsWindowVisible(sdlHwnd);
+                bool onScreenCoords = false;
+                string? boundsStr = null;
+
+                if (sdlHwnd != IntPtr.Zero && GetWindowRect(sdlHwnd, out var r))
+                {
+                    int w = r.Right - r.Left;
+                    int h = r.Bottom - r.Top;
+                    boundsStr = $"{r.Left},{r.Top} ({w}x{h})";
+                    onScreenCoords = r.Left > -10000 && r.Top > -10000 && w > 0 && h > 0;
+                }
+
+                string? desktopName = null;
+                IntPtr hDesk = GetThreadDesktop(GetCurrentThreadId());
+                if (hDesk != IntPtr.Zero)
+                {
+                    var sb = new StringBuilder(128);
+                    if (GetUserObjectInformationW(hDesk, 2 /* UOI_NAME */, sb, sb.Capacity * 2, out _))
+                        desktopName = sb.ToString();
+                }
+
+                bool onInteractiveDesktop = string.IsNullOrEmpty(desktopName) ||
+                    string.Equals(desktopName, "Default", StringComparison.OrdinalIgnoreCase);
+
+                res["sdlHwnd"] = sdlHwnd != IntPtr.Zero ? $"0x{sdlHwnd.ToInt64():X}" : null;
+                res["windowVisible"] = sdlVisibleFlag && onScreenCoords && onInteractiveDesktop;
+                res["consoleVisible"] = conHwnd != IntPtr.Zero && IsWindowVisible(conHwnd) && onInteractiveDesktop;
+                res["windowBounds"] = boundsStr;
+                res["desktopName"] = desktopName;
+                res["onInteractiveDesktop"] = onInteractiveDesktop;
+            }
+            catch { }
+            return res;
         }
 
         private static string EscapePsSingle(string s) => s.Replace("'", "''");
