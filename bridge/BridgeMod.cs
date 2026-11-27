@@ -189,16 +189,21 @@ namespace SdvDevBridge
         public int TargetX { get; }
         public int TargetY { get; }
         public int Facing { get; }
+        public bool SkipEvents { get; }
         public int TicksElapsed { get; set; }
+        public int PostWarpSettleTicks { get; set; }
+        public int CleanedEventCount { get; set; }
+        public List<string> SkippedEventIds { get; } = new List<string>();
         public TaskCompletionSource<JObject> Tcs { get; }
 
-        public PendingWarpJob(int targetScreenId, string targetLocation, int x, int y, int facing, TaskCompletionSource<JObject> tcs)
+        public PendingWarpJob(int targetScreenId, string targetLocation, int x, int y, int facing, bool skipEvents, TaskCompletionSource<JObject> tcs)
         {
             TargetScreenId = targetScreenId;
             TargetLocation = targetLocation;
             TargetX = x;
             TargetY = y;
             Facing = facing;
+            SkipEvents = skipEvents;
             Tcs = tcs;
         }
     }
@@ -446,24 +451,7 @@ namespace SdvDevBridge
 
             if (_activeWarpJob != null && Context.ScreenId == _activeWarpJob.TargetScreenId)
             {
-                _activeWarpJob.TicksElapsed++;
-                bool finished = (!Game1.isWarping && Game1.locationRequest == null) || _activeWarpJob.TicksElapsed > 60;
-                if (finished)
-                {
-                    var wj = _activeWarpJob;
-                    _activeWarpJob = null;
-                    Game1.fadeToBlack = false;
-                    Game1.fadeToBlackAlpha = 0f;
-                    wj.Tcs.TrySetResult(new JObject
-                    {
-                        ["ok"] = true,
-                        ["screenIndex"] = Context.ScreenId,
-                        ["location"] = Game1.currentLocation?.NameOrUniqueName ?? wj.TargetLocation,
-                        ["targetX"] = Game1.player?.TilePoint.X ?? wj.TargetX,
-                        ["targetY"] = Game1.player?.TilePoint.Y ?? wj.TargetY,
-                        ["facing"] = Game1.player?.FacingDirection ?? wj.Facing
-                    });
-                }
+                TickActiveWarpJob();
             }
 
             if (_activeProfileSession != null && Context.ScreenId == 0 && _activeProfileSession.WallClock.Elapsed.TotalSeconds >= _activeProfileSession.TargetSeconds)
@@ -906,6 +894,8 @@ namespace SdvDevBridge
                 ["onInteractiveDesktop"] = winInfo["onInteractiveDesktop"],
                 ["inWorld"] = Context.IsWorldReady,
                 ["isPlayerFree"] = Context.IsPlayerFree,
+                ["eventActive"] = Game1.eventUp || Game1.CurrentEvent != null || Game1.currentLocation?.currentEvent != null,
+                ["activeEventId"] = (Game1.CurrentEvent ?? Game1.currentLocation?.currentEvent)?.id,
                 ["screenCount"] = GameRunner.instance?.gameInstances?.Count ?? 1,
                 ["saveFolderName"] = Constants.SaveFolderName,
                 ["currentSavePath"] = Constants.CurrentSavePath,
@@ -1205,18 +1195,26 @@ namespace SdvDevBridge
             int facing = req.Value<int?>("facing") ?? 2;
             int? rx = req.Value<int?>("x");
             int? ry = req.Value<int?>("y");
+            bool explicitCoords = rx.HasValue && ry.HasValue;
+            bool skipEvents = req.Value<bool?>("skipEvents") ?? explicitCoords;
 
             int tx, ty;
-            if (rx.HasValue && ry.HasValue)
+            if (explicitCoords)
             {
-                tx = rx.Value;
-                ty = ry.Value;
+                tx = rx!.Value;
+                ty = ry!.Value;
             }
             else
             {
                 var autoTile = FindSafeLandingTile(loc);
                 tx = autoTile.X;
                 ty = autoTile.Y;
+            }
+
+            var preSkippedIds = new List<string>();
+            if (skipEvents && (Game1.eventUp || Game1.CurrentEvent != null || Game1.currentLocation?.currentEvent != null))
+            {
+                AbortCurrentEventForWarp(loc, tx, ty, facing, preSkippedIds);
             }
 
             Game1.exitActiveMenu();
@@ -1229,19 +1227,174 @@ namespace SdvDevBridge
                 Game1.nonWarpFade = false;
                 if (tcs != null && _activeWarpJob == null)
                 {
-                    _activeWarpJob = new PendingWarpJob(Context.ScreenId, loc.NameOrUniqueName, tx, ty, facing, tcs);
+                    var job = new PendingWarpJob(Context.ScreenId, loc.NameOrUniqueName, tx, ty, facing, skipEvents, tcs);
+                    if (preSkippedIds.Count > 0)
+                    {
+                        job.CleanedEventCount += preSkippedIds.Count;
+                        job.SkippedEventIds.AddRange(preSkippedIds);
+                    }
+                    _activeWarpJob = job;
                     return null;
                 }
             }
 
-            return new JObject
+            Event? curEvt = Game1.CurrentEvent ?? Game1.currentLocation?.currentEvent;
+            var syncRes = new JObject
             {
                 ["ok"] = true,
                 ["location"] = loc.NameOrUniqueName,
                 ["targetX"] = tx,
                 ["targetY"] = ty,
-                ["facing"] = facing
+                ["facing"] = facing,
+                ["eventActive"] = Game1.eventUp || curEvt != null,
+                ["eventId"] = curEvt?.id
             };
+            if (preSkippedIds.Count > 0)
+                syncRes["skippedEventId"] = preSkippedIds[0];
+            return syncRes;
+        }
+
+        /// <summary>
+        /// 驱动异步切图落地与进图自动触发剧情 (`CurrentEvent`) 的无残留清理：
+        ///
+        /// 【当初为什么要写这个机制及原版二段传送坑说明】：
+        /// 1. 在新测试档调 `sdv-dev warp Town 45 71` 或 `Beach 38 14` 时，原版 `performWarpFarmer -> resetForPlayerEntry -> checkForEvents()`
+        ///    会自动拉起进图剧情（如刘易斯社区中心 `611439`、威利送鱼竿 `739330`），把 `eventUp`/`viewportFreeze` 锁死并把玩家和镜头拽离目标格；
+        /// 2. 原版 `Event.exitEvent()` 并不会立即清理 `currentLocation.currentEvent`，而是设 `eventOver = true` 等下一帧 `Game1.eventFinished()`；
+        ///    且 `Game1.eventFinished()` 内部会**再次调用 `warpFarmer(exitLocation, positionBeforeEvent.X, positionBeforeEvent.Y, ...)`**！
+        ///    因此必须先将 `exitLocation` 与 `positionBeforeEvent` 对齐至 `(TargetX, TargetY)`，再连续执行 `exitEvent() + eventFinished()`，
+        ///    并等该收尾传送彻底落地后固定玩家坐标与 `Game1.UpdateViewPort(true, player.getStandingPosition())`。
+        /// </summary>
+        private void TickActiveWarpJob()
+        {
+            var wj = _activeWarpJob;
+            if (wj == null)
+                return;
+
+            wj.TicksElapsed++;
+            if ((Game1.isWarping || Game1.locationRequest != null) && wj.TicksElapsed <= 90)
+            {
+                Game1.fadeToBlackAlpha = 1.1f;
+                Game1.fadeToBlack = true;
+                Game1.nonWarpFade = false;
+                return;
+            }
+
+            // 留 1 tick 让 SMAPI `Player.Warped` 上的 Mod 剧情触发器也执行完毕再检查是否被劫持进剧情
+            if (wj.PostWarpSettleTicks < 1 && wj.TicksElapsed <= 90)
+            {
+                wj.PostWarpSettleTicks++;
+                return;
+            }
+
+            Event? activeEvt = Game1.CurrentEvent ?? Game1.currentLocation?.currentEvent;
+            if (wj.SkipEvents && (activeEvt != null || Game1.eventUp) && wj.CleanedEventCount < 4 && wj.TicksElapsed <= 90)
+            {
+                GameLocation? dstLoc = FindLocationFlexible(wj.TargetLocation) ?? Game1.currentLocation;
+                AbortCurrentEventForWarp(dstLoc, wj.TargetX, wj.TargetY, wj.Facing, wj.SkippedEventIds);
+                wj.CleanedEventCount++;
+                wj.PostWarpSettleTicks = 0;
+
+                if (Game1.isWarping || Game1.locationRequest != null)
+                {
+                    Game1.fadeToBlackAlpha = 1.1f;
+                    Game1.fadeToBlack = true;
+                    Game1.nonWarpFade = false;
+                    return;
+                }
+            }
+
+            _activeWarpJob = null;
+
+            if (wj.SkipEvents && Game1.player != null)
+            {
+                GameLocation? expectedLoc = FindLocationFlexible(wj.TargetLocation);
+                if (expectedLoc != null && Game1.currentLocation == expectedLoc)
+                {
+                    Game1.player.setTileLocation(new Vector2(wj.TargetX, wj.TargetY));
+                    Game1.player.faceDirection(wj.Facing);
+                }
+
+                if (wj.CleanedEventCount > 0)
+                {
+                    Game1.eventUp = false;
+                    Game1.eventOver = false;
+                    Game1.displayHUD = true;
+                    Game1.viewportFreeze = false;
+                    Game1.player.CanMove = true;
+                    Game1.player.freezePause = 0;
+                }
+
+                Game1.UpdateViewPort(true, Game1.player.StandingPixel);
+            }
+
+            Game1.fadeToBlack = false;
+            Game1.fadeToBlackAlpha = 0f;
+            Game1.fadeIn = false;
+
+            Event? finalEvt = Game1.CurrentEvent ?? Game1.currentLocation?.currentEvent;
+            bool eventActive = Game1.eventUp || finalEvt != null;
+            var res = new JObject
+            {
+                ["ok"] = true,
+                ["screenIndex"] = Context.ScreenId,
+                ["location"] = Game1.currentLocation?.NameOrUniqueName ?? wj.TargetLocation,
+                ["targetX"] = Game1.player?.TilePoint.X ?? wj.TargetX,
+                ["targetY"] = Game1.player?.TilePoint.Y ?? wj.TargetY,
+                ["facing"] = Game1.player?.FacingDirection ?? wj.Facing,
+                ["eventActive"] = eventActive,
+                ["eventId"] = finalEvt?.id
+            };
+            if (wj.SkippedEventIds.Count > 0)
+            {
+                res["skippedEventId"] = wj.SkippedEventIds[0];
+                if (wj.SkippedEventIds.Count > 1)
+                    res["skippedEventIds"] = new JArray(wj.SkippedEventIds);
+            }
+            wj.Tcs.TrySetResult(res);
+        }
+
+        private static void AbortCurrentEventForWarp(GameLocation? dstLoc, int targetX, int targetY, int facing, List<string> recordedIds)
+        {
+            Event? evt = Game1.CurrentEvent ?? Game1.currentLocation?.currentEvent;
+            if (evt != null)
+            {
+                string evtId = !string.IsNullOrWhiteSpace(evt.id) ? evt.id : "custom";
+                if (!recordedIds.Contains(evtId))
+                    recordedIds.Add(evtId);
+
+                if (dstLoc != null)
+                    evt.exitLocation = new LocationRequest(dstLoc.NameOrUniqueName, dstLoc.isStructure.Value, dstLoc);
+                if (Game1.player != null)
+                {
+                    Game1.player.positionBeforeEvent = new Vector2(targetX, targetY);
+                    Game1.player.orientationBeforeEvent = facing;
+                }
+
+                try { evt.exitEvent(); } catch { }
+            }
+
+            try
+            {
+                if (Game1.player != null)
+                {
+                    Game1.player.positionBeforeEvent = new Vector2(targetX, targetY);
+                    Game1.player.orientationBeforeEvent = facing;
+                }
+                Game1.eventFinished();
+            }
+            catch
+            {
+                if (Game1.currentLocation != null)
+                {
+                    try { Game1.currentLocation.currentEvent?.cleanup(); } catch { }
+                    Game1.currentLocation.currentEvent = null;
+                }
+                Game1.eventUp = false;
+                Game1.eventOver = false;
+                Game1.displayHUD = true;
+                Game1.viewportFreeze = false;
+            }
         }
 
         private JObject HandleMapScreenshot(JObject req)

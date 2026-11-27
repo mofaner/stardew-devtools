@@ -930,7 +930,20 @@ namespace LiveProbeMod
         $harv2 = Invoke-SdvRaw @('interact', '--right-click', '65,16')
         Assert-Contains $harv2.Text '(O)348' "Restored checkpoint allowed harvesting Wine a second time!"
         $null = Invoke-SdvRaw @('checkpoint', 'delete', 'auto_test_ready_keg')
-        Pass-Step "Synchronous warp + interact + checkpoint save/load time machine"
+
+        # Verify `warp` cutscene hijack protection:
+        # On Sunny Spring Day 8 at 10:00am:
+        # 1) `warp Beach` (no explicit x,y) triggers Willy's Bamboo Pole cutscene 739330 (`eventActive == true`);
+        # 2) `warp Town 45 71` (explicit x,y) aborts Willy's active cutscene AND auto-skips Lewis's Community Center cutscene 611439,
+        #    landing cleanly at Town (45, 71) with `eventActive == false` and `isPlayerFree == true`!
+        $null = Invoke-SdvRaw @('world', '--weather', 'sun', '--time', '1000')
+        $wBeachEvt = Invoke-SdvRaw @('warp', 'Beach') | Select-Object -ExpandProperty Text | ConvertFrom-Json
+        Assert-True ($wBeachEvt.eventActive -eq $true -and -not [string]::IsNullOrWhiteSpace($wBeachEvt.eventId)) "Warp without coords reported triggered Beach cutscene ($($wBeachEvt.eventId))"
+        $wTownClean = Invoke-SdvRaw @('warp', 'Town', '45', '71') | Select-Object -ExpandProperty Text | ConvertFrom-Json
+        Assert-True ($wTownClean.ok -eq $true -and $wTownClean.eventActive -eq $false -and $wTownClean.targetX -eq 45 -and $wTownClean.targetY -eq 71 -and -not [string]::IsNullOrWhiteSpace($wTownClean.skippedEventId)) "Warp with explicit coords (45,71) auto-cleaned entry cutscene(s) ($($wTownClean.skippedEventId)) and landed at exact tile"
+        $liveAfterTown = Invoke-SdvRaw @('live') | Select-Object -ExpandProperty Text | ConvertFrom-Json
+        Assert-True ($liveAfterTown.isPlayerFree -eq $true -and $liveAfterTown.eventActive -eq $false -and $liveAfterTown.tileX -eq 45 -and $liveAfterTown.tileY -eq 71) "Player is free at Town (45,71) with zero residual event lock"
+        Pass-Step "Synchronous warp (with cutscene auto-skip & eventActive) + interact + checkpoint save/load time machine"
 
         # 7f. Live NPC `schedule-check`
         $scRes = Invoke-SdvRaw @('schedule-check', 'Abigail', '--key', 'spring')

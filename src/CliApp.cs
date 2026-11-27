@@ -1390,9 +1390,14 @@ namespace SdvKb
 
         private static int RunWarp(string[] args)
         {
+            EnsureCommandOptions("warp", args, new[] { "--facing", "-f", "--screen" }, "--facing-up", "--skip-events", "--allow-events", "--keep-events");
             int facing = GetIntOption(args, "--facing", "-f", defaultValue: 2);
             string? screen = GetOption(args, "--screen");
             if (HasFlag(args, "--facing-up")) facing = 0;
+            bool skipEventsFlag = HasFlag(args, "--skip-events");
+            bool allowEventsFlag = HasFlag(args, "--allow-events", "--keep-events");
+            bool? skipEvents = skipEventsFlag ? true : (allowEventsFlag ? false : (bool?)null);
+
             var pos = GetPositionalList(args, "--facing", "-f", "--screen");
             if (pos.Count == 0)
             {
@@ -1424,6 +1429,7 @@ namespace SdvKb
                 x,
                 y,
                 facing,
+                skipEvents,
                 screen
             }));
             return 0;
@@ -2427,18 +2433,20 @@ OPTIONS:
 
                 case "warp":
                 case "reload-assets":
-                    Console.WriteLine(@"# sdv-dev warp / reload-assets — 实机瞬移与着色器/地图/贴图 0.2s 免重启热刷
+                    Console.WriteLine(@"# sdv-dev warp / reload-assets — 实机瞬移（自带进图剧情锁清理）与着色器/地图/贴图 0.2s 免重启热刷
 
 用法：
-  sdv-dev warp <LocationName> [x] [y] [--facing 0..3]
+  sdv-dev warp <LocationName> [x] [y] [--facing 0..3] [--skip-events | --allow-events]
   sdv-dev reload-assets [--project <ModDir>] [--assets <Asset1,Asset2>] [--no-reload-map]
 
 说明：
+  - `warp` 显式传入坐标 `x y`（或加 `--skip-events`）时，若进图意外触发原版/模组过场剧情 (`CurrentEvent`)，会自动清干净剧情锁、恢复精确站位并刷新 `UpdateViewPort` 镜头，返回 JSON 含 `eventActive` / `skippedEventId`（如需保留进图剧情可加 `--allow-events`）；
   - 只改了 `.fx` 着色器、`.tmx` 地图或 `.png`/`.json` 时优先用 `reload-assets --project <ModDir>`，无需重启游戏！
   - 会自动将工程内全部 `.fx` 重编为 `.mgfxo`、精准拷入当前活跃 `modsPath` 对应的模组目录，并在主线程自动调用模组 `ReloadShaders()` 或直接原地替换内存中的 `Effect` 实例！
 
 示例：
-  sdv-dev warp IslandSouth 20 35
+  sdv-dev warp Town 45 71
+  sdv-dev warp Beach --skip-events
   sdv-dev reload-assets --project d:\myProject\MyShaderMod
   sdv-dev reload-assets --project d:\myProject\CoralMod --assets Maps/CoralBay");
                     break;
@@ -2494,7 +2502,7 @@ OPTIONS:
   sdv-dev config <ModId> [--get [Key] | --set Key=Val ...] [--no-save] 免重启 0.05 秒实时读写模组配置
 
 游戏内检视、传送、截图与日志：
-  sdv-dev warp <Location> [x] [y]                                      瞬移至目标地图坐标
+  sdv-dev warp <Location> [x] [y] [--skip-events | --allow-events]     瞬移至目标坐标（传了 x,y 时默认自动清掉进图剧情锁并对齐镜头，返回 eventActive/skippedEventId）
   sdv-dev screenshot --mode screen|map [--ui-overlay] --out <file.png> 实机画面或全图截图
   sdv-dev screenshot --ab-compare <ModId> --out <ab.png>               同机位一键生成「原版关闭 vs 模组开启」左右对比图
   sdv-dev screenshot --burst [4] [--interval-ticks 15] [--pan-test] --out <grid.png>
@@ -2749,17 +2757,17 @@ OPTIONS:
 
         private static readonly HashSet<string> GlobalKnownOptions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
-            "--ab", "--ab-compare", "--ab-toggle", "--action", "--add-item", "--advance-days", "--aim-tile", "--all-mods", "--asm", "--asset", "--assets", "--at", "--author", "--auto-crop",
+            "--ab", "--ab-compare", "--ab-toggle", "--action", "--add-item", "--advance-days", "--aim-tile", "--all-mods", "--allow-events", "--asm", "--asset", "--assets", "--at", "--author", "--auto-crop",
             "--background", "--both", "--burst", "--button", "--cat", "--cell", "--clear", "--click", "--close", "--code-b64", "--cold", "--config", "--context", "--cp", "--cp-trace", "--crop",
             "--day", "--days", "--db", "--debug-overlay", "--debug", "--defines", "--deploy", "--docs-only", "--docs-out", "--drop-in", "--dropin",
             "--entry", "--export", "--facing-up", "--facing", "--file", "--focus", "--force", "--friendship", "--full-mods", "--full",
             "--game-path", "--gamepad", "--get", "--github", "--give", "--grep", "--grid", "--headless", "--help", "--hide", "--hide-console", "--hold", "--hover", "--id", "--il", "--include-back", "--instructions", "--interval-ms", "--interval-ticks", "--isolated",
-            "--json", "--keep-seen", "--keep-window", "--key", "--keys", "--kind", "--layer", "--level", "--limit", "--lines", "--list-assets", "--list",
+            "--json", "--keep-events", "--keep-seen", "--keep-window", "--key", "--keys", "--kind", "--layer", "--level", "--limit", "--lines", "--list-assets", "--list",
             "--mail", "--match", "--min-version", "--mod", "--mode", "--mods-path", "--money", "--move", "--name", "--near", "--new-test-save",
             "--no-back", "--no-bbox", "--no-console", "--no-focus", "--no-move", "--no-publicize", "--no-ref", "--no-reload-map", "--no-save", "--no-window", "--off", "--offline", "--optional",
             "--out", "--pan", "--pan-test", "--place", "--power", "--prefab", "--preset", "--press", "--profile", "--project", "--rect", "--refill", "--reload-map",
             "--reset", "--reset-test-world", "--response", "--right-click", "--same-desktop", "--save", "--scale", "--screen", "--script-b64", "--script", "--scroll", "--search",
-            "--season", "--seconds", "--set", "--settle-ticks", "--show", "--show-console", "--show-paths", "--single-target", "--size", "--skip-check", "--skip", "--spec", "--status", "--stdin", "--step",
+            "--season", "--seconds", "--set", "--settle-ticks", "--show", "--show-console", "--show-paths", "--single-target", "--size", "--skip-check", "--skip-events", "--skip", "--spec", "--status", "--stdin", "--step",
             "--tail", "--tap", "--target", "--test-world", "--theme", "--ticks", "--tile-size", "--time", "--timeout", "--tool", "--top", "--trace",
             "--ui", "--ui-overlay", "--unpack", "--use-tool", "--visible", "--weather", "--with-mods", "--xy", "--year", "--zoom",
             "-a", "-c", "-C", "-d", "-e", "-f", "-g", "-h", "-k", "-l", "-m", "-n", "-o", "-p", "-r", "-s", "-t", "-w", "-y", "-z", "-"
