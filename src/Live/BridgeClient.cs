@@ -49,6 +49,25 @@ namespace SdvKb.Live
             return PrettyFormatJson(resp);
         }
 
+        public static string SendJsonAllowingLogicalFailure(object payload, out bool logicalOk, int connectTimeoutMs = 3000)
+        {
+            string formatted = SendRequired(payload, connectTimeoutMs);
+            logicalOk = true;
+            try
+            {
+                using var doc = JsonDocument.Parse(formatted);
+                if (doc.RootElement.TryGetProperty("ok", out var okEl) && okEl.ValueKind == JsonValueKind.False)
+                    logicalOk = false;
+            }
+            catch { }
+            return formatted;
+        }
+
+        public static string SendrawOrCheckedWarp(object payload, out bool warpOk, int connectTimeoutMs = 3000)
+        {
+            return SendJsonAllowingLogicalFailure(payload, out warpOk, connectTimeoutMs);
+        }
+
         public static string PrettyFormatJson(string rawJson)
         {
             try

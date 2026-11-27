@@ -91,9 +91,10 @@ namespace SdvKb.Project
             ("tractormod", "Pathoschild.TractorMod", "Pathoschild/StardewMods", "TractorMod", "tractor-mod"),
             ("centralstation", "Pathoschild.CentralStation", "Pathoschild/StardewMods", "CentralStation", "central-station"),
             ("uiinfosuite2", "Annosz.UiInfoSuite2", "Annosz/UIInfoSuite2", "UIInfoSuite2", null),
-            ("alternativetextures", "PeacefulEnd.AlternativeTextures", "PeacefulEnd/AlternativeTextures", "AlternativeTextures", null),
-            ("fashionSense", "PeacefulEnd.FashionSense", "PeacefulEnd/FashionSense", "FashionSense", null),
-            ("customcompanions", "PeacefulEnd.CustomCompanions", "PeacefulEnd/CustomCompanions", "CustomCompanions", null),
+            ("alternativetextures", "PeacefulEnd.AlternativeTextures", "Floogen/AlternativeTextures", "AlternativeTextures", null),
+            ("fashionSense", "PeacefulEnd.FashionSense", "Floogen/FashionSense", "FashionSense", null),
+            ("customcompanions", "PeacefulEnd.CustomCompanions", "Floogen/CustomCompanions", "CustomCompanions", null),
+            ("solidfoundations", "PeacefulEnd.SolidFoundations", "Floogen/SolidFoundations", "SolidFoundations", null),
             ("stardewhack", "bcmpinc.StardewHack", "bcmpinc/StardewHack", "StardewHack", null),
             ("kokoro", "Shockah.Kokoro", "Shockah/Stardew-Valley-Mods", "Kokoro", null),
             ("trinkettinker", "mushymato.TrinketTinker", "Mushymato/TrinketTinker", "TrinketTinker", null),
@@ -218,27 +219,62 @@ namespace SdvKb.Project
             return info;
         }
 
-        public static SdvProjectConfig LoadProjectConfig(string modDir)
+        public static SdvProjectConfig LoadProjectConfig(string modDir, bool includeLocalOverrides = true)
         {
-            string cfgPath = Path.Combine(modDir, "sdv-project.json");
-            if (!File.Exists(cfgPath))
-                return new SdvProjectConfig();
+            var jsonOpts = new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true,
+                ReadCommentHandling = JsonCommentHandling.Skip,
+                AllowTrailingCommas = true
+            };
 
-            try
+            SdvProjectConfig baseCfg = new SdvProjectConfig();
+            string cfgPath = Path.Combine(modDir, "sdv-project.json");
+            if (File.Exists(cfgPath))
             {
-                return JsonSerializer.Deserialize<SdvProjectConfig>(
-                    File.ReadAllText(cfgPath),
-                    new JsonSerializerOptions
+                try
+                {
+                    baseCfg = JsonSerializer.Deserialize<SdvProjectConfig>(File.ReadAllText(cfgPath), jsonOpts) ?? new SdvProjectConfig();
+                }
+                catch { }
+            }
+
+            // 支持免污染 Git 工作区的本地覆盖配置 `sdv-project.local.json`（用于临时挂载 SVE / RSV 等大型联调包）
+            if (includeLocalOverrides)
+            {
+                string localPath = Path.Combine(modDir, "sdv-project.local.json");
+                if (File.Exists(localPath))
+                {
+                    try
                     {
-                        PropertyNameCaseInsensitive = true,
-                        ReadCommentHandling = JsonCommentHandling.Skip,
-                        AllowTrailingCommas = true
-                    }) ?? new SdvProjectConfig();
+                        var localCfg = JsonSerializer.Deserialize<SdvProjectConfig>(File.ReadAllText(localPath), jsonOpts);
+                        if (localCfg != null)
+                        {
+                            if (localCfg.Isolated)
+                                baseCfg.Isolated = true;
+                            foreach (var em in localCfg.ExtraMods)
+                            {
+                                if (!string.IsNullOrWhiteSpace(em) &&
+                                    !baseCfg.ExtraMods.Contains(em.Trim(), StringComparer.OrdinalIgnoreCase))
+                                {
+                                    baseCfg.ExtraMods.Add(em.Trim());
+                                }
+                            }
+                            foreach (var ld in localCfg.Dependencies)
+                            {
+                                if (!string.IsNullOrWhiteSpace(ld.UniqueId) &&
+                                    !baseCfg.Dependencies.Any(d => d.UniqueId.Equals(ld.UniqueId, StringComparison.OrdinalIgnoreCase)))
+                                {
+                                    baseCfg.Dependencies.Add(ld);
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+                }
             }
-            catch
-            {
-                return new SdvProjectConfig();
-            }
+
+            return baseCfg;
         }
 
         public static void SaveProjectConfig(string modDir, SdvProjectConfig cfg)
@@ -456,8 +492,8 @@ namespace SdvKb.Project
                 }), new UTF8Encoding(false));
             }
 
-            // 2. Update sdv-project.json
-            var projCfg = LoadProjectConfig(fullModDir);
+            // 2. Update sdv-project.json (without leaking sdv-project.local.json entries into git-tracked sdv-project.json!)
+            var projCfg = LoadProjectConfig(fullModDir, includeLocalOverrides: false);
             var existingSpec = projCfg.Dependencies.FirstOrDefault(d => d.UniqueId.Equals(targetId, StringComparison.OrdinalIgnoreCase));
             if (existingSpec == null)
             {
@@ -519,7 +555,7 @@ namespace SdvKb.Project
                 }
             }
 
-            var projCfg = LoadProjectConfig(fullModDir);
+            var projCfg = LoadProjectConfig(fullModDir, includeLocalOverrides: false);
             int removedCfg = projCfg.Dependencies.RemoveAll(d => d.UniqueId.Equals(targetId, StringComparison.OrdinalIgnoreCase));
             if (removedCfg > 0 || File.Exists(Path.Combine(fullModDir, "sdv-project.json")))
                 SaveProjectConfig(fullModDir, projCfg);
@@ -1009,15 +1045,66 @@ namespace SdvKb.Project
             }
         }
 
-        private static string? TryLookupGitHubRepoFromSmapiList(string uniqueId)
+        private static Dictionary<string, string>? _embeddedSmapiRepoMap;
+        private static readonly object SmapiRepoMapLock = new object();
+
+        private static Dictionary<string, string> GetEmbeddedSmapiRepoMap()
         {
+            if (_embeddedSmapiRepoMap != null)
+                return _embeddedSmapiRepoMap;
+
+            lock (SmapiRepoMapLock)
+            {
+                if (_embeddedSmapiRepoMap != null)
+                    return _embeddedSmapiRepoMap;
+
+                var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                try
+                {
+                    using Stream? s = typeof(ModDependencyResolver).Assembly.GetManifestResourceStream("SmapiGithubMap.tsv");
+                    if (s != null)
+                    {
+                        using var sr = new StreamReader(s, Encoding.UTF8);
+                        string? line;
+                        while ((line = sr.ReadLine()) != null)
+                        {
+                            int tab = line.IndexOf('\t');
+                            if (tab > 0 && tab < line.Length - 1)
+                            {
+                                dict[line.Substring(0, tab).Trim()] = line.Substring(tab + 1).Trim();
+                            }
+                        }
+                    }
+                }
+                catch { }
+
+                _embeddedSmapiRepoMap = dict;
+                return dict;
+            }
+        }
+
+        /// <summary>
+        /// 从内嵌的 2,700+ 条官方 SMAPI 兼容表 (`smapi.io` / `SmapiCompatibilityList`) 精确反查模组的真实 GitHub 仓库，
+        /// 解决 `PeacefulEnd.CustomCompanions -> Floogen/CustomCompanions` 等作者 ID 与 GitHub 用户名不一致导致猜仓库 404 的问题。
+        /// </summary>
+        public static string? TryLookupGitHubRepoFromSmapiList(string uniqueId)
+        {
+            if (string.IsNullOrWhiteSpace(uniqueId))
+                return null;
+
+            var embedded = GetEmbeddedSmapiRepoMap();
+            if (embedded.TryGetValue(uniqueId.Trim(), out var bundledRepo))
+                return bundledRepo;
+
             try
             {
                 string cacheFile = Path.Combine(KbConfig.DataDir, "smapi-github-map.json");
                 Dictionary<string, string>? map = null;
                 if (File.Exists(cacheFile) && (DateTime.UtcNow - File.GetLastWriteTimeUtc(cacheFile)).TotalDays < 14)
                 {
-                    map = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(cacheFile));
+                    var loaded = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(cacheFile));
+                    if (loaded != null && loaded.Count > 0)
+                        map = new Dictionary<string, string>(loaded, StringComparer.OrdinalIgnoreCase);
                 }
 
                 if (map == null)
@@ -1030,7 +1117,7 @@ namespace SdvKb.Project
                     {
                         foreach (var m in modsArr.EnumerateArray())
                         {
-                            string? gh = GetString(m, "githubRepo");
+                            string? gh = GetString(m, "github") ?? GetString(m, "githubRepo");
                             string? ids = GetString(m, "id");
                             if (string.IsNullOrWhiteSpace(gh) || string.IsNullOrWhiteSpace(ids))
                                 continue;
@@ -1038,10 +1125,13 @@ namespace SdvKb.Project
                                 map[singleId] = gh!.Trim();
                         }
                     }
-                    try { File.WriteAllText(cacheFile, JsonSerializer.Serialize(map), new UTF8Encoding(false)); } catch { }
+                    if (map.Count > 0)
+                    {
+                        try { File.WriteAllText(cacheFile, JsonSerializer.Serialize(map), new UTF8Encoding(false)); } catch { }
+                    }
                 }
 
-                if (map != null && map.TryGetValue(uniqueId, out var foundRepo))
+                if (map != null && map.TryGetValue(uniqueId.Trim(), out var foundRepo))
                     return foundRepo;
             }
             catch

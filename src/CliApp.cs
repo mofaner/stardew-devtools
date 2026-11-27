@@ -102,6 +102,7 @@ namespace SdvKb
                 "schedule-check" or "schedule" => RunScheduleCheck(rest),
                 "mp" or "multiplayer" => RunMultiplayer(rest),
                 "warp" => RunWarp(rest),
+                "wait" or "sleep" => RunWait(rest),
                 "screenshot" => RunScreenshot(rest),
                 "config" or "mod-config" => RunModConfig(rest),
                 "stop" => RunStop(rest),
@@ -1170,16 +1171,17 @@ namespace SdvKb
             string? save = GetOption(args, "--save", "-s");
             string? project = GetOption(args, "--project", "-p");
             string? modsPath = GetOption(args, "--mods-path");
-            string? withModsRaw = GetOption(args, "--with-mods");
+            string? withModsRaw = GetOption(args, "--extra-mods", "--with-mods");
             bool isolated = HasFlag(args, "--isolated");
             bool testWorld = HasFlag(args, "--test-world", "--new-test-save");
             bool resetTestWorld = HasFlag(args, "--reset-test-world");
             bool background = HasFlag(args, "--background", "--no-window", "--headless") && !HasFlag(args, "--visible");
             bool hideConsole = HasFlag(args, "--no-console", "--hide-console") && !HasFlag(args, "--show-console");
             bool noFocus = HasFlag(args, "--no-focus");
-            int timeout = GetIntOption(args, "--timeout", "-t", defaultValue: 65);
-
             var extraMods = ParseCsvList(withModsRaw);
+            int defaultTimeout = (extraMods.Count > 0 || !isolated) ? 240 : 90;
+            int timeout = GetIntOption(args, "--timeout", "-t", defaultValue: defaultTimeout);
+
             string json = LiveGameController.StartGameAndWait(
                 cfg.GamePath,
                 save,
@@ -1237,7 +1239,7 @@ namespace SdvKb
             string? project = GetOption(args, "--project", "-p");
             string? save = GetOption(args, "--save", "-s");
             string? modsPath = GetOption(args, "--mods-path");
-            string? withModsRaw = GetOption(args, "--with-mods");
+            string? withModsRaw = GetOption(args, "--extra-mods", "--with-mods");
             bool isolated = HasFlag(args, "--isolated");
             bool fullMods = HasFlag(args, "--full-mods");
             bool testWorld = HasFlag(args, "--test-world", "--new-test-save");
@@ -1252,9 +1254,10 @@ namespace SdvKb
             bool? hideConsoleOverride = HasFlag(args, "--no-console", "--hide-console")
                 ? true
                 : (HasFlag(args, "--show-console") ? false : (bool?)null);
-            int timeout = GetIntOption(args, "--timeout", "-t", defaultValue: 65);
-
             var extraMods = ParseCsvList(withModsRaw);
+            int defaultTimeout = (extraMods.Count > 0 || fullMods) ? 240 : 90;
+            int timeout = GetIntOption(args, "--timeout", "-t", defaultValue: defaultTimeout);
+
             string json = LiveGameController.RestartOrReloadProject(
                 project,
                 cfg.GamePath,
@@ -1422,7 +1425,7 @@ namespace SdvKb
                 }
             }
 
-            Console.WriteLine(BridgeClient.SendRequired(new
+            string warpResp = BridgeClient.SendrawOrCheckedWarp(new
             {
                 action = "warp",
                 location = loc,
@@ -1431,17 +1434,51 @@ namespace SdvKb
                 facing,
                 skipEvents,
                 screen
-            }));
-            return 0;
+            }, out bool warpOk);
+            Console.WriteLine(warpResp);
+            return warpOk ? 0 : 1;
+        }
+
+        private static int RunWait(string[] args)
+        {
+            EnsureCommandOptions("wait", args, new[] { "--ticks", "-t", "--ms" }, "--until-ready");
+            bool untilReady = HasFlag(args, "--until-ready");
+            string? ticksStr = GetOption(args, "--ticks", "-t");
+            string? msStr = GetOption(args, "--ms");
+            string pos = GetPositionalQuery(args, "--ticks", "-t", "--ms");
+
+            int ticks = 20;
+            if (int.TryParse(ticksStr, out int tv) && tv > 0)
+                ticks = tv;
+            else if (int.TryParse(msStr, out int mv) && mv > 0)
+                ticks = Math.Max(1, (int)Math.Round(mv / (1000.0 / 60.0)));
+            else if (int.TryParse(pos, out int pv) && pv > 0)
+                ticks = pv;
+            else if (untilReady)
+                ticks = 180;
+
+            string resp = BridgeClient.SendJsonAllowingLogicalFailure(new
+            {
+                action = "wait_ticks",
+                ticks,
+                untilReady
+            }, out bool ok, connectTimeoutMs: 5000);
+            Console.WriteLine(resp);
+            return ok ? 0 : 1;
         }
 
         private static int RunScreenshot(string[] args)
         {
-            string[] valOpts = { "--mode", "-m", "--out", "-o", "--scale", "-s", "--zoom", "-z", "--screen", "--ab-compare", "--ab", "--ab-toggle", "--interval-ticks", "--interval-ms", "--pan" };
-            EnsureCommandOptions("screenshot", args, valOpts, "--ui-overlay", "--ui", "--burst", "--grid", "--pan-test");
+            string[] valOpts =
+            {
+                "--mode", "-m", "--out", "--output", "-o", "--scale", "-s", "--zoom", "-z", "--screen",
+                "--ab-compare", "--ab", "--ab-toggle", "--interval-ticks", "--interval-ms", "--pan",
+                "--at", "--time", "--weather", "--tour", "--settle-ticks"
+            };
+            EnsureCommandOptions("screenshot", args, valOpts, "--ui-overlay", "--ui", "--burst", "--grid", "--pan-test", "--godmode");
 
             string mode = (GetOption(args, "--mode", "-m") ?? "screen").Trim().ToLowerInvariant();
-            string? outPath = GetOption(args, "--out", "-o");
+            string? outPath = GetOption(args, "--out", "--output", "-o");
             string? scaleStr = GetOption(args, "--scale", "-s");
             string? zoomStr = GetOption(args, "--zoom", "-z");
             string? screen = GetOption(args, "--screen");
@@ -1450,7 +1487,14 @@ namespace SdvKb
             string? abToggle = GetOption(args, "--ab-toggle");
             bool hasBurstFlag = HasFlag(args, "--burst");
             bool panTestFlag = HasFlag(args, "--pan-test");
+            bool godmodeFlag = HasFlag(args, "--godmode");
             string? panRaw = GetOption(args, "--pan");
+            string? atSpec = GetOption(args, "--at");
+            string? timeStr = GetOption(args, "--time");
+            string? weatherStr = GetOption(args, "--weather");
+            string? tourRaw = GetOption(args, "--tour");
+            int? settleTicksOpt = int.TryParse(GetOption(args, "--settle-ticks"), out int stv) && stv > 0 ? stv : (int?)null;
+            int? reqTime = int.TryParse(timeStr, out int tmv) ? tmv : (int?)null;
             float scale = float.TryParse(scaleStr, NumberStyles.Float, CultureInfo.InvariantCulture, out float sv) ? sv : 1.0f;
             float? tempZoom = float.TryParse(zoomStr, NumberStyles.Float, CultureInfo.InvariantCulture, out float zv) && zv > 0.05f ? zv : (float?)null;
 
@@ -1484,85 +1528,250 @@ namespace SdvKb
 
             string fullOut = Path.GetFullPath(outPath!);
 
-            // 分支 1：带临时镜头缩放重建缓冲 (`--zoom`)、A/B 对比 (`--ab-compare`) 或 动态时序四宫格连拍 (`--burst` / `--pan-test`)
-            bool isMultiOrZoomScreen = mode == "screen" && (!string.IsNullOrWhiteSpace(abMod) || hasBurstFlag || panTestFlag || !string.IsNullOrWhiteSpace(panRaw) || (tempZoom.HasValue && !uiOverlay));
-            if (isMultiOrZoomScreen)
+            // 分支 0：`--tour` 多站点巡检模式（自动无敌保护 + 逐站清锁切图 + 直出 NxM 审片总览图）
+            if (!string.IsNullOrWhiteSpace(tourRaw))
             {
-                int intervalTicks = GetIntOption(args, "--interval-ticks", "--interval-ticks", defaultValue: -1);
-                if (intervalTicks <= 0)
+                var tourStops = ParseTourStopsSpec(tourRaw!);
+                if (tourStops.Count == 0)
+                    throw new ArgumentException($"No valid stops parsed from `--tour {tourRaw}` (expected e.g. `Town:82,56@1630;IslandSouth:20,35@1200`).");
+
+                if (!string.IsNullOrWhiteSpace(weatherStr))
                 {
-                    int intervalMs = GetIntOption(args, "--interval-ms", "--interval-ms", defaultValue: 250);
-                    intervalTicks = Math.Max(1, (int)Math.Round(intervalMs * 60.0 / 1000.0));
+                    BridgeClient.SendRequired(new { action = "world_control", weather = weatherStr, screen }, connectTimeoutMs: 5000);
                 }
 
-                int panDx = 0, panDy = 0;
-                if (!string.IsNullOrWhiteSpace(panRaw))
-                {
-                    var pt = ParsePoint2(panRaw);
-                    if (pt.HasValue) { panDx = pt.Value.X; panDy = pt.Value.Y; }
-                }
-                else if (panTestFlag)
-                {
-                    panDx = 8; // 默认每 tick 向右平滑移动 8px（45 ticks 共平移 360px，足以暴露残影与 UV 错位）
-                }
-
-                string capMode = !string.IsNullOrWhiteSpace(abMod)
-                    ? "ab_compare"
-                    : ((hasBurstFlag || panTestFlag || !string.IsNullOrWhiteSpace(panRaw)) ? "burst" : "single_zoom");
-
-                string advResp = BridgeClient.SendRequired(new
+                string tourResp = BridgeClient.SendJsonAllowingLogicalFailure(new
                 {
                     action = "screenshot_advanced",
-                    captureMode = capMode,
+                    captureMode = "tour",
                     outPath = fullOut,
-                    abMod,
-                    abToggle,
-                    burstFrames,
-                    intervalTicks,
-                    panDx,
-                    panDy,
+                    tourStops,
+                    time = reqTime,
+                    settleTicks = settleTicksOpt ?? 4,
                     zoom = tempZoom,
                     screen
-                }, connectTimeoutMs: 5000);
-
-                Console.WriteLine(advResp);
-                return 0;
+                }, out bool tourOk, connectTimeoutMs: 5000);
+                Console.WriteLine(tourResp);
+                return tourOk ? 0 : 1;
             }
 
-            string resp = BridgeClient.SendRequired(new
+            // 单令场景预置（`--at Town:82,56` / `--time 1630` / `--weather sun` / `--godmode`）
+            bool restoreGodModeOffAfter = false;
+            try
             {
-                action = "screenshot",
-                mode,
-                outPath = fullOut,
-                scale,
-                screen,
-                uiOverlay
-            }, connectTimeoutMs: 5000);
-
-            if (uiOverlay && mode == "screen" && File.Exists(fullOut))
-            {
-                try
+                if (godmodeFlag)
                 {
-                    using var doc = JsonDocument.Parse(resp);
-                    if (doc.RootElement.TryGetProperty("uiLayout", out var uiEl))
+                    string pJson = BridgeClient.SendRequired(new { action = "player", screen });
+                    using var pDoc = JsonDocument.Parse(pJson);
+                    bool wasInv = pDoc.RootElement.TryGetProperty("invincible", out var invEl) && invEl.ValueKind == JsonValueKind.True;
+                    if (!wasInv)
                     {
-                        var overlayStats = SpriteSheetInspector.DrawUiOverlayOnScreenshotPng(fullOut, uiEl);
-                        PrintJson(new
-                        {
-                            ok = true,
-                            mode = "screen",
-                            outputPng = fullOut,
-                            uiOverlay = overlayStats,
-                            uiLayout = JsonSerializer.Deserialize<object>(uiEl.GetRawText())
-                        });
-                        return 0;
+                        restoreGodModeOffAfter = true;
+                        BridgeClient.SendRequired(new { action = "player", invincible = true, heal = true, screen });
                     }
                 }
-                catch { }
+
+                if (reqTime.HasValue || !string.IsNullOrWhiteSpace(weatherStr))
+                {
+                    BridgeClient.SendRequired(new
+                    {
+                        action = "world_control",
+                        time = reqTime,
+                        weather = weatherStr,
+                        screen
+                    }, connectTimeoutMs: 5000);
+                }
+
+                if (!string.IsNullOrWhiteSpace(atSpec))
+                {
+                    var parsedAt = ParseSingleSceneSpec(atSpec!);
+                    if (parsedAt.Time.HasValue && !reqTime.HasValue)
+                    {
+                        BridgeClient.SendRequired(new { action = "world_control", time = parsedAt.Time, screen }, connectTimeoutMs: 5000);
+                    }
+
+                    string atWarpResp = BridgeClient.SendrawOrCheckedWarp(new
+                    {
+                        action = "warp",
+                        location = parsedAt.Location,
+                        x = parsedAt.X,
+                        y = parsedAt.Y,
+                        facing = 2,
+                        skipEvents = true,
+                        screen
+                    }, out bool atWarpOk);
+
+                    if (!atWarpOk)
+                    {
+                        Console.WriteLine(atWarpResp);
+                        return 1;
+                    }
+                }
+
+                if (!string.IsNullOrWhiteSpace(atSpec) || reqTime.HasValue || !string.IsNullOrWhiteSpace(weatherStr))
+                {
+                    BridgeClient.SendRequired(new { action = "wait_ticks", ticks = settleTicksOpt ?? 3 }, connectTimeoutMs: 5000);
+                }
+
+                // 分支 1：带临时镜头缩放重建缓冲 (`--zoom`)、A/B 对比 (`--ab-compare`) 或 动态时序四宫格连拍 (`--burst` / `--pan-test`)
+                bool isMultiOrZoomScreen = mode == "screen" && (!string.IsNullOrWhiteSpace(abMod) || hasBurstFlag || panTestFlag || !string.IsNullOrWhiteSpace(panRaw) || (tempZoom.HasValue && !uiOverlay));
+                if (isMultiOrZoomScreen)
+                {
+                    int intervalTicks = GetIntOption(args, "--interval-ticks", "--interval-ticks", defaultValue: -1);
+                    if (intervalTicks <= 0)
+                    {
+                        int intervalMs = GetIntOption(args, "--interval-ms", "--interval-ms", defaultValue: 250);
+                        intervalTicks = Math.Max(1, (int)Math.Round(intervalMs * 60.0 / 1000.0));
+                    }
+
+                    int panDx = 0, panDy = 0;
+                    if (!string.IsNullOrWhiteSpace(panRaw))
+                    {
+                        var pt = ParsePoint2(panRaw);
+                        if (pt.HasValue) { panDx = pt.Value.X; panDy = pt.Value.Y; }
+                    }
+                    else if (panTestFlag)
+                    {
+                        panDx = 8; // 默认每 tick 向右平滑移动 8px（45 ticks 共平移 360px，足以暴露残影与 UV 错位）
+                    }
+
+                    string capMode = !string.IsNullOrWhiteSpace(abMod)
+                        ? "ab_compare"
+                        : ((hasBurstFlag || panTestFlag || !string.IsNullOrWhiteSpace(panRaw)) ? "burst" : "single_zoom");
+
+                    string advResp = BridgeClient.SendRequired(new
+                    {
+                        action = "screenshot_advanced",
+                        captureMode = capMode,
+                        outPath = fullOut,
+                        abMod,
+                        abToggle,
+                        burstFrames,
+                        intervalTicks,
+                        panDx,
+                        panDy,
+                        zoom = tempZoom,
+                        screen
+                    }, connectTimeoutMs: 5000);
+
+                    Console.WriteLine(advResp);
+                    return 0;
+                }
+
+                string resp = BridgeClient.SendRequired(new
+                {
+                    action = "screenshot",
+                    mode,
+                    outPath = fullOut,
+                    scale,
+                    screen,
+                    uiOverlay
+                }, connectTimeoutMs: 5000);
+
+                if (uiOverlay && mode == "screen" && File.Exists(fullOut))
+                {
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(resp);
+                        if (doc.RootElement.TryGetProperty("uiLayout", out var uiEl))
+                        {
+                            var overlayStats = SpriteSheetInspector.DrawUiOverlayOnScreenshotPng(fullOut, uiEl);
+                            PrintJson(new
+                            {
+                                ok = true,
+                                mode = "screen",
+                                outputPng = fullOut,
+                                uiOverlay = overlayStats,
+                                uiLayout = JsonSerializer.Deserialize<object>(uiEl.GetRawText())
+                            });
+                            return 0;
+                        }
+                    }
+                    catch { }
+                }
+
+                Console.WriteLine(resp);
+                return 0;
+            }
+            finally
+            {
+                if (restoreGodModeOffAfter)
+                {
+                    try { BridgeClient.SendJsonAllowingLogicalFailure(new { action = "player", invincible = false, screen }, out _); } catch { }
+                }
+            }
+        }
+
+        private static (string Location, int? X, int? Y, int? Time, string? Label) ParseSingleSceneSpec(string raw)
+        {
+            string s = raw.Trim();
+            string? label = null;
+            int eq = s.IndexOf('=');
+            if (eq > 0 && eq < s.Length - 1)
+            {
+                label = s.Substring(0, eq).Trim();
+                s = s.Substring(eq + 1).Trim();
             }
 
-            Console.WriteLine(resp);
-            return 0;
+            int? time = null;
+            int atIdx = s.LastIndexOf('@');
+            if (atIdx > 0 && atIdx < s.Length - 1)
+            {
+                if (int.TryParse(s.Substring(atIdx + 1).Trim(), out int parsedT))
+                    time = parsedT;
+                s = s.Substring(0, atIdx).Trim();
+            }
+
+            int? x = null, y = null;
+            int colon = s.IndexOf(':');
+            string loc = s;
+            if (colon > 0 && colon < s.Length - 1)
+            {
+                loc = s.Substring(0, colon).Trim();
+                var pt = ParsePoint2(s.Substring(colon + 1));
+                if (pt.HasValue)
+                {
+                    x = pt.Value.X;
+                    y = pt.Value.Y;
+                }
+            }
+
+            return (loc, x, y, time, label);
+        }
+
+        private static List<object> ParseTourStopsSpec(string tourRaw)
+        {
+            string content = tourRaw.Trim();
+            if (content.StartsWith("@", StringComparison.Ordinal) && content.Length > 1)
+            {
+                string listFile = content.Substring(1).Trim();
+                if (!File.Exists(listFile))
+                    throw new FileNotFoundException($"Tour stop file not found: `{listFile}`.");
+                content = File.ReadAllText(listFile, Encoding.UTF8);
+            }
+
+            var stops = new List<object>();
+            foreach (var token in content.Split(new[] { ';', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string trimmed = token.Trim();
+                if (trimmed.Length == 0 || trimmed.StartsWith("#", StringComparison.Ordinal))
+                    continue;
+
+                var p = ParseSingleSceneSpec(trimmed);
+                if (!string.IsNullOrWhiteSpace(p.Location))
+                {
+                    stops.Add(new
+                    {
+                        raw = trimmed,
+                        location = p.Location,
+                        x = p.X,
+                        y = p.Y,
+                        time = p.Time,
+                        label = p.Label
+                    });
+                }
+            }
+            return stops;
         }
 
         private static int RunModConfig(string[] args)
@@ -1666,6 +1875,7 @@ namespace SdvKb
         {
             var cfg = KbConfig.Load(GetOption(args, "--game-path", "-g"));
             string? file = GetOption(args, "--file", "-f");
+            string? explicitCode = GetOption(args, "--code", "-c");
             string? b64 = GetOption(args, "--code-b64");
             string? screen = GetOption(args, "--screen");
             bool stdinFlag = HasFlag(args, "--stdin");
@@ -1674,6 +1884,10 @@ namespace SdvKb
             if (!string.IsNullOrWhiteSpace(b64))
             {
                 code = Encoding.UTF8.GetString(Convert.FromBase64String(b64!));
+            }
+            else if (!string.IsNullOrWhiteSpace(explicitCode))
+            {
+                code = explicitCode!;
             }
             else if (!string.IsNullOrWhiteSpace(file))
             {
@@ -1685,7 +1899,7 @@ namespace SdvKb
             }
             else
             {
-                code = GetPositionalQuery(args, "--game-path", "-g", "--file", "-f", "--code-b64", "--screen");
+                code = GetPositionalQuery(args, "--game-path", "-g", "--file", "-f", "--code", "-c", "--code-b64", "--screen");
             }
 
             if (string.IsNullOrWhiteSpace(code))
@@ -1726,7 +1940,39 @@ namespace SdvKb
         private static int RunPlayer(string[] args)
         {
             string? screen = GetOption(args, "--screen");
-            Console.WriteLine(BridgeClient.SendRequired(new { action = "player", screen }));
+            string? speed = GetOption(args, "--speed");
+            bool heal = HasFlag(args, "--heal", "--refill");
+
+            bool? invincible = null;
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (args[i].Equals("--invincible", StringComparison.OrdinalIgnoreCase) ||
+                    args[i].Equals("--godmode", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (i + 1 < args.Length && !args[i + 1].StartsWith("-", StringComparison.Ordinal))
+                    {
+                        string v = args[i + 1].Trim();
+                        if (v.Equals("off", StringComparison.OrdinalIgnoreCase) || v.Equals("false", StringComparison.OrdinalIgnoreCase) || v == "0")
+                            invincible = false;
+                        else
+                            invincible = true;
+                        i++;
+                    }
+                    else
+                    {
+                        invincible = true;
+                    }
+                }
+            }
+
+            Console.WriteLine(BridgeClient.SendRequired(new
+            {
+                action = "player",
+                invincible,
+                speed,
+                heal,
+                screen
+            }));
             return 0;
         }
 
@@ -2222,8 +2468,9 @@ namespace SdvKb
             return 0;
         }
 
-        private static int RunLogs(string[] args)
+        internal static string FormatLogsLockFree(string[] rawArgs)
         {
+            string[] args = rawArgs.Skip(1).ToArray();
             string? level = GetOption(args, "--level", "-l");
             string? mod = GetOption(args, "--mod", "-m");
             int tail = GetIntOption(args, "--tail", "-n", defaultValue: 40);
@@ -2232,18 +2479,22 @@ namespace SdvKb
             var entries = LiveGameController.ReadSmapiLogs(level, mod, tail);
             if (asJson)
             {
-                PrintJson(entries);
-                return 0;
+                return JsonSerializer.Serialize(entries, new JsonSerializerOptions
+                {
+                    WriteIndented = true,
+                    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+                }) + Environment.NewLine;
             }
 
             if (entries.Count == 0)
-            {
-                Console.WriteLine("No matching log entries found in SMAPI-latest.txt.");
-                return 0;
-            }
+                return "No matching log entries found in SMAPI-latest.txt." + Environment.NewLine;
 
-            foreach (var e in entries)
-                Console.WriteLine(e);
+            return string.Join(Environment.NewLine, entries) + Environment.NewLine;
+        }
+
+        private static int RunLogs(string[] args)
+        {
+            Console.Write(FormatLogsLockFree(new[] { "logs" }.Concat(args).ToArray()));
             return 0;
         }
 
@@ -2432,15 +2683,19 @@ OPTIONS:
                     break;
 
                 case "warp":
+                case "wait":
+                case "sleep":
                 case "reload-assets":
                     Console.WriteLine(@"# sdv-dev warp / reload-assets — 实机瞬移（自带进图剧情锁清理）与着色器/地图/贴图 0.2s 免重启热刷
 
 用法：
   sdv-dev warp <LocationName> [x] [y] [--facing 0..3] [--skip-events | --allow-events]
+  sdv-dev wait [--ticks 20 | --ms 500 | --until-ready]
   sdv-dev reload-assets [--project <ModDir>] [--assets <Asset1,Asset2>] [--no-reload-map]
 
 说明：
-  - `warp` 显式传入坐标 `x y`（或加 `--skip-events`）时，若进图意外触发原版/模组过场剧情 (`CurrentEvent`)，会自动清干净剧情锁、恢复精确站位并刷新 `UpdateViewPort` 镜头，返回 JSON 含 `eventActive` / `skippedEventId`（如需保留进图剧情可加 `--allow-events`）；
+  - `warp` 执行前自动清掉残留状态锁（`killScreen` 昏迷黑屏、半途 `_isWarping`、`fadeToBlack`、`globalFade`）；若未传 `x y` 自动从地图中心螺旋挑选有 `Back` 图块且非门口的非空安全格；落地后核验目标地点（被结界改道标 `""redirected"": true`，传送未生效返回 `""ok"": false` 绝不假成功）；
+  - `wait` 用于纯推进指定游戏帧数或等待切图渐隐结束（`--until-ready`）；
   - 只改了 `.fx` 着色器、`.tmx` 地图或 `.png`/`.json` 时优先用 `reload-assets --project <ModDir>`，无需重启游戏！
   - 会自动将工程内全部 `.fx` 重编为 `.mgfxo`、精准拷入当前活跃 `modsPath` 对应的模组目录，并在主线程自动调用模组 `ReloadShaders()` 或直接原地替换内存中的 `Effect` 实例！
 
@@ -2461,6 +2716,7 @@ OPTIONS:
   return new { loc = Location.NameOrUniqueName, hasBuildingTile = tile != null };
   '@ | sdv-dev eval --stdin
   sdv-dev eval --file <script.cs>
+  sdv-dev eval --code ""<C#表达式或语句>""  (别名 `-c`)
   sdv-dev eval ""<简单无引号表达式>""
 
 特性与防踩坑提示：
@@ -2488,22 +2744,25 @@ OPTIONS:
                     Console.WriteLine(@"# sdv-dev 实机生命周期、窗口前后台/无控制台控制、模组隔离 (--isolated) 与热重启
 
 启动、窗口模式与热迭代：
-  sdv-dev live                                                         查看进程、桥接状态、真实窗口可见性 (`windowVisible`/`consoleVisible`/`desktopName`) 与坐标
-  sdv-dev start --isolated [--project <dir>] [--no-console] [--background] [--no-focus] --test-world
+  sdv-dev live                                                         无锁只读查看进程、窗口可见性与实时加载进度（即使 150s+ 大包 restart 期间也秒返 `state`/`elapsedSec` 与最新日志！）
+  sdv-dev start --isolated [--project <dir>] [--extra-mods Id1,Id2] [--no-console] [--background] [--no-focus] --test-world
       - 默认显示前台游戏窗口；加 `--no-console` 则**只显示星露谷游戏画面窗口、不弹 SMAPI 黑色控制台窗口**！
-      - 加 `--background` 则连游戏画面也移至屏幕外无打扰隐藏运行（满分辨率 60FPS 照常截图）；
-      - 热驻 `--daemon` 在游戏运行期间会自动续命（不因 10 分钟空闲自退而连坐关闭游戏）。
+      - `--extra-mods` 可免改 `sdv-project.json` 临时在隔离沙盒挂载 SVE/RSV 等大型拓展（也支持不进 Git 的 `sdv-project.local.json`）；
+      - 加 `--background` 则连游戏画面也移至屏幕外无打扰隐藏运行（满分辨率 60FPS 照常截图）。
   sdv-dev window [--show | --background] [--no-console | --show-console] [--focus]
       无需重启游戏，运行中 10ms 秒切前后台窗口显示，或单独隐藏/恢复 SMAPI 黑色控制台窗口！
-  sdv-dev restart --project <dir> [--isolated | --full-mods] [--no-console] [--same-desktop | --background] [--no-focus] --test-world
-      先执行 check+build（失败不关原游戏），通过后无锁暂存并在旧进程退出后自动替换 DLL（默认继承上一轮窗口与无控制台状态）！
+  sdv-dev restart --project <dir> [--isolated | --full-mods] [--extra-mods Id1,Id2] [--no-console] [--same-desktop | --background] --test-world
+      先执行 check+build（失败不关原游戏），通过后无锁暂存并在旧进程退出后自动替换 DLL；加载超过 10s 时实时向 stderr 输出心跳进度！
   sdv-dev reload --project <cpDir> [--assets A,B]                      免重启热重载 Content Patcher 包
   sdv-dev reload-assets --project <dir> --assets Maps/MyMap            免重启热刷 C#/CP 模组的地图与贴图资产
   sdv-dev config <ModId> [--get [Key] | --set Key=Val ...] [--no-save] 免重启 0.05 秒实时读写模组配置
 
-游戏内检视、传送、截图与日志：
-  sdv-dev warp <Location> [x] [y] [--skip-events | --allow-events]     瞬移至目标坐标（传了 x,y 时默认自动清掉进图剧情锁并对齐镜头，返回 eventActive/skippedEventId）
-  sdv-dev screenshot --mode screen|map [--ui-overlay] --out <file.png> 实机画面或全图截图
+游戏内检视、玩家无敌/加速开关、传送、截图与日志：
+  sdv-dev player [--invincible on|off] [--speed +5|off] [--heal]       查看玩家状态，或一键开关锁血无敌与移速 Buff（跑怪区/大地图免手写 C#）
+  sdv-dev wait [--ticks 20 | --until-ready]                            纯推进游戏帧或等待切图黑幕消退
+  sdv-dev warp <Location> [x] [y] [--skip-events | --allow-events]     清锁瞬移至目标坐标（校验防假成功与结界重定向）
+  sdv-dev screenshot [--at Loc:x,y] [--time 1630] [--godmode] --output <file.png>
+  sdv-dev screenshot --tour ""Town:82,56@1630;IslandSouth:20,35@1200"" --output <tour.png>
   sdv-dev screenshot --ab-compare <ModId> --out <ab.png>               同机位一键生成「原版关闭 vs 模组开启」左右对比图
   sdv-dev screenshot --burst [4] [--interval-ticks 15] [--pan-test] --out <grid.png>
   sdv-dev player / sdv-dev ui / sdv-dev ui-click (--id|--match|--response|--close)
@@ -2568,15 +2827,17 @@ OPTIONS:
                     break;
 
                 case "screenshot":
-                    Console.WriteLine(@"# sdv-dev screenshot — 实机画面/全图截图、安全缩放、UI 拓扑叠图、A/B 光影对比与动态四宫格连拍
+                    Console.WriteLine(@"# sdv-dev screenshot — 实机截图、黑屏告警、单令造景、--tour 多站巡检拼图、A/B 对比与四宫格连拍
 
 用法：
-  sdv-dev screenshot --mode screen|map [--zoom 0.75] [--ui-overlay] --out <shot.png>
-  sdv-dev screenshot --ab-compare <ModId[:BoolProp]> [--ab-toggle <BoolProp>] [--zoom 0.8] --out <ab_compare.png>
+  sdv-dev screenshot [--mode screen|map] [--at <Loc[:x,y]>] [--time 1630] [--weather sun|rain] [--godmode] [--zoom 0.75] [--ui-overlay] --output <shot.png>
+  sdv-dev screenshot --tour ""<Loc1[:x,y][@time]>;<Loc2[:x,y][@time]>..."" [--zoom 0.8] --output <tour_grid.png>
+      多场景批量巡检：自动挂临时锁血无敌、逐站清状态锁与剧情锁并稳定抓拍，直出带站名/坐标/时间角标的 NxM 审片总览图与逐站亮度报告（亦支持 `--tour @stops.txt` 文件列表）！
+  sdv-dev screenshot --ab-compare <ModId[:BoolProp]> [--ab-toggle <BoolProp>] [--at <Loc:x,y>] [--zoom 0.8] --output <ab_compare.png>
       同机位同时间自动切换目标模组开关（关闭截左图 -> 开启跑 2 ticks 截右图 -> 恢复原值），合成左右标注对比图！
-  sdv-dev screenshot --burst [4] [--interval-ticks 15 | --interval-ms 250] [--pan <dx,dy> | --pan-test] [--zoom 0.8] --out <burst_grid.png>
+  sdv-dev screenshot --burst [4] [--interval-ticks 15 | --interval-ms 250] [--pan <dx,dy> | --pan-test] [--zoom 0.8] --output <burst_grid.png>
       按固定游戏 Tick 间隔连续抓拍多帧（可选同步平滑平移镜头测残影/视差），自动合成带帧号与 Tick 角标的 2x2 时序四宫格 PNG！
-  - 注：`--zoom <0.35..3.0>` 内部自动调用 `SetWindowSize` 重建 `@Game1.screen` 缓冲，拍完自动还原，绝不产生右侧 UV 撕裂假竖线。");
+  - 注：所有截图返回 JSON 均自带 `meanLuminance`、`isBlackFrame` 与 `stateFlags`（自动识别昏迷 `killScreen` 或黑幕渐隐并多等消退帧）；`--out` / `--output` / `-o` 通用。");
                     break;
 
                 case "schema":
@@ -2758,18 +3019,18 @@ OPTIONS:
         private static readonly HashSet<string> GlobalKnownOptions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             "--ab", "--ab-compare", "--ab-toggle", "--action", "--add-item", "--advance-days", "--aim-tile", "--all-mods", "--allow-events", "--asm", "--asset", "--assets", "--at", "--author", "--auto-crop",
-            "--background", "--both", "--burst", "--button", "--cat", "--cell", "--clear", "--click", "--close", "--code-b64", "--cold", "--config", "--context", "--cp", "--cp-trace", "--crop",
+            "--background", "--both", "--burst", "--button", "--cat", "--cell", "--clear", "--click", "--close", "--code", "--code-b64", "--cold", "--config", "--context", "--cp", "--cp-trace", "--crop",
             "--day", "--days", "--db", "--debug-overlay", "--debug", "--defines", "--deploy", "--docs-only", "--docs-out", "--drop-in", "--dropin",
-            "--entry", "--export", "--facing-up", "--facing", "--file", "--focus", "--force", "--friendship", "--full-mods", "--full",
-            "--game-path", "--gamepad", "--get", "--github", "--give", "--grep", "--grid", "--headless", "--help", "--hide", "--hide-console", "--hold", "--hover", "--id", "--il", "--include-back", "--instructions", "--interval-ms", "--interval-ticks", "--isolated",
+            "--entry", "--export", "--extra-mods", "--facing-up", "--facing", "--file", "--focus", "--force", "--friendship", "--full-mods", "--full",
+            "--game-path", "--gamepad", "--get", "--github", "--give", "--godmode", "--grep", "--grid", "--headless", "--heal", "--help", "--hide", "--hide-console", "--hold", "--hover", "--id", "--il", "--include-back", "--instructions", "--interval-ms", "--interval-ticks", "--invincible", "--isolated",
             "--json", "--keep-events", "--keep-seen", "--keep-window", "--key", "--keys", "--kind", "--layer", "--level", "--limit", "--lines", "--list-assets", "--list",
-            "--mail", "--match", "--min-version", "--mod", "--mode", "--mods-path", "--money", "--move", "--name", "--near", "--new-test-save",
+            "--mail", "--match", "--min-version", "--mod", "--mode", "--mods-path", "--money", "--move", "--ms", "--name", "--near", "--new-test-save",
             "--no-back", "--no-bbox", "--no-console", "--no-focus", "--no-move", "--no-publicize", "--no-ref", "--no-reload-map", "--no-save", "--no-window", "--off", "--offline", "--optional",
-            "--out", "--pan", "--pan-test", "--place", "--power", "--prefab", "--preset", "--press", "--profile", "--project", "--rect", "--refill", "--reload-map",
+            "--out", "--output", "--pan", "--pan-test", "--place", "--power", "--prefab", "--preset", "--press", "--profile", "--project", "--rect", "--refill", "--reload-map",
             "--reset", "--reset-test-world", "--response", "--right-click", "--same-desktop", "--save", "--scale", "--screen", "--script-b64", "--script", "--scroll", "--search",
-            "--season", "--seconds", "--set", "--settle-ticks", "--show", "--show-console", "--show-paths", "--single-target", "--size", "--skip-check", "--skip-events", "--skip", "--spec", "--status", "--stdin", "--step",
-            "--tail", "--tap", "--target", "--test-world", "--theme", "--ticks", "--tile-size", "--time", "--timeout", "--tool", "--top", "--trace",
-            "--ui", "--ui-overlay", "--unpack", "--use-tool", "--visible", "--weather", "--with-mods", "--xy", "--year", "--zoom",
+            "--season", "--seconds", "--set", "--settle-ticks", "--show", "--show-console", "--show-paths", "--single-target", "--size", "--skip-check", "--skip-events", "--skip", "--spec", "--speed", "--status", "--stdin", "--step",
+            "--tail", "--tap", "--target", "--test-world", "--theme", "--ticks", "--tile-size", "--time", "--timeout", "--tool", "--top", "--tour", "--trace",
+            "--ui", "--ui-overlay", "--unpack", "--until-ready", "--use-tool", "--visible", "--weather", "--with-mods", "--xy", "--year", "--zoom",
             "-a", "-c", "-C", "-d", "-e", "-f", "-g", "-h", "-k", "-l", "-m", "-n", "-o", "-p", "-r", "-s", "-t", "-w", "-y", "-z", "-"
         };
 

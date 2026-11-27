@@ -18,6 +18,7 @@
     <EmbeddedResource Include="..\bridge\manifest.json" LogicalName="SdvDevBridge.manifest.json" />
     <EmbeddedResource Include="..\obj\WikiDocsBundle.zip" LogicalName="WikiDocsBundle.zip" Condition="Exists('..\obj\WikiDocsBundle.zip')" />
     <EmbeddedResource Include="..\obj\MgfxcBundle.zip" LogicalName="MgfxcBundle.zip" Condition="Exists('..\obj\MgfxcBundle.zip')" />
+    <EmbeddedResource Include="..\resources\smapi-github-map.tsv" LogicalName="SmapiGithubMap.tsv" Condition="Exists('..\resources\smapi-github-map.tsv')" />
   </ItemGroup>
 
   <ItemGroup>

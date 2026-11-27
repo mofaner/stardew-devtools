@@ -19,12 +19,15 @@ namespace SdvKb.Daemon
         // 重新运行 `build.ps1` 或覆盖更新安装包后，若后台仍驻留着 10 分钟内未超时的旧版 `--daemon`，
         // 客户端直接连上去会读到旧版帮助文本与旧逻辑。加入二进制指纹对账后，一旦发现磁盘上的 worker 已更新，
         // 旧守护进程立即返回 `StaleDaemonExitCode` 并主动自退，客户端无感拉起新进程接管。
-        private const string ProtocolMagic = "SDVD2";
+        private const string ProtocolMagic = "SDVD3";
         private const int StaleDaemonExitCode = -32099;
+        private const byte FrameFinalResult = 0;
+        private const byte FrameProgressStderr = 1;
         private static readonly long SelfWorkerStamp = ComputeSelfBinaryStamp();
         private static readonly TimeSpan IdleTimeout = TimeSpan.FromMinutes(10);
 
         private static readonly object ExecLock = new object();
+        private static readonly AsyncLocal<Action<string>?> ActiveProgressSink = new AsyncLocal<Action<string>?>();
         private static DateTime _lastActivityUtc = DateTime.UtcNow;
         private static readonly DateTime _startedAtUtc = DateTime.UtcNow;
         private static int _activeRequests;
@@ -108,8 +111,11 @@ namespace SdvKb.Daemon
 
             try
             {
-                // Run 2 concurrent pipe accept loops so back-to-back CLI invocations NEVER hit a gap between connections!
+                // Run 4 concurrent pipe accept loops so lock-free `sdv-dev live` / `logs` queries ALWAYS return instantly
+                // even while another client is waiting inside a 150s+ SVE/RSV `restart`!
                 Task.WhenAll(
+                    AcceptLoopAsync(cts),
+                    AcceptLoopAsync(cts),
                     AcceptLoopAsync(cts),
                     AcceptLoopAsync(cts)
                 ).GetAwaiter().GetResult();
@@ -211,6 +217,7 @@ namespace SdvKb.Daemon
 
                         if (mode != "SHUTDOWN" && clientExpectedStamp != 0L && SelfWorkerStamp != 0L && clientExpectedStamp != SelfWorkerStamp)
                         {
+                            bw.Write(FrameFinalResult);
                             bw.Write(StaleDaemonExitCode);
                             bw.Write(string.Empty);
                             bw.Write(string.Empty);
@@ -221,6 +228,7 @@ namespace SdvKb.Daemon
 
                         if (mode == "SHUTDOWN")
                         {
+                            bw.Write(FrameFinalResult);
                             bw.Write(0);
                             bw.Write("Shutting down daemon.\n");
                             bw.Write(string.Empty);
@@ -238,13 +246,16 @@ namespace SdvKb.Daemon
                             string idleDesc = gameAlive
                                 ? "paused while game is running (10m after game stops)"
                                 : $"in {idleLeft.TotalMinutes:F1} min (timeout=10m)";
+                            string activeOp = Live.LiveGameController.ActiveLifecycleState ?? "idle";
                             string statusMsg =
                                 $"Daemon PID      : {Process.GetCurrentProcess().Id}\n" +
                                 $"Uptime          : {up.TotalMinutes:F1} min\n" +
+                                $"Lifecycle State : {activeOp}\n" +
                                 $"Idle Auto-Exit  : {idleDesc}\n" +
                                 $"Served Queries  : {_servedCount}\n" +
                                 $"Warm DB Open    : {_warmDb != null}\n" +
                                 $"ILSpy Prewarmed : {_prewarmCompleted}\n";
+                            bw.Write(FrameFinalResult);
                             bw.Write(0);
                             bw.Write(statusMsg);
                             bw.Write(string.Empty);
@@ -252,13 +263,46 @@ namespace SdvKb.Daemon
                             continue;
                         }
 
-                        (int code, string stdout, string stderr) = ExecuteCommandIsolated(cwd, args);
+                        // 无锁只读快通道：当另一个终端正在跑长达 150 秒的大型拓展模组 `start`/`restart` 时，
+                        // `sdv-dev live`、`logs` 与 `--version` 完全不抢 `ExecLock`，直接秒返实时加载阶段与最新 SMAPI 日志！
+                        if (TryExecuteLockFreeReadOnly(args, out int fastCode, out string fastOut, out string fastErr))
+                        {
+                            _lastActivityUtc = DateTime.UtcNow;
+                            Interlocked.Increment(ref _servedCount);
+                            bw.Write(FrameFinalResult);
+                            bw.Write(fastCode);
+                            bw.Write(fastOut);
+                            bw.Write(fastErr);
+                            bw.Flush();
+                            continue;
+                        }
+
+                        object pipeWriteSync = new object();
+                        void StreamProgress(string line)
+                        {
+                            try
+                            {
+                                lock (pipeWriteSync)
+                                {
+                                    bw.Write(FrameProgressStderr);
+                                    bw.Write(line);
+                                    bw.Flush();
+                                }
+                            }
+                            catch { }
+                        }
+
+                        (int code, string stdout, string stderr) = ExecuteCommandIsolated(cwd, args, StreamProgress);
                         _lastActivityUtc = DateTime.UtcNow;
 
-                        bw.Write(code);
-                        bw.Write(stdout);
-                        bw.Write(stderr);
-                        bw.Flush();
+                        lock (pipeWriteSync)
+                        {
+                            bw.Write(FrameFinalResult);
+                            bw.Write(code);
+                            bw.Write(stdout);
+                            bw.Write(stderr);
+                            bw.Flush();
+                        }
                     }
                     finally
                     {
@@ -283,7 +327,82 @@ namespace SdvKb.Daemon
             }
         }
 
-        private static (int ExitCode, string Stdout, string Stderr) ExecuteCommandIsolated(string cwd, string[] args)
+        public static void EmitStreamingProgress(string line)
+        {
+            if (string.IsNullOrWhiteSpace(line))
+                return;
+
+            var sink = ActiveProgressSink.Value;
+            if (sink != null)
+            {
+                sink(line);
+            }
+            else
+            {
+                try
+                {
+                    Console.Error.WriteLine(line);
+                    Console.Error.Flush();
+                }
+                catch { }
+            }
+        }
+
+        private static bool TryExecuteLockFreeReadOnly(string[] args, out int code, out string stdout, out string stderr)
+        {
+            code = 0;
+            stdout = string.Empty;
+            stderr = string.Empty;
+
+            if (args.Length == 0)
+                return false;
+
+            string sub = args[0].ToLowerInvariant();
+            bool hasHelp = false;
+            for (int i = 1; i < args.Length; i++)
+            {
+                if (args[i].Equals("-h", StringComparison.OrdinalIgnoreCase) ||
+                    args[i].Equals("--help", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasHelp = true;
+                    break;
+                }
+            }
+            if (hasHelp)
+                return false;
+
+            try
+            {
+                if (sub == "live" || sub == "game-status")
+                {
+                    stdout = Live.LiveGameController.GetLiveStatusJson() + Environment.NewLine;
+                    return true;
+                }
+
+                if (sub == "-v" || sub == "--version" || sub == "version")
+                {
+                    string ver = typeof(CliApp).Assembly.GetName().Version?.ToString(3) ?? "1.4.0";
+                    stdout = $"sdv-dev {ver}{Environment.NewLine}";
+                    return true;
+                }
+
+                if (sub == "logs")
+                {
+                    stdout = CliApp.FormatLogsLockFree(args);
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                code = 1;
+                stderr = $"[ERROR] {ex.Message}{Environment.NewLine}";
+                return true;
+            }
+
+            return false;
+        }
+
+        private static (int ExitCode, string Stdout, string Stderr) ExecuteCommandIsolated(string cwd, string[] args, Action<string>? progressSink = null)
         {
             lock (ExecLock)
             {
@@ -291,6 +410,7 @@ namespace SdvKb.Daemon
                 TextWriter origOut = Console.Out;
                 TextWriter origErr = Console.Error;
                 string origCwd = Environment.CurrentDirectory;
+                ActiveProgressSink.Value = progressSink;
 
                 using var swOut = new StringWriter();
                 using var swErr = new StringWriter();
@@ -323,6 +443,7 @@ namespace SdvKb.Daemon
                 }
                 finally
                 {
+                    ActiveProgressSink.Value = null;
                     Console.SetOut(origOut);
                     Console.SetError(origErr);
                     try { Environment.CurrentDirectory = origCwd; } catch { }

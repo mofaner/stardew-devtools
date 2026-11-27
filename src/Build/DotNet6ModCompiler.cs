@@ -920,7 +920,8 @@ namespace SdvEvalDynamic
             Directory.CreateDirectory(targetDir);
             CleanupUnlockedOldBinaries(targetDir);
             PruneDeletedFilesInTarget(sourceModDir, targetDir);
-            CopyModTreeLockTolerant(sourceModDir, targetDir, skipBinaries: false);
+            string resolvedProjectVer = ResolveProjectSemVerFromCsproj(sourceModDir);
+            CopyModTreeLockTolerant(sourceModDir, targetDir, skipBinaries: false, resolvedProjectVer: resolvedProjectVer);
             return targetDir;
         }
 
@@ -933,9 +934,74 @@ namespace SdvEvalDynamic
             {
                 Directory.CreateDirectory(targetDir);
                 CleanupUnlockedOldBinaries(targetDir);
-                CopyModTreeLockTolerant(sourceModDir, targetDir, skipBinaries: true);
+                string resolvedProjectVer = ResolveProjectSemVerFromCsproj(sourceModDir);
+                CopyModTreeLockTolerant(sourceModDir, targetDir, skipBinaries: true, resolvedProjectVer: resolvedProjectVer);
             }
             return targetDir;
+        }
+
+        /// <summary>
+        /// 从模组目录的 `.csproj`（或父级 `Directory.Build.props`）提取 `<Version>` / `<VersionPrefix>`，
+        /// 用于在部署或打包 Pathoschild `ModBuildConfig` 模板工程时自动替换 `manifest.json` 中的 `REPLACE_ME_WITH_VERSION` / `%ProjectVersion%`。
+        /// </summary>
+        public static string ResolveProjectSemVerFromCsproj(string modDir)
+        {
+            try
+            {
+                var candidates = new List<string>();
+                if (Directory.Exists(modDir))
+                    candidates.AddRange(Directory.GetFiles(modDir, "*.csproj", SearchOption.TopDirectoryOnly));
+
+                string? cur = modDir;
+                for (int depth = 0; depth < 4 && !string.IsNullOrEmpty(cur); depth++)
+                {
+                    string props = Path.Combine(cur!, "Directory.Build.props");
+                    if (File.Exists(props))
+                        candidates.Add(props);
+                    cur = Path.GetDirectoryName(cur);
+                }
+
+                foreach (var xmlPath in candidates)
+                {
+                    try
+                    {
+                        var xdoc = XDocument.Load(xmlPath);
+                        foreach (var elName in new[] { "Version", "VersionPrefix", "AssemblyVersion" })
+                        {
+                            var vEl = xdoc.Descendants().FirstOrDefault(e => e.Name.LocalName.Equals(elName, StringComparison.OrdinalIgnoreCase));
+                            string? val = vEl?.Value?.Trim();
+                            if (!string.IsNullOrWhiteSpace(val) && !val!.Contains("$("))
+                            {
+                                // 归一化四段式 AssemblyVersion (如 1.2.3.0 -> 1.2.3)
+                                var m4 = Regex.Match(val, @"^(\d+\.\d+\.\d+)\.\d+$");
+                                return m4.Success ? m4.Groups[1].Value : val;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+
+            return "1.0.0";
+        }
+
+        public static string ReplaceManifestVersionTokens(string rawManifestJson, string resolvedSemVer)
+        {
+            if (string.IsNullOrEmpty(rawManifestJson))
+                return rawManifestJson;
+
+            if (rawManifestJson.IndexOf("REPLACE_ME_WITH_VERSION", StringComparison.OrdinalIgnoreCase) < 0 &&
+                rawManifestJson.IndexOf("%ProjectVersion%", StringComparison.OrdinalIgnoreCase) < 0 &&
+                rawManifestJson.IndexOf("$(Version)", StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                return rawManifestJson;
+            }
+
+            string updated = Regex.Replace(rawManifestJson, "REPLACE_ME_WITH_VERSION", resolvedSemVer, RegexOptions.IgnoreCase);
+            updated = Regex.Replace(updated, "%ProjectVersion%", resolvedSemVer, RegexOptions.IgnoreCase);
+            updated = Regex.Replace(updated, @"\$\(Version\)", resolvedSemVer, RegexOptions.IgnoreCase);
+            return updated;
         }
 
         private static string ResolveExistingOrDefaultTargetModDir(string sourceModDir, string modsRoot, string fallbackFolderName)
@@ -1019,7 +1085,7 @@ namespace SdvEvalDynamic
             }
         }
 
-        private static void CopyModTreeLockTolerant(string srcDir, string dstDir, bool skipBinaries)
+        private static void CopyModTreeLockTolerant(string srcDir, string dstDir, bool skipBinaries, string? resolvedProjectVer = null)
         {
             Directory.CreateDirectory(dstDir);
 
@@ -1035,6 +1101,7 @@ namespace SdvEvalDynamic
                 }
                 if (fileName.IndexOf(".old_locked_", StringComparison.OrdinalIgnoreCase) >= 0 ||
                     fileName.Equals("sdv-project.json", StringComparison.OrdinalIgnoreCase) ||
+                    fileName.Equals("sdv-project.local.json", StringComparison.OrdinalIgnoreCase) ||
                     fileName.Equals(".gitignore", StringComparison.OrdinalIgnoreCase) ||
                     fileName.Equals(".gitattributes", StringComparison.OrdinalIgnoreCase))
                 {
@@ -1044,6 +1111,16 @@ namespace SdvEvalDynamic
                     continue;
 
                 string dstPath = Path.Combine(dstDir, fileName);
+                if (fileName.Equals("manifest.json", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(resolvedProjectVer))
+                {
+                    string rawMf = File.ReadAllText(file, Encoding.UTF8);
+                    string replacedMf = ReplaceManifestVersionTokens(rawMf, resolvedProjectVer!);
+                    if (!ReferenceEquals(rawMf, replacedMf) && replacedMf != rawMf)
+                    {
+                        File.WriteAllText(dstPath, replacedMf, new UTF8Encoding(false));
+                        continue;
+                    }
+                }
                 CopySingleFileWithLockedRenameFallback(file, dstPath);
             }
 
@@ -1063,7 +1140,7 @@ namespace SdvEvalDynamic
                 {
                     continue;
                 }
-                CopyModTreeLockTolerant(sub, Path.Combine(dstDir, name), skipBinaries);
+                CopyModTreeLockTolerant(sub, Path.Combine(dstDir, name), skipBinaries, resolvedProjectVer);
             }
         }
 

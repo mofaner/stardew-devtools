@@ -111,43 +111,135 @@ namespace SdvKb.Live
             return Path.Combine(gamePath, "Mods");
         }
 
+        // 无锁实时生命周期状态（供大型模组 150s+ 重启期间另一终端秒查 `sdv-dev live` 获取加载阶段与耗时）
+        public static volatile string? ActiveLifecycleState;
+        public static volatile string? ActiveLifecycleDetail;
+        public static long LifecycleStartTick64;
+
+        private static void SetLifecycleState(string? state, string? detail = null)
+        {
+            if (state == null)
+            {
+                ActiveLifecycleState = null;
+                ActiveLifecycleDetail = null;
+                return;
+            }
+            if (ActiveLifecycleState == null)
+                LifecycleStartTick64 = Environment.TickCount64;
+            ActiveLifecycleState = state;
+            ActiveLifecycleDetail = detail;
+        }
+
+        public static List<string> ReadSmapiLogTailLines(int count = 3)
+        {
+            var lines = new List<string>();
+            try
+            {
+                if (!File.Exists(SmapiLatestLogPath))
+                    return lines;
+
+                using var fs = new FileStream(SmapiLatestLogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                long seekPos = Math.Max(0L, fs.Length - 16384L);
+                fs.Seek(seekPos, SeekOrigin.Begin);
+                using var sr = new StreamReader(fs, Encoding.UTF8);
+                if (seekPos > 0)
+                    sr.ReadLine(); // 丢弃可能被截断的半行
+
+                var allTail = new List<string>();
+                string? line;
+                while ((line = sr.ReadLine()) != null)
+                {
+                    string trimmed = line.Trim();
+                    if (trimmed.Length > 0)
+                        allTail.Add(trimmed.Length > 180 ? trimmed.Substring(0, 180) + "..." : trimmed);
+                }
+
+                int skip = Math.Max(0, allTail.Count - count);
+                for (int i = skip; i < allTail.Count; i++)
+                    lines.Add(allTail[i]);
+            }
+            catch { }
+            return lines;
+        }
+
         public static string GetLiveStatusJson()
         {
+            string? lcState = ActiveLifecycleState;
+            string? lcDetail = ActiveLifecycleDetail;
+            double? lcElapsedSec = lcState != null
+                ? Math.Round(Math.Max(0.0, (Environment.TickCount64 - LifecycleStartTick64) / 1000.0), 1)
+                : (double?)null;
+
             var proc = FindRunningSmapiProcess();
             if (proc == null)
             {
+                if (lcState != null)
+                {
+                    return JsonSerializer.Serialize(new
+                    {
+                        ok = true,
+                        running = false,
+                        state = lcState,
+                        lifecycleDetail = lcDetail,
+                        elapsedSec = lcElapsedSec,
+                        bridgeConnected = false,
+                        inWorld = false,
+                        recentSmapiLogs = ReadSmapiLogTailLines(3)
+                    }, IndentedJson());
+                }
+
                 return JsonSerializer.Serialize(new
                 {
                     ok = true,
                     running = false,
+                    state = "stopped",
                     bridgeConnected = false,
                     inWorld = false
                 }, IndentedJson());
             }
 
-            var (connected, respJson, err) = BridgeClient.TrySendJson("{\"action\":\"status\"}", connectTimeoutMs: 1200);
+            var (connected, respJson, err) = BridgeClient.TrySendJson("{\"action\":\"status\"}", connectTimeoutMs: 900);
             if (!connected)
             {
+                var tailLogs = ReadSmapiLogTailLines(3);
                 return JsonSerializer.Serialize(new
                 {
                     ok = true,
                     running = true,
                     pid = proc.Id,
+                    state = lcState ?? "loading_smapi",
+                    lifecycleDetail = lcDetail,
+                    elapsedSec = lcElapsedSec,
                     bridgeConnected = false,
                     inWorld = false,
-                    note = $"Process PID={proc.Id} is running without SdvDevBridge connected ({err})."
+                    recentSmapiLogs = tailLogs,
+                    note = lcState != null
+                        ? $"SMAPI PID={proc.Id} is {lcState} ({lcElapsedSec:0.0}s elapsed) — bridge not ready yet."
+                        : $"Process PID={proc.Id} is running without SdvDevBridge connected ({err})."
                 }, IndentedJson());
             }
 
             using var doc = JsonDocument.Parse(respJson);
+            bool isInWorld = doc.RootElement.TryGetProperty("inWorld", out var iwEl) && iwEl.ValueKind == JsonValueKind.True;
             var dict = new Dictionary<string, object?>
             {
                 ["running"] = true,
-                ["pid"] = proc.Id
+                ["pid"] = proc.Id,
+                ["state"] = lcState ?? (isInWorld ? "in_world" : "title_menu")
             };
+            if (lcElapsedSec.HasValue)
+            {
+                dict["elapsedSec"] = lcElapsedSec.Value;
+                if (!string.IsNullOrEmpty(lcDetail))
+                    dict["lifecycleDetail"] = lcDetail;
+            }
             foreach (var p in doc.RootElement.EnumerateObject())
             {
                 dict[p.Name] = JsonSerializer.Deserialize<object>(p.Value.GetRawText());
+            }
+            if (lcState != null && !isInWorld)
+            {
+                dict["recentSmapiLogs"] = ReadSmapiLogTailLines(2);
             }
             return JsonSerializer.Serialize(dict, IndentedJson());
         }
@@ -257,62 +349,76 @@ namespace SdvKb.Live
                 return GetLiveStatusJson();
             }
 
-            string? targetModsRoot = null;
-            if (wantsCustomModsRoot)
+            try
             {
-                if (!isolated && !string.IsNullOrWhiteSpace(customModsPath) && string.IsNullOrWhiteSpace(projectDir) && (extraWithMods == null || !extraWithMods.Any()))
-                {
-                    // Explicit pre-existing custom mods directory passed by user
-                    targetModsRoot = Path.GetFullPath(customModsPath!);
-                    Directory.CreateDirectory(targetModsRoot);
-                }
-                else
-                {
-                    var (isoDir, _, missingReq) = ModDependencyResolver.StageIsolatedModsDirectory(
-                        gamePath,
-                        customModsPath,
-                        projectDir,
-                        extraWithMods);
+                SetLifecycleState(ActiveLifecycleState ?? "starting", "Staging mods and launching SMAPI");
 
-                    if (missingReq.Count > 0)
+                string? targetModsRoot = null;
+                if (wantsCustomModsRoot)
+                {
+                    if (!isolated && !string.IsNullOrWhiteSpace(customModsPath) && string.IsNullOrWhiteSpace(projectDir) && (extraWithMods == null || !extraWithMods.Any()))
                     {
-                        throw new InvalidOperationException(
-                            $"Cannot start isolated SMAPI session: missing required prerequisite mod(s): {string.Join(", ", missingReq)}. " +
-                            "Install them into local `Mods` or run `sdv-dev deps add <UniqueID>` first.");
+                        // Explicit pre-existing custom mods directory passed by user
+                        targetModsRoot = Path.GetFullPath(customModsPath!);
+                        Directory.CreateDirectory(targetModsRoot);
                     }
-                    targetModsRoot = isoDir;
+                    else
+                    {
+                        var (isoDir, stagedIds, missingReq) = ModDependencyResolver.StageIsolatedModsDirectory(
+                            gamePath,
+                            customModsPath,
+                            projectDir,
+                            extraWithMods);
+
+                        if (missingReq.Count > 0)
+                        {
+                            throw new InvalidOperationException(
+                                $"Cannot start isolated SMAPI session: missing required prerequisite mod(s): {string.Join(", ", missingReq)}. " +
+                                "Install them into local `Mods` or run `sdv-dev deps add <UniqueID>` first.");
+                        }
+                        targetModsRoot = isoDir;
+                        if (stagedIds.Count >= 5)
+                        {
+                            Daemon.WorkerDaemonServer.EmitStreamingProgress(
+                                $"[sdv-dev] Staged {stagedIds.Count} isolated mods; launching SMAPI...");
+                        }
+                    }
                 }
-            }
+                else if (!string.IsNullOrWhiteSpace(projectDir))
+                {
+                    ModDependencyResolver.EnsureRequiredPrerequisitesInModsRoot(projectDir, gamePath, Path.Combine(gamePath, "Mods"));
+                }
 
-            else if (!string.IsNullOrWhiteSpace(projectDir))
+                EnsureBridgeModInstalled(gamePath, targetModsRoot);
+
+                string smapiExe = Path.Combine(gamePath, "StardewModdingAPI.exe");
+                if (!File.Exists(smapiExe))
+                    throw new FileNotFoundException($"StardewModdingAPI.exe not found at `{smapiExe}`.");
+
+                string? autoLoadEnv = null;
+                if (!string.IsNullOrWhiteSpace(saveFolder))
+                    autoLoadEnv = saveFolder!;
+                else if (resetTestWorld)
+                    autoLoadEnv = "__RESET_TEST_SAVE__";
+                else if (useDisposableTestWorld)
+                    autoLoadEnv = "__NEW_TEST_SAVE__";
+
+                SetLifecycleState(ActiveLifecycleState ?? "starting", "Waiting for SMAPI & Content Patcher startup");
+                bool brokeAway = SpawnDetachedSmapiProcess(smapiExe, gamePath, targetModsRoot, autoLoadEnv, background, noFocus, hideConsole);
+
+                string statusJson = WaitUntilNewBridgeSessionReady(
+                    saveFolder,
+                    useDisposableTestWorld,
+                    resetTestWorld,
+                    timeoutSeconds,
+                    previousPidToIgnore: null);
+
+                return AttachEphemeralJobWarningIfNeeded(statusJson, brokeAway);
+            }
+            finally
             {
-                ModDependencyResolver.EnsureRequiredPrerequisitesInModsRoot(projectDir, gamePath, Path.Combine(gamePath, "Mods"));
+                SetLifecycleState(null);
             }
-
-            EnsureBridgeModInstalled(gamePath, targetModsRoot);
-
-            string smapiExe = Path.Combine(gamePath, "StardewModdingAPI.exe");
-            if (!File.Exists(smapiExe))
-                throw new FileNotFoundException($"StardewModdingAPI.exe not found at `{smapiExe}`.");
-
-            string? autoLoadEnv = null;
-            if (!string.IsNullOrWhiteSpace(saveFolder))
-                autoLoadEnv = saveFolder!;
-            else if (resetTestWorld)
-                autoLoadEnv = "__RESET_TEST_SAVE__";
-            else if (useDisposableTestWorld)
-                autoLoadEnv = "__NEW_TEST_SAVE__";
-
-            bool brokeAway = SpawnDetachedSmapiProcess(smapiExe, gamePath, targetModsRoot, autoLoadEnv, background, noFocus, hideConsole);
-
-            string statusJson = WaitUntilNewBridgeSessionReady(
-                saveFolder,
-                useDisposableTestWorld,
-                resetTestWorld,
-                timeoutSeconds,
-                previousPidToIgnore: null);
-
-            return AttachEphemeralJobWarningIfNeeded(statusJson, brokeAway);
         }
 
         private static string AttachEphemeralJobWarningIfNeeded(string statusJson, bool brokeAway)
@@ -343,26 +449,62 @@ namespace SdvKb.Live
             int? previousPidToIgnore)
         {
             var sw = Stopwatch.StartNew();
+            int nextHeartbeatSec = 10;
+
             while (sw.Elapsed.TotalSeconds < timeoutSeconds)
             {
                 Thread.Sleep(650);
                 var running = FindRunningSmapiProcess();
-                if (running != null && previousPidToIgnore.HasValue && running.Id == previousPidToIgnore.Value)
-                    continue;
+                bool validNewProc = running != null && (!previousPidToIgnore.HasValue || running.Id != previousPidToIgnore.Value);
 
-                var (conn, respJson, _) = BridgeClient.TrySendJson("{\"action\":\"status\"}", 1000);
-                if (!conn)
-                    continue;
+                bool conn = false;
+                string respJson = string.Empty;
+                int loadedModCount = 0;
 
-                if (string.IsNullOrWhiteSpace(saveFolder) && !useDisposableTestWorld && !resetTestWorld)
-                    return GetLiveStatusJson();
+                if (validNewProc)
+                {
+                    (conn, respJson, _) = BridgeClient.TrySendJson("{\"action\":\"status\"}", 900);
+                    if (conn)
+                    {
+                        if (string.IsNullOrWhiteSpace(saveFolder) && !useDisposableTestWorld && !resetTestWorld)
+                        {
+                            SetLifecycleState(null);
+                            return GetLiveStatusJson();
+                        }
 
-                using var doc = JsonDocument.Parse(respJson);
-                if (doc.RootElement.TryGetProperty("inWorld", out var iw) && iw.ValueKind == JsonValueKind.True)
-                    return GetLiveStatusJson();
+                        using var doc = JsonDocument.Parse(respJson);
+                        if (doc.RootElement.TryGetProperty("loadedModCount", out var mcEl) && mcEl.TryGetInt32(out int mc))
+                            loadedModCount = mc;
+                        if (doc.RootElement.TryGetProperty("inWorld", out var iw) && iw.ValueKind == JsonValueKind.True)
+                        {
+                            SetLifecycleState(null);
+                            return GetLiveStatusJson();
+                        }
+                        SetLifecycleState(ActiveLifecycleState ?? "starting", $"Bridge connected ({loadedModCount} mods); loading save into world");
+                    }
+                    else
+                    {
+                        SetLifecycleState(ActiveLifecycleState ?? "starting", $"SMAPI PID={running!.Id} initializing mods / Content Patcher");
+                    }
+                }
+
+                // 每 10 秒往 stderr 推送一行心跳进度（挂载 SVE + 里奇赛德村 300+ 地图耗时 150s+ 时不再黑盒静默，且保持 stdout 纯 JSON）
+                if (sw.Elapsed.TotalSeconds >= nextHeartbeatSec)
+                {
+                    int elapsedInt = (int)Math.Round(sw.Elapsed.TotalSeconds);
+                    var tail = ReadSmapiLogTailLines(1);
+                    string lastLog = tail.Count > 0 ? $" | {tail[0]}" : string.Empty;
+                    string stageText = !validNewProc
+                        ? "Waiting for new SMAPI process to spawn"
+                        : (!conn
+                            ? $"SMAPI PID={running!.Id} loading mods/assets"
+                            : $"Bridge ready ({loadedModCount} mods), entering world");
+                    Daemon.WorkerDaemonServer.EmitStreamingProgress($"[sdv-dev +{elapsedInt}s/{timeoutSeconds}s] {stageText}{lastLog}");
+                    nextHeartbeatSec += 12;
+                }
             }
 
-            throw new TimeoutException($"Timed out after {timeoutSeconds}s waiting for SMAPI / world load. Check `sdv-dev logs --level Error`.");
+            throw new TimeoutException($"Timed out after {timeoutSeconds}s waiting for SMAPI / world load (for large modpacks like SVE+RSV, pass `--timeout 300`). Check `sdv-dev logs --level Error`.");
         }
 
         /// <summary>
@@ -392,35 +534,38 @@ namespace SdvKb.Live
             bool noFocus = true,
             bool? hideConsoleOverride = null)
         {
-            ModBuildResult? buildRes = null;
-
-            if (!isolated && !forceFullMods && string.IsNullOrWhiteSpace(customModsPath) &&
-                !string.IsNullOrWhiteSpace(modDir) && Directory.Exists(modDir))
+            SetLifecycleState("restarting", "Compiling & validating mod before restart");
+            try
             {
-                if (ModDependencyResolver.LoadProjectConfig(modDir!).Isolated)
-                    isolated = true;
-            }
+                ModBuildResult? buildRes = null;
 
-            bool wantsIsolated = !forceFullMods && (isolated || !string.IsNullOrWhiteSpace(customModsPath));
-
-            // Step 1: Compile fresh DLL FIRST (including post-compile Harmony patch verification), THEN run full directory validation
-            // on the newly built artifacts — BEFORE touching the running game!
-            if (!string.IsNullOrWhiteSpace(modDir))
-            {
-                buildRes = DotNet6ModCompiler.BuildAndOptionallyDeploy(modDir!, gamePath, deploy: false);
-                if (!buildRes.Success)
+                if (!isolated && !forceFullMods && string.IsNullOrWhiteSpace(customModsPath) &&
+                    !string.IsNullOrWhiteSpace(modDir) && Directory.Exists(modDir))
                 {
-                    throw new InvalidOperationException($"C# Mod compilation / Harmony verification failed (running game preserved):\n{buildRes.CompilerOutput}");
+                    if (ModDependencyResolver.LoadProjectConfig(modDir!).Isolated)
+                        isolated = true;
                 }
 
-                var issues = ModValidator.ValidateModDirectory(modDir!);
-                var errors = issues.Where(i => i.Severity == "ERROR").ToList();
-                if (errors.Count > 0)
+                bool wantsIsolated = !forceFullMods && (isolated || !string.IsNullOrWhiteSpace(customModsPath));
+
+                // Step 1: Compile fresh DLL FIRST (including post-compile Harmony patch verification), THEN run full directory validation
+                // on the newly built artifacts — BEFORE touching the running game!
+                if (!string.IsNullOrWhiteSpace(modDir))
                 {
-                    string errSummary = string.Join("\n", errors.Select(e => $"[{e.Severity}] {e.File}: {e.Message}"));
-                    throw new InvalidOperationException($"Mod validation failed (running game preserved):\n{errSummary}");
+                    buildRes = DotNet6ModCompiler.BuildAndOptionallyDeploy(modDir!, gamePath, deploy: false);
+                    if (!buildRes.Success)
+                    {
+                        throw new InvalidOperationException($"C# Mod compilation / Harmony verification failed (running game preserved):\n{buildRes.CompilerOutput}");
+                    }
+
+                    var issues = ModValidator.ValidateModDirectory(modDir!);
+                    var errors = issues.Where(i => i.Severity == "ERROR").ToList();
+                    if (errors.Count > 0)
+                    {
+                        string errSummary = string.Join("\n", errors.Select(e => $"[{e.Severity}] {e.File}: {e.Message}"));
+                        throw new InvalidOperationException($"Mod validation failed (running game preserved):\n{errSummary}");
+                    }
                 }
-            }
 
             // Step 2: Fast hot-reload path if it's a Content Patcher pack and game is already running in compatible mode!
             var running = FindRunningSmapiProcess();
@@ -578,19 +723,24 @@ namespace SdvKb.Live
                 DotNet6ModCompiler.DeployModFolder(Path.GetFullPath(modDir!), gamePath, buildRes.UniqueId);
             }
 
-            return StartGameAndWait(
-                gamePath,
-                previousSave,
-                useDisposableTestWorld,
-                timeoutSeconds,
-                isolated: wantsIsolated,
-                customModsPath: customModsPath,
-                projectDir: modDir,
-                extraWithMods: extraWithMods,
-                resetTestWorld: resetTestWorld,
-                background: effectiveBackground,
-                noFocus: noFocus,
-                hideConsole: hideConsoleOverride ?? false);
+                return StartGameAndWait(
+                    gamePath,
+                    previousSave,
+                    useDisposableTestWorld,
+                    timeoutSeconds,
+                    isolated: wantsIsolated,
+                    customModsPath: customModsPath,
+                    projectDir: modDir,
+                    extraWithMods: extraWithMods,
+                    resetTestWorld: resetTestWorld,
+                    background: effectiveBackground,
+                    noFocus: noFocus,
+                    hideConsole: hideConsoleOverride ?? false);
+            }
+            finally
+            {
+                SetLifecycleState(null);
+            }
         }
 
         /// <summary>

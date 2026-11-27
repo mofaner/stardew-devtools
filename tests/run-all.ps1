@@ -466,7 +466,31 @@ WWWWWW
     Assert-True (Test-Path -LiteralPath (Join-Path $cleanBeginnerGame "Mods\CpEditMapPack\assets\booth.tmx")) "Real Mods received assets/booth.tmx"
     # Clean up test pack from shared DefaultIsolatedModsRoot after verifying dual deploy
     Remove-Item -LiteralPath (Join-Path $HOME ".local\share\sdv-dev\isolated-mods\CpEditMapPack") -Recurse -Force -ErrorAction SilentlyContinue
-    Pass-Step "Offline map-autotile, CP EditMap, zero-unpacked .xnb, empty-Mods CP/GMCM pull, & dual-target build --deploy --both"
+
+    # Verify Pathoschild-style `REPLACE_ME_WITH_VERSION` auto-replacement from `.csproj` `<Version>` + `sdv-project.local.json` overlay!
+    $tplModDir = Join-Path $workRoot "TemplateVerMod"
+    New-Item -ItemType Directory -Path $tplModDir -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $tplModDir "TemplateVerMod.csproj"), '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net6.0</TargetFramework><Version>2.4.6</Version></PropertyGroup></Project>', [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText((Join-Path $tplModDir "manifest.json"), '{"Name":"TemplateVerMod","Author":"Tester","Version":"REPLACE_ME_WITH_VERSION","UniqueID":"Tester.TemplateVerMod","MinimumApiVersion":"4.0.0","EntryDll":"TemplateVerMod.dll","UpdateKeys":["GitHub:Tester/TemplateVerMod"]}', [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText((Join-Path $tplModDir "ModEntry.cs"), 'using StardewModdingAPI; namespace TemplateVerMod { public class ModEntry : Mod { public override void Entry(IModHelper h) {} } }', [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText((Join-Path $tplModDir "sdv-project.local.json"), '{"isolated":true,"extraMods":["Pathoschild.ContentPatcher"]}', [System.Text.UTF8Encoding]::new($false))
+
+    $tplDeps = Invoke-SdvRaw @('deps', '--project', $tplModDir, '--game-path', $cleanBeginnerGame)
+    Assert-True ($tplDeps.Code -eq 0) "deps read sdv-project.local.json cleanly: $($tplDeps.Text)"
+    Assert-Contains $tplDeps.Text "Pathoschild.ContentPatcher" "sdv-project.local.json extraMods overlaid without touching sdv-project.json"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $tplModDir "sdv-project.json"))) "sdv-project.json stayed untouched"
+
+    $tplBuild = Invoke-SdvRaw @('build', $tplModDir, '--deploy', '--single-target', '--mods-path', (Join-Path $cleanBeginnerGame "Mods"))
+    Assert-True ($tplBuild.Code -eq 0) "TemplateVerMod build --deploy succeeded: $($tplBuild.Text)"
+    $deployedMfText = Get-Content -LiteralPath (Join-Path $cleanBeginnerGame "Mods\TemplateVerMod\manifest.json") -Raw
+    Assert-Contains $deployedMfText '"2.4.6"' "Deployed manifest.json replaced REPLACE_ME_WITH_VERSION with 2.4.6 from .csproj"
+    Assert-True ($deployedMfText -notmatch 'REPLACE_ME_WITH_VERSION') "No residual REPLACE_ME_WITH_VERSION in deployed manifest.json"
+
+    $tplPack = Invoke-SdvRaw @('pack', '--project', $tplModDir)
+    Assert-True ($tplPack.Code -eq 0) "TemplateVerMod pack succeeded with REPLACE_ME_WITH_VERSION: $($tplPack.Text)"
+    Assert-Contains $tplPack.Text '"Version": "2.4.6"' "sdv-dev pack materialized SemVer 2.4.6 from .csproj"
+
+    Pass-Step "Offline map-autotile, CP EditMap, zero-unpacked .xnb, CP/GMCM pull, dual deploy, & REPLACE_ME_WITH_VERSION fill"
 
     # ------------------------------------------------------------------
     # 6b. Expanded API/Decompile (--grep, MonoGame, xTile, SModHooks),
@@ -943,6 +967,19 @@ namespace LiveProbeMod
         Assert-True ($wTownClean.ok -eq $true -and $wTownClean.eventActive -eq $false -and $wTownClean.targetX -eq 45 -and $wTownClean.targetY -eq 71 -and -not [string]::IsNullOrWhiteSpace($wTownClean.skippedEventId)) "Warp with explicit coords (45,71) auto-cleaned entry cutscene(s) ($($wTownClean.skippedEventId)) and landed at exact tile"
         $liveAfterTown = Invoke-SdvRaw @('live') | Select-Object -ExpandProperty Text | ConvertFrom-Json
         Assert-True ($liveAfterTown.isPlayerFree -eq $true -and $liveAfterTown.eventActive -eq $false -and $liveAfterTown.tileX -eq 45 -and $liveAfterTown.tileY -eq 71) "Player is free at Town (45,71) with zero residual event lock"
+
+        # Verify P0-1/P0-2/P2: recovery from fainted `killScreen = true`, `player --invincible/--speed`, `wait`, `eval -c`, and `screenshot --tour`!
+        $null = Invoke-SdvRaw @('eval', '-c', 'Game1.killScreen = true; Player.health = 0; Game1.fadeToBlack = true; Game1.fadeToBlackAlpha = 1.0f; return Game1.killScreen;')
+        $wRecover = Invoke-SdvRaw @('warp', 'BusStop', '22', '10') | Select-Object -ExpandProperty Text | ConvertFrom-Json
+        Assert-True ($wRecover.ok -eq $true -and $wRecover.location -eq 'BusStop' -and $wRecover.redirected -eq $false) "Warp cleared killScreen/fade lock and landed at BusStop"
+        $pBuff = Invoke-SdvRaw @('player', '--invincible', 'on', '--speed', '+4', '--heal') | Select-Object -ExpandProperty Text | ConvertFrom-Json
+        Assert-True ($pBuff.invincible -eq $true -and [double]$pBuff.addedSpeed -ge 3.9) "player --invincible on --speed +4 applied natively"
+        $waitRes = Invoke-SdvRaw @('wait', '--ticks', '4') | Select-Object -ExpandProperty Text | ConvertFrom-Json
+        Assert-True ($waitRes.ok -eq $true -and $waitRes.waitedTicks -ge 4) "sdv-dev wait --ticks 4 advanced 4 ticks"
+        $tourPng = Join-Path $workRoot "mini_tour_grid.png"
+        $tourRes = Invoke-SdvRaw @('screenshot', '--tour', 'Farm:64,15@1200;Town:45,71@1500', '--output', $tourPng) | Select-Object -ExpandProperty Text | ConvertFrom-Json
+        Assert-True ($tourRes.ok -eq $true -and $tourRes.grid -eq '2x1' -and $tourRes.isBlackFrame -eq $false -and [double]$tourRes.meanLuminance -gt 5) "screenshot --tour produced non-black 2x1 overview PNG (meanLuminance=$($tourRes.meanLuminance))"
+        $null = Invoke-SdvRaw @('player', '--invincible', 'off', '--speed', 'off')
         Pass-Step "Synchronous warp (with cutscene auto-skip & eventActive) + interact + checkpoint save/load time machine"
 
         # 7f. Live NPC `schedule-check`

@@ -3,6 +3,7 @@ using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.IO.Pipes;
 using System.Linq;
@@ -23,6 +24,7 @@ using StardewModdingAPI;
 using StardewModdingAPI.Events;
 using StardewModdingAPI.Utilities;
 using StardewValley;
+using StardewValley.Buffs;
 using StardewValley.Characters;
 using StardewValley.Menus;
 using StardewValley.Network;
@@ -50,6 +52,7 @@ namespace SdvDevBridge
         public int TargetScreenId { get; }
         public bool IncludeUiLayout { get; }
         public long QueuedTick { get; }
+        public bool ReadyForRender { get; set; }
         public TaskCompletionSource<JObject> Tcs { get; }
 
         public PendingScreenCapture(string outputPath, int targetScreenId, bool includeUiLayout, long queuedTick, TaskCompletionSource<JObject> tcs)
@@ -185,10 +188,13 @@ namespace SdvDevBridge
     internal sealed class PendingWarpJob
     {
         public int TargetScreenId { get; }
+        public string OriginLocation { get; }
+        public Point OriginTile { get; }
         public string TargetLocation { get; }
         public int TargetX { get; }
         public int TargetY { get; }
         public int Facing { get; }
+        public bool ExplicitCoords { get; }
         public bool SkipEvents { get; }
         public int TicksElapsed { get; set; }
         public int PostWarpSettleTicks { get; set; }
@@ -196,14 +202,34 @@ namespace SdvDevBridge
         public List<string> SkippedEventIds { get; } = new List<string>();
         public TaskCompletionSource<JObject> Tcs { get; }
 
-        public PendingWarpJob(int targetScreenId, string targetLocation, int x, int y, int facing, bool skipEvents, TaskCompletionSource<JObject> tcs)
+        public PendingWarpJob(int targetScreenId, string originLocation, Point originTile, string targetLocation, int x, int y, int facing, bool explicitCoords, bool skipEvents, TaskCompletionSource<JObject> tcs)
         {
             TargetScreenId = targetScreenId;
+            OriginLocation = originLocation;
+            OriginTile = originTile;
             TargetLocation = targetLocation;
             TargetX = x;
             TargetY = y;
             Facing = facing;
+            ExplicitCoords = explicitCoords;
             SkipEvents = skipEvents;
+            Tcs = tcs;
+        }
+    }
+
+    internal sealed class PendingWaitJob
+    {
+        public int TargetTicks { get; }
+        public bool UntilReady { get; }
+        public long StartTick { get; }
+        public int WaitedTicks { get; set; }
+        public TaskCompletionSource<JObject> Tcs { get; }
+
+        public PendingWaitJob(int targetTicks, bool untilReady, long startTick, TaskCompletionSource<JObject> tcs)
+        {
+            TargetTicks = targetTicks;
+            UntilReady = untilReady;
+            StartTick = startTick;
             Tcs = tcs;
         }
     }
@@ -212,12 +238,17 @@ namespace SdvDevBridge
     {
         public const string DedicatedTestSaveFolder = "SdvDevTest_999999999";
         public const ulong DedicatedTestUniqueId = 999999999UL;
+        private const string DevSpeedBuffId = "sdv_dev_speed";
+
+        private static readonly FieldInfo? GameIsWarpingField =
+            typeof(Game1).GetField("_isWarping", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
 
         private readonly ConcurrentQueue<PendingPipeCommand> _mainThreadQueue = new ConcurrentQueue<PendingPipeCommand>();
         private readonly ConcurrentQueue<PendingScreenCapture> _screenCaptureQueue = new ConcurrentQueue<PendingScreenCapture>();
         private PendingDayAdvanceJob? _activeDayAdvanceJob;
         private PendingProfileSession? _activeProfileSession;
         private PendingWarpJob? _activeWarpJob;
+        private PendingWaitJob? _activeWaitJob;
         private PendingCheckpointRestore? _pendingCheckpointRestore;
         private PendingMultiFrameCapture? _activeMultiFrameCapture;
         private CancellationTokenSource? _cts;
@@ -228,6 +259,7 @@ namespace SdvDevBridge
         private bool _automationBackgroundMode;
         private bool _hideConsoleOnly;
         private bool _launchNoFocus;
+        private bool _godModeEnabled;
         private long _tickCounter;
 
         public static string ComputeUserToken()
@@ -386,6 +418,12 @@ namespace SdvDevBridge
             if (_automationBackgroundMode && Game1.options != null && Game1.options.pauseWhenOutOfFocus)
                 Game1.options.pauseWhenOutOfFocus = false;
 
+            // 维持无敌锁血模式（由 `sdv-dev player --invincible on` 或 `screenshot --tour/--godmode` 激活），防止高伤怪区巡检时被打晕进医院黑屏
+            if ((_godModeEnabled || (_activeMultiFrameCapture != null && _activeMultiFrameCapture.TempGodMode)) && Context.IsWorldReady && Game1.player != null)
+            {
+                EnforceGodModeTick(Game1.player);
+            }
+
             // TitleMenu 首帧可能会重新居中窗口（CenterOnDisplay），前 120 ticks（以及 SetWindowSize 缩放恢复后）持续对齐前后台/无控制台窗口策略
             if ((_tickCounter <= 120 && (_tickCounter % 15 == 1)) || _reapplyBackgroundAfterZoomRestore)
             {
@@ -417,15 +455,26 @@ namespace SdvDevBridge
                 }
             }
 
-            // Fallback if Display.Rendered did not fire within ~50 ticks (e.g. minimized window)
+            // 换图渐隐中自动多等几帧（最多 35 ticks）让黑幕消退后再允许 Display.Rendered 抓拍；若超过 55 ticks 仍未渲染（如最小化窗口）则走即时兜底
             if (_screenCaptureQueue.TryPeek(out var pendingShot) &&
-                Context.ScreenId == pendingShot.TargetScreenId &&
-                (_tickCounter - pendingShot.QueuedTick) > 50)
+                Context.ScreenId == pendingShot.TargetScreenId)
             {
-                if (_screenCaptureQueue.TryDequeue(out var expiredShot))
+                long waited = _tickCounter - pendingShot.QueuedTick;
+                bool midTransition = Game1.isWarping || Game1.locationRequest != null ||
+                    (Game1.fadeToBlack && Game1.fadeToBlackAlpha > 0.05f && !Game1.killScreen);
+                if (!midTransition || waited >= 35)
+                {
+                    pendingShot.ReadyForRender = true;
+                }
+                if (waited > 55 && _screenCaptureQueue.TryDequeue(out var expiredShot))
                 {
                     expiredShot.Tcs.TrySetResult(CaptureScreenBufferImmediate(expiredShot.OutputPath, expiredShot.IncludeUiLayout));
                 }
+            }
+
+            if (_activeWaitJob != null && Context.ScreenId == 0)
+            {
+                TickActiveWaitJob();
             }
 
             if (_pendingCheckpointRestore != null && Context.ScreenId == 0)
@@ -523,7 +572,7 @@ namespace SdvDevBridge
                     _activeProfileSession.FrameIntervalTicks.Add(delta);
             }
 
-            while (_screenCaptureQueue.TryPeek(out var peekCap) && peekCap.TargetScreenId == Context.ScreenId)
+            while (_screenCaptureQueue.TryPeek(out var peekCap) && peekCap.TargetScreenId == Context.ScreenId && peekCap.ReadyForRender)
             {
                 if (_screenCaptureQueue.TryDequeue(out var cap))
                 {
@@ -586,6 +635,9 @@ namespace SdvDevBridge
                             compositeRt.SaveAsPng(fs, outW, outH);
                         }
 
+                        Color[] compPixels = new Color[outW * outH];
+                        compositeRt.GetData(compPixels);
+
                         var compRes = new JObject
                         {
                             ["ok"] = true,
@@ -595,6 +647,7 @@ namespace SdvDevBridge
                             ["height"] = outH,
                             ["source"] = "Game1.screen+uiScreen"
                         };
+                        AttachScreenshotDiagnostics(compRes, compPixels);
                         if (includeUiLayout)
                             compRes["uiLayout"] = BuildUiJson(maxComponents: 200);
                         return compRes;
@@ -604,6 +657,8 @@ namespace SdvDevBridge
                     {
                         worldTarget.SaveAsPng(fs, worldTarget.Width, worldTarget.Height);
                     }
+                    Color[] worldPixels = new Color[worldTarget.Width * worldTarget.Height];
+                    worldTarget.GetData(worldPixels);
                     var wRes = new JObject
                     {
                         ["ok"] = true,
@@ -613,6 +668,7 @@ namespace SdvDevBridge
                         ["height"] = worldTarget.Height,
                         ["source"] = "Game1.screen"
                     };
+                    AttachScreenshotDiagnostics(wRes, worldPixels);
                     if (includeUiLayout)
                         wRes["uiLayout"] = BuildUiJson(maxComponents: 200);
                     return wRes;
@@ -635,7 +691,7 @@ namespace SdvDevBridge
                     tex.SaveAsPng(fs, w, h);
                 }
 
-                return new JObject
+                var bbRes = new JObject
                 {
                     ["ok"] = true,
                     ["mode"] = "screen",
@@ -644,6 +700,8 @@ namespace SdvDevBridge
                     ["height"] = h,
                     ["source"] = "BackBuffer"
                 };
+                AttachScreenshotDiagnostics(bbRes, pixels);
+                return bbRes;
             }
             catch (Exception ex)
             {
@@ -780,7 +838,9 @@ namespace SdvDevBridge
                 case "status":
                     return BuildStatusJson();
                 case "player":
-                    return BuildPlayerJson();
+                    return HandlePlayerCommand(req);
+                case "wait_ticks":
+                    return StartWaitJob(req, tcs);
                 case "ui":
                     return BuildUiJson();
                 case "ui_click":
@@ -918,9 +978,202 @@ namespace SdvDevBridge
                 obj["maxStamina"] = Game1.player.MaxStamina;
                 obj["health"] = Game1.player.health;
                 obj["maxHealth"] = Game1.player.maxHealth;
+                obj["invincible"] = _godModeEnabled;
+                obj["killScreen"] = Game1.killScreen;
             }
 
             return obj;
+        }
+
+        private static void EnforceGodModeTick(Farmer p)
+        {
+            Game1.killScreen = false;
+            if (p.health < p.maxHealth)
+                p.health = p.maxHealth;
+            if (p.Stamina < p.MaxStamina)
+                p.Stamina = p.MaxStamina;
+            p.temporarilyInvincible = true;
+            p.temporaryInvincibilityTimer = 0;
+            p.currentTemporaryInvincibilityDuration = 999999;
+            p.flashDuringThisTemporaryInvincibility = false;
+        }
+
+        internal static (double MeanLuminance, bool IsBlackFrame) ComputeFrameLuminanceStats(Color[] pixels)
+        {
+            if (pixels == null || pixels.Length == 0)
+                return (0.0, true);
+
+            // 步进采样（约 16K~64K 样本点，耗时 < 0.2ms）精准计算平均感知亮度与非黑像素比例
+            int step = Math.Max(1, pixels.Length / 32768);
+            double sumLum = 0.0;
+            int nonDark = 0;
+            int count = 0;
+            for (int i = 0; i < pixels.Length; i += step)
+            {
+                Color c = pixels[i];
+                double lum = 0.2126 * c.R + 0.7152 * c.G + 0.0722 * c.B;
+                sumLum += lum;
+                if (c.R > 8 || c.G > 8 || c.B > 8)
+                    nonDark++;
+                count++;
+            }
+
+            double mean = count > 0 ? sumLum / count : 0.0;
+            double nonDarkRatio = count > 0 ? (double)nonDark / count : 0.0;
+            bool isBlack = mean < 2.5 && nonDarkRatio < 0.01;
+            return (Math.Round(mean, 2), isBlack);
+        }
+
+        internal static void AttachScreenshotDiagnostics(JObject res, Color[] pixels)
+        {
+            var (meanLum, isBlack) = ComputeFrameLuminanceStats(pixels);
+            bool evtActive = Game1.eventUp || Game1.CurrentEvent != null || Game1.currentLocation?.currentEvent != null;
+            string? menuName = Game1.activeClickableMenu?.GetType().Name;
+
+            res["meanLuminance"] = meanLum;
+            res["isBlackFrame"] = isBlack;
+            res["stateFlags"] = new JObject
+            {
+                ["fadeToBlack"] = Game1.fadeToBlack,
+                ["fadeAlpha"] = Math.Round(Game1.fadeToBlackAlpha, 2),
+                ["killScreen"] = Game1.killScreen,
+                ["eventActive"] = evtActive,
+                ["activeMenu"] = menuName
+            };
+
+            if (isBlack || Game1.killScreen || (Game1.fadeToBlack && Game1.fadeToBlackAlpha > 0.5f))
+            {
+                var reasons = new List<string>();
+                if (Game1.killScreen) reasons.Add("killScreen=true (player fainted / knocked out)");
+                if (Game1.fadeToBlack && Game1.fadeToBlackAlpha > 0.5f) reasons.Add($"fadeToBlackAlpha={Game1.fadeToBlackAlpha:F2}");
+                if (evtActive) reasons.Add("eventActive=true");
+                if (menuName != null) reasons.Add($"activeMenu={menuName}");
+                string reasonSuffix = reasons.Count > 0 ? $" ({string.Join(", ", reasons)})" : string.Empty;
+                res["warning"] = $"Captured frame is nearly pure black or obscured (meanLuminance={meanLum}){reasonSuffix}.";
+            }
+        }
+
+        private JObject? StartWaitJob(JObject req, TaskCompletionSource<JObject>? tcs)
+        {
+            int ticks = Math.Clamp(req.Value<int?>("ticks") ?? 20, 1, 3600);
+            bool untilReady = req.Value<bool?>("untilReady") == true;
+            if (tcs == null)
+                return new JObject { ["ok"] = false, ["error"] = "Async TaskCompletionSource unavailable for wait_ticks." };
+
+            if (_activeWaitJob != null)
+                return new JObject { ["ok"] = false, ["error"] = "Another `wait` operation is already running." };
+
+            _activeWaitJob = new PendingWaitJob(ticks, untilReady, _tickCounter, tcs);
+            return null;
+        }
+
+        private void TickActiveWaitJob()
+        {
+            var job = _activeWaitJob;
+            if (job == null)
+                return;
+
+            job.WaitedTicks++;
+            bool readyNow = Context.IsWorldReady &&
+                            !Game1.isWarping &&
+                            Game1.locationRequest == null &&
+                            (!Game1.fadeToBlack || Game1.fadeToBlackAlpha <= 0.02f) &&
+                            !Game1.killScreen;
+
+            bool done = job.UntilReady
+                ? (readyNow || job.WaitedTicks >= job.TargetTicks)
+                : (job.WaitedTicks >= job.TargetTicks);
+
+            if (!done)
+                return;
+
+            _activeWaitJob = null;
+            job.Tcs.TrySetResult(new JObject
+            {
+                ["ok"] = !job.UntilReady || readyNow,
+                ["waitedTicks"] = job.WaitedTicks,
+                ["ready"] = readyNow,
+                ["tickCounter"] = _tickCounter,
+                ["inWorld"] = Context.IsWorldReady,
+                ["isPlayerFree"] = Context.IsPlayerFree,
+                ["location"] = Game1.currentLocation?.NameOrUniqueName,
+                ["timeOfDay"] = Game1.timeOfDay
+            });
+        }
+
+        private JObject HandlePlayerCommand(JObject req)
+        {
+            if (!Context.IsWorldReady || Game1.player == null)
+                return new JObject { ["ok"] = false, ["error"] = "World is not loaded yet (`inWorld=false`)." };
+
+            Farmer p = Game1.player;
+            var applied = new JArray();
+
+            bool? invOpt = req.Value<bool?>("invincible");
+            if (invOpt.HasValue)
+            {
+                _godModeEnabled = invOpt.Value;
+                if (_godModeEnabled)
+                {
+                    EnforceGodModeTick(p);
+                    applied.Add("invincible=on");
+                }
+                else
+                {
+                    p.temporarilyInvincible = false;
+                    p.temporaryInvincibilityTimer = 0;
+                    p.currentTemporaryInvincibilityDuration = 0;
+                    applied.Add("invincible=off");
+                }
+            }
+
+            if (req.Value<bool?>("heal") == true)
+            {
+                Game1.killScreen = false;
+                p.health = p.maxHealth;
+                p.Stamina = p.MaxStamina;
+                applied.Add("healed");
+            }
+
+            JToken? speedTok = req["speed"];
+            if (speedTok != null && speedTok.Type != JTokenType.Null)
+            {
+                string rawSpd = speedTok.ToString().Trim();
+                if (rawSpd.Equals("off", StringComparison.OrdinalIgnoreCase) ||
+                    rawSpd.Equals("reset", StringComparison.OrdinalIgnoreCase) ||
+                    rawSpd == "0")
+                {
+                    p.buffs.Remove(DevSpeedBuffId);
+                    applied.Add("speed=0");
+                }
+                else if (float.TryParse(rawSpd.TrimStart('+'), NumberStyles.Float, CultureInfo.InvariantCulture, out float spdVal))
+                {
+                    if (Math.Abs(spdVal) < 0.01f)
+                    {
+                        p.buffs.Remove(DevSpeedBuffId);
+                        applied.Add("speed=0");
+                    }
+                    else
+                    {
+                        var fx = new BuffEffects();
+                        fx.Speed.Value = spdVal;
+                        var buff = new Buff(
+                            id: DevSpeedBuffId,
+                            source: "sdv-dev",
+                            displaySource: "sdv-dev",
+                            duration: Buff.ENDLESS,
+                            effects: fx,
+                            displayName: $"Dev Speed ({(spdVal >= 0 ? "+" : "")}{spdVal:0.#})");
+                        p.applyBuff(buff);
+                        applied.Add($"speed={(spdVal >= 0 ? "+" : "")}{spdVal:0.#}");
+                    }
+                }
+            }
+
+            var res = BuildPlayerJson();
+            if (applied.Count > 0)
+                res["applied"] = applied;
+            return res;
         }
 
         private JObject BuildPlayerJson()
@@ -960,6 +1213,8 @@ namespace SdvDevBridge
                 ["maxStamina"] = p.MaxStamina,
                 ["health"] = p.health,
                 ["maxHealth"] = p.maxHealth,
+                ["invincible"] = _godModeEnabled,
+                ["addedSpeed"] = p.buffs.Speed,
                 ["skills"] = new JObject
                 {
                     ["farming"] = p.FarmingLevel,
@@ -1211,23 +1466,26 @@ namespace SdvDevBridge
                 ty = autoTile.Y;
             }
 
+            string originLoc = Game1.currentLocation?.NameOrUniqueName ?? string.Empty;
+            Point originTile = Game1.player.TilePoint;
+
             var preSkippedIds = new List<string>();
             if (skipEvents && (Game1.eventUp || Game1.CurrentEvent != null || Game1.currentLocation?.currentEvent != null))
             {
                 AbortCurrentEventForWarp(loc, tx, ty, facing, preSkippedIds);
             }
 
-            Game1.exitActiveMenu();
+            // 彻底清理前序残留的卡死锁（如被打空血医院黑屏 `killScreen`、门垫半途 `_isWarping`、`pauseTime`、`messagePause`、`globalFade`）
+            ClearResidualLocksBeforeWarp();
             Game1.warpFarmer(loc.NameOrUniqueName, tx, ty, facing);
-            // Fast-complete fade transition on next tick (same technique vanilla uses for IsDedicatedHost) so CLI warp returns synchronously!
+
+            // 注意：`ScreenFade.UpdateFade` 要求 `fadeToBlackAlpha > 1.1f`（严格大于 1.1）且 `fadeIn == true`、`!messagePause`、`pauseTime == 0f` 才会执行切图回调！
             if (Game1.isWarping || Game1.locationRequest != null)
             {
-                Game1.fadeToBlackAlpha = 1.1f;
-                Game1.fadeToBlack = true;
-                Game1.nonWarpFade = false;
+                FastForwardWarpFade();
                 if (tcs != null && _activeWarpJob == null)
                 {
-                    var job = new PendingWarpJob(Context.ScreenId, loc.NameOrUniqueName, tx, ty, facing, skipEvents, tcs);
+                    var job = new PendingWarpJob(Context.ScreenId, originLoc, originTile, loc.NameOrUniqueName, tx, ty, facing, explicitCoords, skipEvents, tcs);
                     if (preSkippedIds.Count > 0)
                     {
                         job.CleanedEventCount += preSkippedIds.Count;
@@ -1238,20 +1496,118 @@ namespace SdvDevBridge
                 }
             }
 
-            Event? curEvt = Game1.CurrentEvent ?? Game1.currentLocation?.currentEvent;
-            var syncRes = new JObject
+            return BuildVerifiedWarpResult(originLoc, originTile, loc.NameOrUniqueName, tx, ty, facing, preSkippedIds);
+        }
+
+        internal static void ClearResidualLocksBeforeWarp()
+        {
+            Game1.killScreen = false;
+            Game1.pauseTime = 0f;
+            Game1.messagePause = false;
+            Game1.dialogueUp = false;
+            Game1.globalFade = false;
+            Game1.nonWarpFade = false;
+            Game1.fadeToBlack = false;
+            Game1.fadeToBlackAlpha = 0f;
+            Game1.fadeIn = true;
+            Game1.locationRequest = null;
+            try { GameIsWarpingField?.SetValue(null, false); } catch { }
+
+            if (Game1.activeClickableMenu != null)
             {
-                ["ok"] = true,
-                ["location"] = loc.NameOrUniqueName,
-                ["targetX"] = tx,
-                ["targetY"] = ty,
-                ["facing"] = facing,
-                ["eventActive"] = Game1.eventUp || curEvt != null,
-                ["eventId"] = curEvt?.id
+                Game1.exitActiveMenu();
+                Game1.activeClickableMenu = null;
+            }
+
+            if (Game1.player != null)
+            {
+                if (Game1.player.health <= 0)
+                    Game1.player.health = Math.Max(10, Game1.player.maxHealth / 2);
+                if (Game1.player.Stamina <= 0f)
+                    Game1.player.Stamina = Math.Max(20f, Game1.player.MaxStamina / 2f);
+                Game1.player.completelyStopAnimatingOrDoingAction();
+                Game1.player.CanMove = true;
+                Game1.player.freezePause = 0;
+            }
+        }
+
+        internal static void FastForwardWarpFade()
+        {
+            Game1.pauseTime = 0f;
+            Game1.messagePause = false;
+            Game1.fadeIn = true;
+            Game1.fadeToBlackAlpha = 1.25f;
+            Game1.fadeToBlack = true;
+            Game1.nonWarpFade = false;
+        }
+
+        private static bool IsExpectedWarpDestination(string requestedLoc, string actualLoc)
+        {
+            if (string.Equals(requestedLoc, actualLoc, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            // 兼容原版被动节日临时替换地图（如冬季夜市 Beach -> BeachNightMarket）
+            if (actualLoc.StartsWith(requestedLoc, StringComparison.OrdinalIgnoreCase) &&
+                actualLoc.IndexOf("NightMarket", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+            return false;
+        }
+
+        private JObject BuildVerifiedWarpResult(
+            string originLoc,
+            Point originTile,
+            string requestedLoc,
+            int requestedX,
+            int requestedY,
+            int requestedFacing,
+            List<string> skippedIds)
+        {
+            string actualLoc = Game1.currentLocation?.NameOrUniqueName ?? string.Empty;
+            int actualX = Game1.player?.TilePoint.X ?? requestedX;
+            int actualY = Game1.player?.TilePoint.Y ?? requestedY;
+            int actualFacing = Game1.player?.FacingDirection ?? requestedFacing;
+            Event? finalEvt = Game1.CurrentEvent ?? Game1.currentLocation?.currentEvent;
+            bool eventActive = Game1.eventUp || finalEvt != null;
+
+            bool matchedTarget = IsExpectedWarpDestination(requestedLoc, actualLoc);
+            bool stayedAtOrigin = !matchedTarget &&
+                string.Equals(actualLoc, originLoc, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(requestedLoc, originLoc, StringComparison.OrdinalIgnoreCase);
+            bool redirected = !matchedTarget && !stayedAtOrigin;
+
+            var res = new JObject
+            {
+                ["ok"] = !stayedAtOrigin,
+                ["screenIndex"] = Context.ScreenId,
+                ["requestedLocation"] = requestedLoc,
+                ["location"] = actualLoc,
+                ["targetX"] = actualX,
+                ["targetY"] = actualY,
+                ["facing"] = actualFacing,
+                ["redirected"] = redirected,
+                ["eventActive"] = eventActive,
+                ["eventId"] = finalEvt?.id
             };
-            if (preSkippedIds.Count > 0)
-                syncRes["skippedEventId"] = preSkippedIds[0];
-            return syncRes;
+
+            if (stayedAtOrigin)
+            {
+                res["warpFailed"] = true;
+                res["error"] = $"Warp to `{requestedLoc}` did not take effect — player remained in `{actualLoc}` at ({actualX},{actualY}) (check festival setup lock or mod warp restriction).";
+            }
+            else if (redirected)
+            {
+                res["warning"] = $"Warp to `{requestedLoc}` was redirected to `{actualLoc}` ({actualX},{actualY}) by game or mod logic.";
+            }
+
+            if (skippedIds.Count > 0)
+            {
+                res["skippedEventId"] = skippedIds[0];
+                if (skippedIds.Count > 1)
+                    res["skippedEventIds"] = new JArray(skippedIds);
+            }
+            return res;
         }
 
         /// <summary>
@@ -1263,7 +1619,7 @@ namespace SdvDevBridge
         /// 2. 原版 `Event.exitEvent()` 并不会立即清理 `currentLocation.currentEvent`，而是设 `eventOver = true` 等下一帧 `Game1.eventFinished()`；
         ///    且 `Game1.eventFinished()` 内部会**再次调用 `warpFarmer(exitLocation, positionBeforeEvent.X, positionBeforeEvent.Y, ...)`**！
         ///    因此必须先将 `exitLocation` 与 `positionBeforeEvent` 对齐至 `(TargetX, TargetY)`，再连续执行 `exitEvent() + eventFinished()`，
-        ///    并等该收尾传送彻底落地后固定玩家坐标与 `Game1.UpdateViewPort(true, player.getStandingPosition())`。
+        ///    并等该收尾传送彻底落地后固定玩家坐标与 `Game1.UpdateViewPort(true, player.StandingPixel)`。
         /// </summary>
         private void TickActiveWarpJob()
         {
@@ -1274,13 +1630,11 @@ namespace SdvDevBridge
             wj.TicksElapsed++;
             if ((Game1.isWarping || Game1.locationRequest != null) && wj.TicksElapsed <= 90)
             {
-                Game1.fadeToBlackAlpha = 1.1f;
-                Game1.fadeToBlack = true;
-                Game1.nonWarpFade = false;
+                FastForwardWarpFade();
                 return;
             }
 
-            // 留 1 tick 让 SMAPI `Player.Warped` 上的 Mod 剧情触发器也执行完毕再检查是否被劫持进剧情
+            // 留 1 tick 让 SMAPI `Player.Warped` 上的 Mod 剧情/结界重定向逻辑也执行完毕再核验状态
             if (wj.PostWarpSettleTicks < 1 && wj.TicksElapsed <= 90)
             {
                 wj.PostWarpSettleTicks++;
@@ -1297,9 +1651,7 @@ namespace SdvDevBridge
 
                 if (Game1.isWarping || Game1.locationRequest != null)
                 {
-                    Game1.fadeToBlackAlpha = 1.1f;
-                    Game1.fadeToBlack = true;
-                    Game1.nonWarpFade = false;
+                    FastForwardWarpFade();
                     return;
                 }
             }
@@ -1327,31 +1679,25 @@ namespace SdvDevBridge
 
                 Game1.UpdateViewPort(true, Game1.player.StandingPixel);
             }
+            else if (Game1.player != null && !Game1.eventUp)
+            {
+                Game1.UpdateViewPort(true, Game1.player.StandingPixel);
+            }
 
+            Game1.globalFade = false;
+            Game1.nonWarpFade = false;
             Game1.fadeToBlack = false;
             Game1.fadeToBlackAlpha = 0f;
             Game1.fadeIn = false;
 
-            Event? finalEvt = Game1.CurrentEvent ?? Game1.currentLocation?.currentEvent;
-            bool eventActive = Game1.eventUp || finalEvt != null;
-            var res = new JObject
-            {
-                ["ok"] = true,
-                ["screenIndex"] = Context.ScreenId,
-                ["location"] = Game1.currentLocation?.NameOrUniqueName ?? wj.TargetLocation,
-                ["targetX"] = Game1.player?.TilePoint.X ?? wj.TargetX,
-                ["targetY"] = Game1.player?.TilePoint.Y ?? wj.TargetY,
-                ["facing"] = Game1.player?.FacingDirection ?? wj.Facing,
-                ["eventActive"] = eventActive,
-                ["eventId"] = finalEvt?.id
-            };
-            if (wj.SkippedEventIds.Count > 0)
-            {
-                res["skippedEventId"] = wj.SkippedEventIds[0];
-                if (wj.SkippedEventIds.Count > 1)
-                    res["skippedEventIds"] = new JArray(wj.SkippedEventIds);
-            }
-            wj.Tcs.TrySetResult(res);
+            wj.Tcs.TrySetResult(BuildVerifiedWarpResult(
+                wj.OriginLocation,
+                wj.OriginTile,
+                wj.TargetLocation,
+                wj.TargetX,
+                wj.TargetY,
+                wj.Facing,
+                wj.SkippedEventIds));
         }
 
         private static void AbortCurrentEventForWarp(GameLocation? dstLoc, int targetX, int targetY, int facing, List<string> recordedIds)
@@ -1719,26 +2065,75 @@ namespace SdvDevBridge
                 string.Equals(l.Name, locQuery, StringComparison.OrdinalIgnoreCase));
         }
 
-        private static Point FindSafeLandingTile(GameLocation loc)
+        /// <summary>
+        /// 无显式坐标时，从地图中心向外螺旋寻找真正可站立的安全地面格：
+        /// 1) 若自定义地图尚未懒加载，先 `reloadMap()` 确保拿到真实宽高而非缺省 20x20；
+        /// 2) 强制要求 `Back.Tiles[x, y] != null`（原版 `isTilePassable` 在无图块的纯黑虚空处也会返回 true！）；
+        /// 3) 排除水面、`Buildings` 阻挡层、大型家具/建筑碰撞以及门口 `Warp` / `TouchAction` 触发格，避免一落地又被门垫弹飞。
+        /// </summary>
+        internal static Point FindSafeLandingTile(GameLocation loc)
         {
+            if (loc.Map == null)
+            {
+                try { loc.reloadMap(); } catch { }
+            }
+
             var back = loc.Map?.GetLayer("Back");
-            int w = back?.LayerWidth ?? 20;
-            int h = back?.LayerHeight ?? 20;
+            var buildings = loc.Map?.GetLayer("Buildings");
+            int w = back?.LayerWidth ?? (loc.Map != null ? Math.Max(4, loc.Map.DisplayWidth / 64) : 20);
+            int h = back?.LayerHeight ?? (loc.Map != null ? Math.Max(4, loc.Map.DisplayHeight / 64) : 20);
             int cx = w / 2;
             int cy = h / 2;
 
-            for (int radius = 0; radius < Math.Max(w, h); radius++)
+            var warpTiles = new HashSet<Point>();
+            if (loc.warps != null)
             {
-                for (int dy = -radius; dy <= radius; dy++)
+                foreach (var wp in loc.warps)
+                    warpTiles.Add(new Point(wp.X, wp.Y));
+            }
+
+            CollisionMask blockMask = CollisionMask.All & ~CollisionMask.Farmers & ~CollisionMask.Characters;
+            int maxRadius = Math.Max(w, h);
+
+            for (int pass = 0; pass < 2; pass++)
+            {
+                for (int radius = 0; radius < maxRadius; radius++)
                 {
-                    for (int dx = -radius; dx <= radius; dx++)
+                    for (int dy = -radius; dy <= radius; dy++)
                     {
-                        int x = cx + dx;
-                        int y = cy + dy;
-                        if (x < 1 || y < 1 || x >= w - 1 || y >= h - 1)
-                            continue;
-                        if (!loc.isWaterTile(x, y) && loc.isTilePassable(new xTile.Dimensions.Location(x, y), Game1.viewport))
+                        for (int dx = -radius; dx <= radius; dx++)
+                        {
+                            if (Math.Abs(dx) != radius && Math.Abs(dy) != radius)
+                                continue;
+
+                            int x = cx + dx;
+                            int y = cy + dy;
+                            if (x < 1 || y < 1 || x >= w - 1 || y >= h - 1)
+                                continue;
+
+                            // 第一轮严格要求存在非空 Back 地板图块且避开门口触发格
+                            if (back != null && back.Tiles[x, y] == null)
+                                continue;
+                            if (pass == 0 && buildings != null && buildings.Tiles[x, y] != null)
+                                continue;
+                            if (pass == 0 && warpTiles.Contains(new Point(x, y)))
+                                continue;
+                            if (loc.isWaterTile(x, y))
+                                continue;
+                            if (!loc.isTilePassable(new xTile.Dimensions.Location(x, y), Game1.viewport))
+                                continue;
+                            if (loc.IsTileBlockedBy(new Vector2(x, y), blockMask))
+                                continue;
+
+                            if (pass == 0)
+                            {
+                                string? touch = loc.doesTileHaveProperty(x, y, "TouchAction", "Back");
+                                if (!string.IsNullOrEmpty(touch) && touch.IndexOf("Warp", StringComparison.OrdinalIgnoreCase) >= 0)
+                                    continue;
+                            }
+
                             return new Point(x, y);
+                        }
                     }
                 }
             }

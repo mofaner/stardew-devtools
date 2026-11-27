@@ -16,8 +16,10 @@ namespace SdvDevClient
     /// </summary>
     internal static class ClientProgram
     {
-        private const string ProtocolMagic = "SDVD2";
+        private const string ProtocolMagic = "SDVD3";
         private const int StaleDaemonExitCode = -32099;
+        private const byte FrameFinalResult = 0;
+        private const byte FrameProgressStderr = 1;
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool SetConsoleOutputCP(uint wCodePageID);
@@ -188,6 +190,8 @@ namespace SdvDevClient
                 }
                 else if (string.Equals(a, "--file", StringComparison.OrdinalIgnoreCase) ||
                          string.Equals(a, "-f", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(a, "--code", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(a, "-c", StringComparison.OrdinalIgnoreCase) ||
                          string.Equals(a, "--code-b64", StringComparison.OrdinalIgnoreCase) ||
                          string.Equals(a, "--script-b64", StringComparison.OrdinalIgnoreCase) ||
                          string.Equals(a, "--script", StringComparison.OrdinalIgnoreCase) ||
@@ -197,6 +201,8 @@ namespace SdvDevClient
                 {
                     if (string.Equals(a, "--file", StringComparison.OrdinalIgnoreCase) ||
                         string.Equals(a, "-f", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(a, "--code", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(a, "-c", StringComparison.OrdinalIgnoreCase) ||
                         string.Equals(a, "--script", StringComparison.OrdinalIgnoreCase))
                         hasFileOrB64 = true;
                     i++;
@@ -587,10 +593,25 @@ namespace SdvDevClient
                     bw.Write(args[i] ?? string.Empty);
                 bw.Flush();
 
-                exitCode = br.ReadInt32();
-                stdout = br.ReadString();
-                stderr = br.ReadString();
-                return true;
+                while (true)
+                {
+                    byte frameType = br.ReadByte();
+                    if (frameType == FrameProgressStderr)
+                    {
+                        string progressLine = br.ReadString();
+                        if (!string.IsNullOrEmpty(progressLine))
+                        {
+                            Console.Error.WriteLine(progressLine);
+                            Console.Error.Flush();
+                        }
+                        continue;
+                    }
+
+                    exitCode = br.ReadInt32();
+                    stdout = br.ReadString();
+                    stderr = br.ReadString();
+                    return true;
+                }
             }
             catch
             {

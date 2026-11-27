@@ -82,7 +82,12 @@ namespace SdvKb.Validation
                 string? version = RequireStringProp(root, "Version", "manifest.json", issues);
                 string? uniqueId = RequireStringProp(root, "UniqueID", "manifest.json", issues);
 
-                if (!string.IsNullOrEmpty(version) && !Regex.IsMatch(version!, @"^\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?$"))
+                bool isBuildTemplateVersionToken = !string.IsNullOrEmpty(version) &&
+                    (version!.Equals("REPLACE_ME_WITH_VERSION", StringComparison.OrdinalIgnoreCase) ||
+                     version.Equals("%ProjectVersion%", StringComparison.OrdinalIgnoreCase) ||
+                     version.Equals("$(Version)", StringComparison.OrdinalIgnoreCase));
+
+                if (!string.IsNullOrEmpty(version) && !isBuildTemplateVersionToken && !Regex.IsMatch(version!, @"^\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?$"))
                 {
                     issues.Add(new ValidationIssue { Severity = "WARN", File = "manifest.json", Message = $"Version `{version}` is not standard SemVer (e.g. `1.0.0`)." });
                 }

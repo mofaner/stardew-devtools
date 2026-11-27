@@ -47,6 +47,7 @@ namespace SdvKb.Build
         {
             "config.json",
             "sdv-project.json",
+            "sdv-project.local.json",
             ".gitignore",
             ".gitattributes",
             ".editorconfig",
@@ -94,10 +95,14 @@ namespace SdvKb.Build
 
             var warnings = issues.Where(i => i.Severity != "ERROR").ToList();
 
+            string resolvedCsprojVer = DotNet6ModCompiler.ResolveProjectSemVerFromCsproj(fullModDir);
+            string rawManifestText = File.ReadAllText(manifestPath, System.Text.Encoding.UTF8);
+            string materializedManifestText = DotNet6ModCompiler.ReplaceManifestVersionTokens(rawManifestText, resolvedCsprojVer);
+
             string modName;
             string version;
             string uniqueId;
-            using (var doc = JsonDocument.Parse(File.ReadAllText(manifestPath), JsoncOpts))
+            using (var doc = JsonDocument.Parse(materializedManifestText, JsoncOpts))
             {
                 var root = doc.RootElement;
                 modName = GetStringProp(root, "Name") ?? Path.GetFileName(fullModDir);
@@ -165,6 +170,16 @@ namespace SdvKb.Build
             {
                 foreach (var item in filesToPack.OrderBy(f => f.ZipEntryPath, StringComparer.OrdinalIgnoreCase))
                 {
+                    if (Path.GetFileName(item.DiskPath).Equals("manifest.json", StringComparison.OrdinalIgnoreCase) &&
+                        item.DiskPath.Equals(manifestPath, StringComparison.OrdinalIgnoreCase) &&
+                        materializedManifestText != rawManifestText)
+                    {
+                        var mfEntry = archive.CreateEntry(item.ZipEntryPath, CompressionLevel.Optimal);
+                        using var entryStream = mfEntry.Open();
+                        using var sw = new StreamWriter(entryStream, new System.Text.UTF8Encoding(false));
+                        sw.Write(materializedManifestText);
+                        continue;
+                    }
                     archive.CreateEntryFromFile(item.DiskPath, item.ZipEntryPath, CompressionLevel.Optimal);
                 }
             }

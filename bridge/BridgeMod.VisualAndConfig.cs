@@ -18,12 +18,22 @@ using StardewValley;
 
 namespace SdvDevBridge
 {
+    internal sealed class TourStopSpec
+    {
+        public string RawSpec { get; set; } = string.Empty;
+        public string Location { get; set; } = string.Empty;
+        public int? X { get; set; }
+        public int? Y { get; set; }
+        public int? TimeOfDay { get; set; }
+        public string? Label { get; set; }
+    }
+
     /// <summary>
-    /// 多帧截图异步状态机任务（驱动 `--ab-compare` 光影开关同帧位左右对比图 与 `--burst` / `--pan-test` 动态四宫格拼图）。
+    /// 多帧截图异步状态机任务（驱动 `--ab-compare` 光影开关同帧位左右对比图、`--burst` / `--pan-test` 动态四宫格拼图 与 `--tour` 多站巡检总览图）。
     /// </summary>
     internal sealed class PendingMultiFrameCapture
     {
-        public string Mode { get; set; } = "burst"; // "ab_compare" | "burst"
+        public string Mode { get; set; } = "burst"; // "ab_compare" | "burst" | "single_zoom" | "tour"
         public string OutputPath { get; set; } = string.Empty;
         public TaskCompletionSource<JObject>? Tcs { get; set; }
 
@@ -57,6 +67,19 @@ namespace SdvDevBridge
         public bool OrigBoolValue { get; set; }
         public List<(IList HandlerList, object Entry, int OriginalIndex)> TemporarilyRemovedHandlers { get; } =
             new List<(IList, object, int)>();
+
+        // 多场景自动巡检（`--tour`）状态机与无敌保护还原
+        public List<TourStopSpec> TourStops { get; } = new List<TourStopSpec>();
+        public JArray TourResults { get; } = new JArray();
+        public int CurrentTourIndex { get; set; }
+        public bool TourWarpIssued { get; set; }
+        public int TourPostWarpTicks { get; set; }
+        public int TourEventCleans { get; set; }
+        public int? DefaultTourTime { get; set; }
+        public bool TempGodMode { get; set; }
+        public int SavedHealth { get; set; }
+        public float SavedStamina { get; set; }
+        public int SavedTimeOfDay { get; set; }
     }
 
     /// <summary>
@@ -676,6 +699,45 @@ namespace SdvDevBridge
                 _activeMultiFrameCapture = job;
                 return tcs != null ? null : new JObject { ["ok"] = true, ["started"] = "ab_compare" };
             }
+            else if (capMode == "tour")
+            {
+                if (!Context.IsWorldReady || Game1.player == null)
+                    return new JObject { ["ok"] = false, ["error"] = "`screenshot --tour` requires `inWorld=true`." };
+
+                if (req["tourStops"] is not JArray stopsArr || stopsArr.Count == 0)
+                    return new JObject { ["ok"] = false, ["error"] = "No tour stops specified for `screenshot --tour`." };
+
+                foreach (var item in stopsArr.OfType<JObject>())
+                {
+                    string? locName = item.Value<string>("location")?.Trim();
+                    if (string.IsNullOrWhiteSpace(locName))
+                        continue;
+                    job.TourStops.Add(new TourStopSpec
+                    {
+                        RawSpec = item.Value<string>("raw") ?? locName!,
+                        Location = locName!,
+                        X = item.Value<int?>("x"),
+                        Y = item.Value<int?>("y"),
+                        TimeOfDay = item.Value<int?>("time"),
+                        Label = item.Value<string>("label")
+                    });
+                }
+
+                if (job.TourStops.Count == 0)
+                    return new JObject { ["ok"] = false, ["error"] = "No valid locations parsed for `screenshot --tour`." };
+
+                job.TargetFrames = job.TourStops.Count;
+                job.IntervalTicks = Math.Clamp(req.Value<int?>("settleTicks") ?? 4, 2, 60);
+                job.DefaultTourTime = req.Value<int?>("time");
+                job.TempGodMode = true;
+                job.SavedHealth = Game1.player.health;
+                job.SavedStamina = Game1.player.Stamina;
+                job.SavedTimeOfDay = Game1.timeOfDay;
+                EnforceGodModeTick(Game1.player);
+
+                _activeMultiFrameCapture = job;
+                return tcs != null ? null : new JObject { ["ok"] = true, ["started"] = "tour", ["stopCount"] = job.TourStops.Count };
+            }
             else
             {
                 int frames = Math.Clamp(req.Value<int?>("burstFrames") ?? 4, 2, 9);
@@ -711,6 +773,12 @@ namespace SdvDevBridge
                 return;
 
             job.TotalElapsedTicks++;
+
+            if (job.Mode == "tour")
+            {
+                TickTourCaptureStep(job);
+                return;
+            }
 
             // 超时兜底（例如窗口意外最小化未触发 Display.Rendered 时直接走即时缓冲抓取）
             if (job.TotalElapsedTicks > job.TargetFrames * (job.IntervalTicks + 40) + 120)
@@ -781,6 +849,42 @@ namespace SdvDevBridge
                         return;
                     }
                 }
+                else if (job.Mode == "tour")
+                {
+                    var stop = job.TourStops[job.CurrentTourIndex];
+                    string actualLoc = Game1.currentLocation?.NameOrUniqueName ?? stop.Location;
+                    int tx = Game1.player?.TilePoint.X ?? (stop.X ?? 0);
+                    int ty = Game1.player?.TilePoint.Y ?? (stop.Y ?? 0);
+                    bool redirected = !string.Equals(actualLoc, stop.Location, StringComparison.OrdinalIgnoreCase);
+                    var (meanLum, isBlack) = ComputeFrameLuminanceStats(pixels);
+
+                    string statusTag = isBlack ? " [BLACK]" : (redirected ? $" [->{actualLoc}]" : string.Empty);
+                    string badge = $"#{job.CurrentTourIndex + 1} {(stop.Label ?? actualLoc)} ({tx},{ty}) {Game1.timeOfDay:D4}{statusTag}";
+                    job.CapturedFrames.Add((w, h, pixels, badge));
+                    job.TourResults.Add(new JObject
+                    {
+                        ["index"] = job.CurrentTourIndex + 1,
+                        ["requestedLocation"] = stop.Location,
+                        ["location"] = actualLoc,
+                        ["tile"] = $"{tx},{ty}",
+                        ["timeOfDay"] = Game1.timeOfDay,
+                        ["redirected"] = redirected,
+                        ["meanLuminance"] = meanLum,
+                        ["isBlackFrame"] = isBlack
+                    });
+
+                    job.CurrentTourIndex++;
+                    job.TourWarpIssued = false;
+                    job.TourPostWarpTicks = 0;
+                    job.TourEventCleans = 0;
+
+                    if (job.CurrentTourIndex >= job.TourStops.Count)
+                    {
+                        JObject resp = SaveStitchedMultiFramePng(job);
+                        FinishAndCleanupMultiFrameJob(job, resp);
+                    }
+                    return;
+                }
                 else
                 {
                     int idx = job.CapturedFrames.Count + 1;
@@ -815,6 +919,17 @@ namespace SdvDevBridge
             if (job.Mode == "ab_compare")
             {
                 try { RestoreAbModOriginalState(job); } catch { }
+            }
+
+            if (job.TempGodMode && !_godModeEnabled && Game1.player != null)
+            {
+                Game1.player.temporarilyInvincible = false;
+                Game1.player.temporaryInvincibilityTimer = 0;
+                Game1.player.currentTemporaryInvincibilityDuration = 0;
+                if (job.SavedHealth > 0)
+                    Game1.player.health = Math.Min(Game1.player.maxHealth, job.SavedHealth);
+                if (job.SavedStamina > 0f)
+                    Game1.player.Stamina = Math.Min(Game1.player.MaxStamina, job.SavedStamina);
             }
 
             if (job.SavedViewportState)
@@ -1096,11 +1211,145 @@ namespace SdvDevBridge
             return true;
         }
 
+        private void TickTourCaptureStep(PendingMultiFrameCapture job)
+        {
+            if (job.ReadyForRenderCapture)
+            {
+                // 若最小化导致超 45 ticks 未走 Display.Rendered，直接主动采集当前帧防止挂起
+                if (job.TourPostWarpTicks > job.IntervalTicks + 45)
+                {
+                    CaptureMultiFrameStepOnRendered();
+                }
+                else
+                {
+                    job.TourPostWarpTicks++;
+                }
+                return;
+            }
+
+            while (job.CurrentTourIndex < job.TourStops.Count)
+            {
+                var stop = job.TourStops[job.CurrentTourIndex];
+                if (!job.TourWarpIssued)
+                {
+                    GameLocation? dstLoc = FindLocationFlexible(stop.Location);
+                    if (dstLoc == null)
+                    {
+                        job.TourResults.Add(new JObject
+                        {
+                            ["index"] = job.CurrentTourIndex + 1,
+                            ["requestedLocation"] = stop.Location,
+                            ["ok"] = false,
+                            ["error"] = $"Location `{stop.Location}` not found in `Game1.locations`."
+                        });
+                        job.CurrentTourIndex++;
+                        continue;
+                    }
+
+                    int tx, ty;
+                    if (stop.X.HasValue && stop.Y.HasValue)
+                    {
+                        tx = stop.X.Value;
+                        ty = stop.Y.Value;
+                    }
+                    else
+                    {
+                        Point safe = FindSafeLandingTile(dstLoc);
+                        tx = safe.X;
+                        ty = safe.Y;
+                        stop.X = tx;
+                        stop.Y = ty;
+                    }
+
+                    int targetTime = stop.TimeOfDay ?? job.DefaultTourTime ?? Game1.timeOfDay;
+                    if (targetTime != Game1.timeOfDay)
+                    {
+                        Game1.timeOfDay = targetTime;
+                        Game1.performTenMinuteClockUpdate();
+                    }
+
+                    var dummyIds = new List<string>();
+                    if (Game1.eventUp || Game1.CurrentEvent != null || Game1.currentLocation?.currentEvent != null)
+                        AbortCurrentEventForWarp(dstLoc, tx, ty, 2, dummyIds);
+
+                    ClearResidualLocksBeforeWarp();
+                    Game1.warpFarmer(dstLoc.NameOrUniqueName, tx, ty, 2);
+                    if (Game1.isWarping || Game1.locationRequest != null)
+                        FastForwardWarpFade();
+
+                    job.TourWarpIssued = true;
+                    job.TourPostWarpTicks = 0;
+                    job.TourEventCleans = 0;
+                    return;
+                }
+
+                if ((Game1.isWarping || Game1.locationRequest != null) && job.TourPostWarpTicks < 90)
+                {
+                    FastForwardWarpFade();
+                    job.TourPostWarpTicks++;
+                    return;
+                }
+
+                // 自动清掉进图触发的任何过场剧情锁
+                Event? evt = Game1.CurrentEvent ?? Game1.currentLocation?.currentEvent;
+                if ((evt != null || Game1.eventUp) && job.TourEventCleans < 4)
+                {
+                    GameLocation? dstLoc = FindLocationFlexible(stop.Location) ?? Game1.currentLocation;
+                    AbortCurrentEventForWarp(dstLoc, stop.X ?? 10, stop.Y ?? 10, 2, new List<string>());
+                    job.TourEventCleans++;
+                    if (Game1.isWarping || Game1.locationRequest != null)
+                        FastForwardWarpFade();
+                    return;
+                }
+
+                if (job.TourPostWarpTicks == 0 && Game1.player != null)
+                {
+                    GameLocation? expectedLoc = FindLocationFlexible(stop.Location);
+                    if (expectedLoc != null && Game1.currentLocation == expectedLoc && stop.X.HasValue && stop.Y.HasValue)
+                    {
+                        Game1.player.setTileLocation(new Vector2(stop.X.Value, stop.Y.Value));
+                    }
+                    Game1.globalFade = false;
+                    Game1.nonWarpFade = false;
+                    Game1.fadeToBlack = false;
+                    Game1.fadeToBlackAlpha = 0f;
+                    Game1.fadeIn = false;
+                    Game1.displayHUD = true;
+                    Game1.viewportFreeze = false;
+                    Game1.UpdateViewPort(true, Game1.player.StandingPixel);
+                }
+
+                job.TourPostWarpTicks++;
+                if (job.TourPostWarpTicks >= job.IntervalTicks)
+                {
+                    job.ReadyForRenderCapture = true;
+                }
+                return;
+            }
+
+            // 全部站点均未找到有效地图时的安全兜底
+            if (job.CapturedFrames.Count == 0)
+            {
+                FinishAndCleanupMultiFrameJob(job, new JObject
+                {
+                    ["ok"] = false,
+                    ["mode"] = "tour",
+                    ["error"] = "None of the requested `--tour` locations existed in `Game1.locations`.",
+                    ["stops"] = job.TourResults
+                });
+            }
+            else
+            {
+                JObject resp = SaveStitchedMultiFramePng(job);
+                FinishAndCleanupMultiFrameJob(job, resp);
+            }
+        }
+
         private JObject SaveStitchedMultiFramePng(PendingMultiFrameCapture job)
         {
             int count = job.CapturedFrames.Count;
-            int cellW = job.CapturedFrames[0].Width;
-            int cellH = job.CapturedFrames[0].Height;
+            int rawCellW = job.CapturedFrames[0].Width;
+            int rawCellH = job.CapturedFrames[0].Height;
 
             int cols, rows;
             if (job.Mode == "ab_compare" || count == 2)
@@ -1108,15 +1357,35 @@ namespace SdvDevBridge
                 cols = 2;
                 rows = 1;
             }
+            else if (count == 1)
+            {
+                cols = 1;
+                rows = 1;
+            }
             else if (count <= 4)
             {
                 cols = 2;
                 rows = (count + 1) / 2;
             }
-            else
+            else if (count <= 9)
             {
                 cols = 3;
                 rows = (count + 2) / 3;
+            }
+            else
+            {
+                cols = 4;
+                rows = (count + 3) / 4;
+            }
+
+            // 大批量巡检（如 9~24 站 SVE 地图拼图）时自动按比例限制总画布宽度 <= 3840px，避免生成数亿像素超大纹理爆内存
+            int cellW = rawCellW;
+            int cellH = rawCellH;
+            if (cols * cellW > 3840)
+            {
+                double shrink = 3840.0 / (cols * rawCellW);
+                cellW = Math.Max(320, (int)Math.Round(rawCellW * shrink));
+                cellH = Math.Max(180, (int)Math.Round(rawCellH * shrink));
             }
 
             const int Gap = 6;
@@ -1178,6 +1447,15 @@ namespace SdvDevBridge
                 outTex.SaveAsPng(fs, totalW, totalH);
             }
 
+            int blackFrameCount = 0;
+            double lumSum = 0.0;
+            foreach (var f in job.CapturedFrames)
+            {
+                var (mLum, isBlk) = ComputeFrameLuminanceStats(f.Pixels);
+                lumSum += mLum;
+                if (isBlk) blackFrameCount++;
+            }
+
             var res = new JObject
             {
                 ["ok"] = true,
@@ -1187,6 +1465,9 @@ namespace SdvDevBridge
                 ["frameCount"] = count,
                 ["width"] = totalW,
                 ["height"] = totalH,
+                ["meanLuminance"] = Math.Round(lumSum / Math.Max(1, count), 2),
+                ["isBlackFrame"] = blackFrameCount == count,
+                ["blackFrameCount"] = blackFrameCount,
                 ["labels"] = new JArray(job.CapturedFrames.Select(f => f.Badge))
             };
 
@@ -1195,6 +1476,12 @@ namespace SdvDevBridge
                 res["targetMod"] = job.TargetModId;
                 res["toggleMechanism"] = job.ToggleMechanism;
                 res["toggleMember"] = job.ToggleLabel;
+            }
+            else if (job.Mode == "tour")
+            {
+                res["stops"] = job.TourResults;
+                if (blackFrameCount > 0)
+                    res["warning"] = $"{blackFrameCount} of {count} tour stop(s) produced a nearly black frame — inspect `stops` array.";
             }
             else
             {
